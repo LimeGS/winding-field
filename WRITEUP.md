@@ -26,21 +26,22 @@ artifacts (tag v0.1.0):
 2. The official `copy_displacement_latest` tracer misses our
    pre-registered gate as released at 7.91 µm (56-63% of points past the
    half-gap threshold at native crop + TTA, 0% wrong-wrap), and we found
-   the dominant cause: a unit mismatch, not a perception failure. The
+   the dominant cause of the benchmark miss: a unit mismatch. The
    checkpoint is trained at 4.8 µm and the released CLI applies its
    displacement output raw in volume voxels, with no unit conversion and
    no documented resolution requirement (we read the wheel). Multiplying
    displacements by 4.8/7.91 = 0.607 and changing nothing else drops
    wrong-hop to 5.9/7.7%, passing the gate. Caveat that travels with it:
-   at corrected magnitudes this window is matched by a no-network
-   normal-step baseline, so it certifies the fix, not directional skill.
+   at corrected magnitudes this window is matched by a post-hoc
+   reference-pitch normal-step diagnostic, so it certifies the fix, not
+   directional skill or learned perception.
    Details and controls in the Part B correction box.
 
-3. Both point the same way: winding signals degrade most where sheets
-   compress. In our one window local pitch was ~5× tighter than canonical,
-   so a winding coordinate built on a global pitch constant would drift by
-   whole turns across a few sheets, and a quarter-turn threshold would mean
-   different things in different places.
+3. Both point toward local compression as a variable the algorithms should
+   model explicitly. In this window the adjacent-wrap gap varies roughly
+   6-19 voxels, so a fixed global-pitch rule can represent very different
+   physical situations across the same band. A local-pitch estimator is the
+   next testable hypothesis, not yet a demonstrated fix.
 
 ## Part A: global winding assignment by radius proximity
 
@@ -141,7 +142,7 @@ through the band, so at each point the segment itself records where the
 neighboring wraps sit. We validated that reference four ways before
 trusting it: a self-test that reconstructs the seed's own wrap at 0.000 vox
 (three earlier metric versions failed this and were dropped), wrong-side
-scoring that fails 99%, a dumb-geometry null at 100% wrong, and a raw-CT
+scoring that fails 99%, a gross-magnitude null at 100% wrong, and a raw-CT
 spacing check that uses no segmentation at all and independently confirms
 ~103 µm sheet spacing. It only grades where the segment recorded the
 neighbor, so over half our test points are excluded rather than guessed.
@@ -157,7 +158,7 @@ counts are scored / excluded.
 |---|---|---|---|
 | Reduced spec (7.91 µm, 128³ crops, no TTA, Apple M2 Pro) | 94.1% (4,613 / 5,387) | 97.7% (8,724 / 1,276) | 4.5% / 7.6% |
 | Native crop (128×384×384) + TTA, RTX 3090, still 7.91 µm | **63.2%** (4,697 / 5,303) | **56.3%** (8,697 / 1,303) | **0%** |
-| Native + displacement × 4.8/7.91 (resolution calibration, see box below) | **5.9%** (4,731 / 5,269) | **7.7%** (8,712 / 1,288) | 0% / 4.0% |
+| Native + displacement × 4.8/7.91 (same original scorable denominators) | **277/4,697 = 5.9%** | **672/8,697 = 7.7%** | 0% / 4.0% |
 | Null baseline (constant offset, uncalibrated magnitude) | 100% | 100% | n/a |
 
 Where 63.2% comes from: 10,000 front points, 5,303 excluded because the
@@ -172,41 +173,53 @@ as released misses it (63.2/56.3%); the unit-corrected variant passes it
 
 ### The resolution-calibration finding (2026-07-11)
 
-After first posting the native numbers we found their dominant cause. The
-checkpoint is trained on 4.8 µm voxels. Reading the released CLI source
+After first posting the native numbers we found the dominant cause of the
+benchmark miss. The checkpoint is reported as trained on 4.8 µm voxels.
+Reading the released CLI source
 (the exact `vesuvius==0.2.4` wheel we ran): the model's displacement
 output is applied directly in input-volume voxels, `--volume-scale`
 selects the zarr pyramid level, and nothing converts units or documents a
-resolution requirement. Training targets are voxel displacements of
-4.8 µm data, so on a 7.91 µm volume every predicted hop reads 1.65× too
-long.
+resolution requirement. The dataloader constructs displacement targets in
+training-array voxels and the loss has no physical-spacing term. The code
+therefore makes the output units hermetic; the 4.8 µm pitch itself comes
+from the checkpoint's reported training setup and is not encoded in its
+public metadata. Interpreting one training-grid voxel as one 7.91 µm volume
+voxel makes its physical length 7.91/4.8 = 1.65× larger.
 
 Multiplying the displacements by 4.8/7.91 = 0.607 and changing nothing
 else gives the calibrated row above. Checks, in order: the unscaled rerun
 reproduces the published row exactly first; the factor is physics, not a
-fit (any value in 0.50-0.65 scores 90-96%); wrong-side scoring of the
+fit (values in 0.50-0.65 score 89.6-96.4%); wrong-side scoring of the
 calibrated predictions still fails 100%. The rereading of the failure
 geometry is striking: the model's raw hops (median 21.4 vox front / 14.5
 back) are almost exactly 1.65× the true local gaps (11.2 / 8.8 vox), and
-in the model's own training units the back hop matches the true gap to
-the decimal. The model was reading the local spacing better than the raw
-numbers suggested; the scale was wrong, not the perception.
+in the model's reported training units the back-hop magnitude matches the
+true gap to the decimal. This diagnoses the scale of the benchmark miss;
+the window cannot determine how much of the remaining performance comes
+from learned perception rather than simple local geometry.
 
 The caveat that keeps this honest: at corrected magnitudes this window
-saturates. A permuted-direction null scores 93-97%, and a no-network
-baseline (seed + 9 voxels along the local surface normal) scores
-95.8/95.2%, matching the calibrated model (94.1/92.3%). So this window
+saturates. Permuting coherent directions within the same low-curvature
+window scores 93-97%, and a post-hoc reference-pitch diagnostic (seed + 9
+voxels along the local surface normal) scores 95.8/95.2%, matching the
+calibrated model (94.1/92.3%). The 9-voxel magnitude was selected after
+inspecting this band's reference gaps; it is not a pre-registered or
+deployable no-network baseline. So this window
 certifies the unit mismatch and its one-line fix; it cannot rank the
 calibrated model against dumb geometry. That ranking needs harder
-terrain: multi-hop chaining, high curvature, strongly varying gaps. The
-remaining calibrated misses concentrate exactly where the local gap
-swings ~6→19 vox, so the residual sub-problem is local pitch estimation,
-the same suggestion Part A makes for the winding gate.
+terrain: multi-hop chaining, high curvature, strongly varying gaps. Residual
+miss rates vary sharply across local-gap bins spanning roughly 6-19 voxels,
+although the relation is not monotonic on both sides. This makes a
+pre-specified local-pitch estimator the next sub-problem to test, not yet a
+proven residual fix.
 
-For anyone using this checkpoint on volumes whose resolution differs from
-training: scale the displacements by (training voxel pitch / volume voxel
-pitch), or the hops come out systematically mis-sized. Evidence script and
-saved log: `resolution_calibration.py` in the neural-tracing-audit repo.
+For this checkpoint, when the stated 4.8 µm training pitch applies, an
+opt-in displacement factor of (training voxel pitch / volume voxel pitch)
+corrects this benchmark. A generic implementation should carry training
+pitch in checkpoint metadata and default any new CLI scale to 1.0 rather
+than hard-code 4.8 µm for unrelated checkpoints. Evidence script, saved
+log, and the exact wheel/current-main audit are in the neural-tracing-audit
+repo (`resolution_calibration.py`, `docs/UPSTREAM_UNIT_AUDIT.md`).
 
 ### What we did and did not test
 
@@ -219,17 +232,18 @@ segment, and per the saturation caveat this window cannot rank the
 calibrated model against simple geometric baselines. The reference is
 community segmentation validated locally, not human-annotated truth. Since
 we can only grade where the segment mapped the neighbor, the gradable
-region likely skews toward easier geometry, which for the as-released
-negative makes that number conservative rather than inflated.
+region likely skews toward easier geometry. That makes the as-released
+negative conservative as a failure finding, but the calibrated 5.9/7.7%
+row potentially optimistic for general tracing.
 
 Benchmark spec, code and logs: `docs/BENCHMARK.md` and `docs/NT_AUDIT.md`
 in the neural-tracing-audit repo.
 
 ## What seems worth trying next
 
-- A locally estimated pitch (for example from the intensity-peak spacing we
-  used for the CT check) instead of a global constant, so a quarter-turn
-  threshold behaves consistently where sheets compress.
+- A pre-specified locally estimated pitch (for example from the
+  intensity-peak spacing used for the CT check) instead of a global
+  constant, tested on held-out windows before choosing its parameters.
 - Non-radius correspondence signals on the same connected graph: surface
   normals, tangent direction, mesh-derived orientation, or bridge cuts,
   scored against the same mesh-continuity audit.

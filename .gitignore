@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+*.u8
+*.npz
+*.pt
+*.ppm
+rag*/
+runs/
+de/
+de_ref/
+seg*/
+logs/

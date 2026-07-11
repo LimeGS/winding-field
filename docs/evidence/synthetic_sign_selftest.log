@@ -1,0 +1,19 @@
+=== running ORIGINAL propagation (SIGN=+1, off[v]=off[u]+m+chir*s) ===
+=== running CORRECTED propagation (SIGN=-1, off[v]=off[u]-m+chir*s) ===
+
+GATE1 purity: orig median 1.000  fixed median 1.000
+GATE2 orig : chir +1 (16, 1346)  chir -1 (0, 1346)  -> chose -1
+GATE2 fixed: chir +1 (0, 1346)  chir -1 (16, 1346)  -> chose +1
+W corrected: best sign +1, const +0 | global exact-recovery 100.00% | inside deleted-wrap block 100.00%
+W original : best sign +1, const +0 | global exact-recovery 70.59% | inside deleted-wrap block 0.00%
+original: mode(err full rays) +0, mode(err block rays) -2 (block at its mode: 100.00%)
+GATE3 kill-rate: orig 1.570% (over 16814 pairs)  fixed 0.000% (over 16814 pairs)
+
+PASS  A1 corrected recovers w_true (global): 100.00% > 99% required
+PASS  A1b corrected recovers w_true inside deleted-wrap block: 100.00% > 99% required
+PASS  A2 original has magnitude-2 W errors on block rays: |mode(block)-mode(full)| = 2 (need 2), block at mode 100.00%
+PASS  A3 GATE1 purity identical between runs: medians 1.000 vs 1.000
+PASS  A4a GATE3 ~0% for corrected: 0.000% < 0.1% required
+PASS  A4b GATE3 clearly >0% for original: 1.570% > 0.5% required
+
+SYNTH_TEST PASS

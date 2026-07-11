@@ -1,0 +1,13 @@
+component_filter=all-finite (field has no labels)
+transform landmark_err=19.6
+row v=273: points=1067 transitions=1066 loops=-1.14 dw=+15.00 endpoint_residual=13.859 jumps=373 jump_rate=34.99%
+row v=517: points=2576 transitions=2575 loops=-3.15 dw=+12.00 endpoint_residual=8.850 jumps=609 jump_rate=23.65%
+row v=760: points=2869 transitions=2868 loops=-3.13 dw=+6.00 endpoint_residual=2.868 jumps=710 jump_rate=24.76%
+row v=1004: points=2840 transitions=2839 loops=-3.16 dw=+0.00 endpoint_residual=3.165 jumps=811 jump_rate=28.57%
+row v=1247: points=2887 transitions=2886 loops=-3.16 dw=+2.00 endpoint_residual=1.161 jumps=774 jump_rate=26.82%
+row v=1491: points=3000 transitions=2999 loops=-3.16 dw=-3.00 endpoint_residual=0.165 jumps=802 jump_rate=26.74%
+row v=1734: points=2951 transitions=2950 loops=-3.16 dw=+14.00 endpoint_residual=10.841 jumps=811 jump_rate=27.49%
+row v=1978: points=2875 transitions=2874 loops=-3.17 dw=+4.00 endpoint_residual=0.825 jumps=747 jump_rate=25.99%
+row v=2221: points=2810 transitions=2809 loops=-3.17 dw=+2.00 endpoint_residual=1.169 jumps=678 jump_rate=24.14%
+row v=2465: points=1757 transitions=1756 loops=-2.31 dw=-13.00 endpoint_residual=10.687 jumps=510 jump_rate=29.04%
+AUDIT_DONE mode=REAL rows=10 jumps=6825 transitions=25622 jump_rate=26.637% median_endpoint_residual=3.016

@@ -1,0 +1,32 @@
+cleanup 0
+cleanup 300
+cleanup 600
+cleanup 900
+nodes after cleanup 64096373
+gaps 0
+gaps 300
+gaps 600
+gaps 900
+corrected indices ready
+th 0
+th 200
+th 400
+th 600
+th 800
+th 1000
+z 0
+z 200
+z 400
+z 600
+z 800
+z 1000
+GATE1 purity: median 0.583 p10 0.378
+rays with edges: 1335468 / 1403103
+GATE2 chir +1: conflicts 1382328/2641284 (52.34%) rays_reached 1332417/1403103
+GATE2 chir -1: conflicts 1382264/2641284 (52.33%) rays_reached 1332417/1403103
+chirality chosen -1
+nodes with w assigned: 63978574/64096373
+GATE3 kill-rate: 43.8% (over 105105464 valid edges)
+sweep 0: delta 0.0000
+w z-mid: unique 116 range -21..94
+WFIELD13_DONE

@@ -1,0 +1,36 @@
+cleanup 0
+cleanup 300
+cleanup 600
+cleanup 900
+nodes after cleanup 64096373
+gaps 0
+gaps 300
+gaps 600
+gaps 900
+corrected indices ready
+rays with data: 1403103
+th 0
+th 200
+th 400
+th 600
+th 800
+th 1000
+z 0
+z 200
+z 400
+z 600
+z 800
+z 1000
+GATE1 purity: median 0.568 p10 0.364
+ray-to-ray edges: 2666533
+GATE2 chir +1: weighted_rms_residual 0.3056
+GATE2 chir -1: weighted_rms_residual 0.3056
+chirality chosen +1
+nodes with w assigned: 64096373/64096373
+GATE3 kill-rate: 44.2% (over 119736145 valid edges)
+sweep 0: delta 0.0663
+sweep 1: delta 0.0245
+sweep 2: delta 0.0153
+sweep 3: delta 0.0113
+w z-mid: unique 81 range -9..71
+WFIELD14_DONE

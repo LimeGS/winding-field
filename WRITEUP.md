@@ -127,7 +127,7 @@ Scripts (original and corrected), the synthetic self-test, and all logs:
 
 ## Part B: the official neural tracer in a compressed window
 
-Model: `scrollprize/copy_displacement_latest` (public, trained at 4.8 µm).
+Model: `scrollprize/copy_displacement_latest` (public; reported as trained at 4.8 µm — provenance notes in the neural-tracing-audit repo).
 Given a partial surface and a volume, it predicts the next wrap's surface
 in front of and behind it. Volume: the public 7.91 µm Scroll 3 zarr, which
 is 1.65× coarser than training (no finer chunk-addressable volume exists

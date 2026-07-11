@@ -6,6 +6,10 @@ crossings; radius-proximity matching connects crossings between neighboring
 theta rays and z levels; global solvers then try to assign a consistent
 winding coordinate.
 
+> Companion write-up covering both this winding-assignment result and the
+> related neural-tracer benchmark:
+> https://github.com/LimeGS/winding-field/blob/main/WRITEUP.md
+
 **Status (2026-07-10): the candidate graph is highly connected, but the
 tested radius-proximity winding assignment is not accurate enough to ship as
 a winding field.** The verified corrected result is 43.8-45.8% GATE3
@@ -72,25 +76,14 @@ prior is not imposing the real field's lower jump rate.
 
 ## Correction record
 
-The local modal offset is measured as
-`m = mode(IP_destination - IP_origin)`, while the final coordinate is
-`W = IP + offset`. For a matched same-sheet pair:
-
-```text
-offset_destination = offset_origin - m + seam_step
-```
-
-The original scripts used `+m`. A synthetic spiral with a deliberately
-missing innermost wrap recovers 100% of known winding labels under the
-correct sign and 70.59% under the original sign; corrected GATE3 is 0.000%.
-Run `python sign_convention_selftest.py` to reproduce all six assertions.
-
-The corrected full-volume reruns preserve every sign-independent guard
-metric: median GATE1 purity is 0.568 (0.583 at tight tolerance), unfiltered
-GATE2 loop conflict is 52.3%, and triangle-filtered conflict is 31.4%.
-The remaining disagreement is therefore real for this exact measurement and
-preprocessing pipeline, but it is not an impossibility result for other
-radius models, resolutions, matchers, or learned/geometric signals.
+The original solvers shared a sign error (offsets propagated with `+m`
+where the coordinate construction requires `-m`), which inflated GATE3 to
+68.5-70.5% and the segment audits to ~57-58%. Verified fix: a known-truth
+synthetic spiral recovers 100% of winding labels under the corrected sign
+(`python sign_convention_selftest.py`, 6 assertions), and the corrected
+reruns preserve every sign-independent guard metric bit-for-bit. Original
+scripts, corrected twins, raw logs and the full derivation:
+`docs/NEGATIVE_RESULT.md` and `docs/evidence/`.
 
 ## Repository contents
 

@@ -23,12 +23,18 @@ artifacts (tag v0.1.0):
    ~65-70%; about 25 of those points were a sign bug in our own code,
    caught before release.
 
-2. The official `copy_displacement_latest` tracer, asked to step one wrap
-   out and in in an ultra-compressed window (~100 µm spacing, CT-verified),
-   predicts canonical-pitch hops (~330-500 µm) and lands 2-4 wraps away.
-   That is 94-98% wrong-hop at reduced spec; at native crop + TTA the
-   wrong-wrap rate drops to 0% but 56-63% of points still miss the half-gap
-   threshold. Our pre-registered <30% gate was not met.
+2. The official `copy_displacement_latest` tracer misses our
+   pre-registered gate as released at 7.91 µm (56-63% of points past the
+   half-gap threshold at native crop + TTA, 0% wrong-wrap), and we found
+   the dominant cause: a unit mismatch, not a perception failure. The
+   checkpoint is trained at 4.8 µm and the released CLI applies its
+   displacement output raw in volume voxels, with no unit conversion and
+   no documented resolution requirement (we read the wheel). Multiplying
+   displacements by 4.8/7.91 = 0.607 and changing nothing else drops
+   wrong-hop to 5.9/7.7%, passing the gate. Caveat that travels with it:
+   at corrected magnitudes this window is matched by a no-network
+   normal-step baseline, so it certifies the fix, not directional skill.
+   Details and controls in the Part B correction box.
 
 3. Both point the same way: winding signals degrade most where sheets
    compress. In our one window local pitch was ~5× tighter than canonical,
@@ -151,7 +157,8 @@ counts are scored / excluded.
 |---|---|---|---|
 | Reduced spec (7.91 µm, 128³ crops, no TTA, Apple M2 Pro) | 94.1% (4,613 / 5,387) | 97.7% (8,724 / 1,276) | 4.5% / 7.6% |
 | Native crop (128×384×384) + TTA, RTX 3090, still 7.91 µm | **63.2%** (4,697 / 5,303) | **56.3%** (8,697 / 1,303) | **0%** |
-| Null baseline (constant offset, reduced config) | 100% | 100% | n/a |
+| Native + displacement × 4.8/7.91 (resolution calibration, see box below) | **5.9%** (4,731 / 5,269) | **7.7%** (8,712 / 1,288) | 0% / 4.0% |
+| Null baseline (constant offset, uncalibrated magnitude) | 100% | 100% | n/a |
 
 Where 63.2% comes from: 10,000 front points, 5,303 excluded because the
 neighbor fell outside the reference band, 4,697 gradable. None landed
@@ -159,25 +166,61 @@ nearer a wrong wrap (the 0% column). The local gap is about 11 voxels
 (~88 µm) and we require landing within half of it; 1,730 did (36.8%), the
 other 2,967 landed on the right wrap but too far. That is the 63.2%.
 
-At native config the model predicts hops of ~330-500 µm (canonical pitch)
-where the real spacing is ~100 µm: right side 94% of the time, wrong
-distance almost always. Our reading is that it does not pick up the local
-compression and falls back on its training pitch. The raw distances are in
-the repo so you can re-threshold; at full-gap the numbers look better. We
-pre-registered a <30% gate, and 63.2/56.3% misses it, so as tested this is
-a benchmark miss rather than a deployable tracer. Rerun cost: $0.23
-(RTX 3090, 155.6 s).
+We pre-registered a <30% gate before spending on the GPU rerun. The tool
+as released misses it (63.2/56.3%); the unit-corrected variant passes it
+(5.9/7.7%). Rerun cost: $0.23 (RTX 3090, 155.6 s).
+
+### The resolution-calibration finding (2026-07-11)
+
+After first posting the native numbers we found their dominant cause. The
+checkpoint is trained on 4.8 µm voxels. Reading the released CLI source
+(the exact `vesuvius==0.2.4` wheel we ran): the model's displacement
+output is applied directly in input-volume voxels, `--volume-scale`
+selects the zarr pyramid level, and nothing converts units or documents a
+resolution requirement. Training targets are voxel displacements of
+4.8 µm data, so on a 7.91 µm volume every predicted hop reads 1.65× too
+long.
+
+Multiplying the displacements by 4.8/7.91 = 0.607 and changing nothing
+else gives the calibrated row above. Checks, in order: the unscaled rerun
+reproduces the published row exactly first; the factor is physics, not a
+fit (any value in 0.50-0.65 scores 90-96%); wrong-side scoring of the
+calibrated predictions still fails 100%. The rereading of the failure
+geometry is striking: the model's raw hops (median 21.4 vox front / 14.5
+back) are almost exactly 1.65× the true local gaps (11.2 / 8.8 vox), and
+in the model's own training units the back hop matches the true gap to
+the decimal. The model was reading the local spacing better than the raw
+numbers suggested; the scale was wrong, not the perception.
+
+The caveat that keeps this honest: at corrected magnitudes this window
+saturates. A permuted-direction null scores 93-97%, and a no-network
+baseline (seed + 9 voxels along the local surface normal) scores
+95.8/95.2%, matching the calibrated model (94.1/92.3%). So this window
+certifies the unit mismatch and its one-line fix; it cannot rank the
+calibrated model against dumb geometry. That ranking needs harder
+terrain: multi-hop chaining, high curvature, strongly varying gaps. The
+remaining calibrated misses concentrate exactly where the local gap
+swings ~6→19 vox, so the residual sub-problem is local pitch estimation,
+the same suggestion Part A makes for the winding gate.
+
+For anyone using this checkpoint on volumes whose resolution differs from
+training: scale the displacements by (training voxel pitch / volume voxel
+pitch), or the hops come out systematically mis-sized. Evidence script and
+saved log: `resolution_calibration.py` in the neural-tracing-audit repo.
 
 ### What we did and did not test
 
-Resolution is the open axis: 7.91 µm against 4.8 µm training biases against
-the model, and a native-resolution test needs a resampling adapter nobody
-has built, so "fails at native resolution" is not established. It is one
-blind-chosen window on one segment. The reference is community
-segmentation validated locally, not human-annotated truth. Since we can
-only grade where the segment mapped the neighbor, the gradable region
-likely skews toward easier geometry, which for a negative result makes our
-number conservative rather than inflated.
+Resolution went from open confound to identified mechanism: the dominant
+failure at 7.91 µm is the unit mismatch above, and the one-line scaling
+fixes the benchmark number. True native-resolution inference is still
+untested (a 4.8 µm test needs a resampling adapter for the raw 3.24 µm
+TIFF stack that nobody has built). It is one blind-chosen window on one
+segment, and per the saturation caveat this window cannot rank the
+calibrated model against simple geometric baselines. The reference is
+community segmentation validated locally, not human-annotated truth. Since
+we can only grade where the segment mapped the neighbor, the gradable
+region likely skews toward easier geometry, which for the as-released
+negative makes that number conservative rather than inflated.
 
 Benchmark spec, code and logs: `docs/BENCHMARK.md` and `docs/NT_AUDIT.md`
 in the neural-tracing-audit repo.
@@ -190,8 +233,14 @@ in the neural-tracing-audit repo.
 - Non-radius correspondence signals on the same connected graph: surface
   normals, tangent direction, mesh-derived orientation, or bridge cuts,
   scored against the same mesh-continuity audit.
+- A harder tracer benchmark that can rank direction quality once magnitude
+  is calibrated: multi-hop chaining (errors compound), high-curvature
+  windows, strongly varying gaps. This window saturates there, so it
+  cannot tell a calibrated neural tracer from a normal-step baseline.
 - Native-resolution neural inference, once someone adapts the 3.24 µm stack
-  into the checkpoint's frame.
+  into the checkpoint's frame; and, upstream, making the CLI scale
+  displacements by the training/volume voxel-pitch ratio (or documenting
+  the requirement).
 
 Happy to run the audit harness against meshes of the same region from any
 pipeline (VC3D, ThaumatoAnakalyptor, ScrollFiesta, the neural tracer, or

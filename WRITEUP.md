@@ -27,11 +27,12 @@ artifacts (tag v0.1.0):
    pre-registered gate as released at 7.91 µm (56-63% of points past the
    half-gap threshold at native crop + TTA, 0% wrong-wrap), and we found
    the dominant cause of the benchmark miss: a unit mismatch. The
-   checkpoint is trained at 4.8 µm and the released CLI applies its
-   displacement output raw in volume voxels, with no unit conversion and
-   no documented resolution requirement (we read the wheel). Multiplying
-   displacements by 4.8/7.91 = 0.607 and changing nothing else drops
-   wrong-hop to 5.9/7.7%, passing the gate. Caveat that travels with it:
+   checkpoint is reported as trained at 4.8 µm, while the released CLI
+   applies its displacement output raw in volume voxels, with no unit
+   conversion and no documented resolution requirement (we read the
+   wheel). Multiplying displacements by 4.8/7.91 = 0.607 and changing
+   nothing else drops wrong-hop to 5.9/7.7% on the original scorable
+   denominators, passing the gate. Caveat that travels with it:
    at corrected magnitudes this window is matched by a post-hoc
    reference-pitch normal-step diagnostic, so it certifies the fix, not
    directional skill or learned perception.

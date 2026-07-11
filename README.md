@@ -104,6 +104,7 @@ radius models, resolutions, matchers, or learned/geometric signals.
 | `sign_convention_selftest.py` | Known-truth synthetic sign test |
 | `figures/make_field_figure.py` | Full graph recomputation and figure generator |
 | `docs/NEGATIVE_RESULT.md` | Scientific account and correction history |
+| `WRITEUP.md` | Combined community write-up (Part A here + Part B in neural-tracing-audit) |
 | `docs/EVIDENCE.md` | Exact artifacts, commands, logs, and arithmetic |
 | `docs/evidence/` | Original/corrected raw run logs and checksums |
 | `artifacts/axis.npy` | Exact axis used by the segment audits |

@@ -1,11 +1,46 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.benchmarks/
+.ruff_cache/
+.mypy_cache/
+.venv/
+.coverage
+htmlcov/
 .DS_Store
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+
+# Research history and execution evidence belong outside the public checkout.
+/archive/
+/results/
+/experiments/
+/winding-field-disclosure-final/
+/docs/superpowers/
+**/run/
+**/source-initial/
+
+# Real-data artifacts: see DATA.md.
 *.u8
+*.afv
+*.sqlite
+*.sqlite3
 *.npz
+*.npy
 *.pt
+*.pth
 *.ppm
+*.tif
+*.tiff
+*.zarr/
+*-pairs.json.gz
+constraint-audit.json
+fibre_constraints.json
+excluded-fibres.json
+profiles.npz
 rag*/
 runs/
 de/

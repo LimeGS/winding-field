@@ -1,155 +1,181 @@
-# Winding-field experiments for Herculaneum scrolls
+# Winding fields and reproducible evaluation
 
-This repository tests a global winding-coordinate construction over public
-Scroll 3 surface predictions. Radial ray casting produces candidate sheet
-crossings; radius-proximity matching connects crossings between neighboring
-theta rays and z levels; global solvers then try to assign a consistent
-winding coordinate.
+[![Audit](https://github.com/LimeGS/winding-field/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/LimeGS/winding-field/actions/workflows/ci.yml)
+[![Coverage (local): 91.67%](https://img.shields.io/badge/coverage%20%28local%29-91.67%25-brightgreen)](#checks)
+[![Code license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-> Companion write-up covering both this winding-assignment result and the
-> related neural-tracer benchmark:
-> https://github.com/LimeGS/winding-field/blob/main/WRITEUP.md
+[![Paris4 CT in XY, XZ and YZ views beside global B2 and fine-candidate winding contours](assets/ct-winding.png)](assets/ct-winding.png)
 
-**Status (2026-07-10): the candidate graph is highly connected, but the
-tested radius-proximity winding assignment is not accurate enough to ship as
-a winding field.** The verified corrected result is 43.8-45.8% GATE3
-same-sheet disagreement across three solver architectures plus one tolerance
-sensitivity test. Segment audits aggregate to 21.525-26.637% transition
-jumps; an independent segment scores 23.956%.
+*Paris4 CT at 9.6 µm/pixel, global B2 field at 307.2 µm and fine candidate at
+19.2 µm. [Image attribution and terms](DATA.md#readme-illustration).*
 
-The first report overstated these failures because all solvers shared a sign
-error (`+m` instead of `-m`). The original scripts, corrected twins, raw
-logs, derivation, and known-truth test are retained so that correction is
-auditable rather than hidden. See `docs/NEGATIVE_RESULT.md`.
+Experimental software for constructing continuous winding-coordinate fields over
+predicted scroll surfaces, and evaluating saved fields against a frozen case.
+A useful field should remain nearly constant along a sheet while separating
+adjacent sheets. Numerical convergence and CT overlays do not certify physical
+sheet identity.
 
-## Verified graph result
+This repository contains the current implementation, reusable evaluation tools,
+synthetic examples and regression tests. Research logs, run outputs, experiment
+reports and prior release snapshots are maintained separately.
 
-`figures/make_field_figure.py` recomputes the graph from the raw radii and
-refuses to render if its validation gates fail.
+## The current method
 
-| Measurement | Recomputed result |
-|---|---:|
-| Wrap detections | 67,885,430 |
-| Candidate theta/z edges | 126,878,516 |
-| Wraps participating in at least one edge | 99.7527% |
-| Largest connected component | 96.6671% |
-| Median per-z largest-component coverage | 96.7406% |
-| p10 per-z largest-component coverage | 62.9291% |
-| Double-gap anomaly signature | 510,796 / 4,152,092 sampled gaps (12.3021%) |
+We approach winding counting as the recovery of a continuous layer coordinate,
+`W(x)`, over the scroll volume. Within a locally consistent region, this
+coordinate should vary little when moving along a papyrus layer and increase by
+approximately one when crossing to the next. Surfaces of constant `W` are then
+candidates for following the paper, while differences in `W` estimate how many
+layer spacings separate two locations. The absolute zero is a reference choice;
+the useful information lies in relative ordering and calibrated spacing, rather
+than in assigning an integer label to every voxel at the outset.
 
-These are connectivity and anomaly-census results. They do **not** prove
-that every candidate edge joins the same physical sheet. The double-gap
-census is also a heuristic that can reflect missing detections, merged
-sheets, or local spacing variation; it is not an upper or lower bound on the
-true segmentation-error rate.
+Surface-orientation predictions suggest the direction across layers, and a
+layer-density estimate supplies the expected rate of change in that direction.
+Traced fibres provide complementary evidence: samples believed to lie on the
+same local layer should have similar coordinate values. These observations are
+noisy and need not form a mutually consistent gradient field, so integrating
+them independently along different paths can accumulate drift. Our approach
+instead estimates a field jointly, balancing agreement with the local gradient
+observations against variation along fibres. A shared coarse reference carries
+a common origin and scale into finer regions, helping their local refinements
+remain mutually consistent.
 
-An earlier exploratory note claimed zero conflicts in 75,888 redundant
-edges. Its generator and log were not preserved, so that number has been
-removed from the validated release claims.
+The open problem is making that coherence preserve the physical winding count.
+A constant field has no within-layer drift, and a compressed field can improve
+that metric while losing separation between neighbouring layers. Reliable
+counting therefore also requires justified orientation and calibration,
+validation of between-layer separation, and explicit treatment of missing
+evidence. Folds, breaks and the topology of a rolled sheet can require cuts or
+linked local coordinate patches rather than one globally smooth numbering.
+We assess candidates through coverage, intrafibre drift, separation controls
+and matched CT overlays; smooth contours or numerical convergence alone do not
+establish that the inferred layers are physically correct.
 
-![Candidate graph connectivity](figures/field_figure.png)
+## Install
 
-## Winding-assignment result
+Target interpreters: Python 3.11 and 3.12 on Linux and macOS. CI is configured for
+both Python versions on Linux. Tests run on CPU; GPU execution needs a compatible
+CUDA installation. Process-supervision tools use Unix facilities.
 
-The experiments cover three solver architectures, one matching-tolerance
-sensitivity test, and one independent-segment replication:
+```bash
+python -m venv .venv && source .venv/bin/activate
+python -m pip install -e ".[test,dev]"
+```
 
-| Experiment | Corrected GATE3 disagreement | Aggregate segment jumps |
-|---|---:|---:|
-| Confidence-priority spanning tree | 45.8% | 6,912 / 27,665 (24.985%) |
-| Global weighted least-squares relaxation | 44.2% | 5,955 / 27,665 (21.525%) |
-| Triangle-filtered spanning tree | 44.7% | 6,825 / 25,622 (26.637%) |
-| Confidence tree, tighter nominal tolerance | 43.8% | 7,369 / 27,665 (26.637%) |
-| Confidence tree, independent segment | - | 7,061 / 29,475 (23.956%) |
+Optional extras: `surface` for mesh/atlas tools, `data` for Zarr, `plot` for
+Matplotlib, or `all` for the runtime/test features. Modules install flat
+(`field_solver`, `physical_grid`, etc.); use a virtual environment to avoid name
+collisions. The wheel contains `src/`; command-line tools live in the checkout.
 
-GATE3 is the fraction of matched candidate wrap pairs whose solved winding
-values violate the expected same-sheet relation after accounting for the
-theta seam. It is distinct from GATE1 vote purity. The segment metric is the
-fraction of consecutive Viterbi-path transitions whose winding increment
-deviates by more than 0.5 from the continuous angular increment.
+## Minimal example
 
-The public audit now reports numerator, denominator, per-row rates, aggregate
-rate, and endpoint residual. On Method 1 it reproduces
-`6912/27665 = 24.985%`; its deterministic per-ray shuffle control gives
-`24960/27665 = 90.222%`. That large degradation confirms that the readout
-prior is not imposing the real field's lower jump rate.
+```bash
+python -I examples/minimal_field.py
+```
 
-## Correction record
+It solves and checks a synthetic ramp:
 
-The original solvers shared a sign error (offsets propagated with `+m`
-where the coordinate construction requires `-m`), which inflated GATE3 to
-68.5-70.5% and the segment audits to ~57-58%. Verified fix: a known-truth
-synthetic spiral recovers 100% of winding labels under the corrected sign
-(`python sign_convention_selftest.py`, 6 assertions), and the corrected
-reruns preserve every sign-independent guard metric bit-for-bit. Original
-scripts, corrected twins, raw logs and the full derivation:
-`docs/NEGATIVE_RESULT.md` and `docs/evidence/`.
+```text
+converged: True
+field[0,0,:]: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+```
 
-## Repository contents
+The main library interface is [`field_solver.solve_field`](src/field_solver.py).
+It accepts NumPy arrays, nested sequences or PyTorch tensors and returns a NumPy
+`float32` field plus a JSON-compatible receipt. Coordinates/gradients are XYZ;
+arrays are ZYX. Defaults are CPU, unit spacing, `lam=3`, `rtol=1e-5`,
+`maxiter=4000` and no reference penalty. Arguments are explicit; the solver reads
+no configuration files. Fixed nodes take exact values, and without effective
+anchors node zero fixes the gauge. Invalid inputs raise `ValueError`;
+nonconvergence is reported in the receipt and must block publication.
+
+## Generate and evaluate
+
+### Try the complete benchmark offline
+
+```bash
+python examples/benchmark_demo.py --output /tmp/winding-benchmark-demo
+```
+
+Choose a new output directory each time. This creates a tiny synthetic case,
+an analytic candidate and CT-like layer images, then runs the real evaluator.
+No private data, model weights, GPU or network access is needed.
+
+Expected final checks: **6/6 fibre pairs covered, 3/3 synthetic separation pairs
+correct, and 0/3 for both collapse controls**. Open
+`/tmp/winding-benchmark-demo/evaluation/ct-winding.png` for the overview, or
+`TABLES.md` / `SUMMARY.json` alongside it for the scores. All demo tables and
+images are labeled synthetic. These numbers illustrate the interface, not real
+scroll performance.
+
+### Evaluate supplied observations or predictions
+
+The producer and evaluator communicate through saved artifacts:
+
+```text
+observations + constraints → producer → field.npy + metadata + optional support
+                                          ↓
+                              frozen case + evaluator
+                                          ↓
+                         metrics, controls, CT pictures, hashes
+```
+
+- [`tools/run_coherence.py`](tools/run_coherence.py) runs the current coherence
+  methods on synthetic or supplied hash-bound data. Start with `--help`.
+- [`benchmarks/winding/evaluate.py`](benchmarks/winding/evaluate.py) scores a
+  saved candidate without importing the solver or PyTorch:
+
+```bash
+python benchmarks/winding/evaluate.py \
+  --case "$CASE" --field "$FIELD" --metadata "$METADATA" \
+  --output "$NEW_RUN"
+```
+
+Use `--check-only` with a separate new output directory for preflight. A case can
+also request matched CT/winding pictures. See the
+[benchmark guide](benchmarks/winding/README.md) for the case, candidate and visual
+contracts. Version 1 uses the Paris4 L2 coordinate convention; other producers
+must export the declared frame and units. All/reserved tables, unavailable
+denominators and separation/collapse controls remain explicit.
+
+## Layout
 
 | Path | Purpose |
 |---|---|
-| `build_field.py` | Candidate graph, union-find labels, reference BFS field |
-| `validate_field.py` | Validation of a `build_field.py` output and double-gap census |
-| `method*_corrected.py` | Corrected full-volume solver experiments |
-| `method*.py` | Preserved original experiments, including the sign bug |
-| `audit_segment.py` | Public Viterbi segment audit and shuffle control |
-| `sign_convention_selftest.py` | Known-truth synthetic sign test |
-| `figures/make_field_figure.py` | Full graph recomputation and figure generator |
-| `docs/NEGATIVE_RESULT.md` | Scientific account and correction history |
-| `WRITEUP.md` | Combined community write-up (Part A here + Part B in neural-tracing-audit) |
-| `docs/EVIDENCE.md` | Exact artifacts, commands, logs, and arithmetic |
-| `docs/evidence/` | Original/corrected raw run logs and checksums |
-| `artifacts/axis.npy` | Exact axis used by the segment audits |
+| `src/` | Solver, constraints, physical grids, references, topology, data adapters and shared evaluation helpers |
+| `benchmarks/winding/` | Current artifact evaluator, metrics, independent interpolation, CT renderer and tests |
+| `tools/` | Coherence runner, supervision, error auditing and surface export/probe/atlas tools |
+| `tests/` | Synthetic unit, integration and regression tests |
+| `examples/` | Small executable library example |
+| `.github/` | CI, dependency-update configuration and contribution templates |
 
-## Reproduction
-
-Download the five NPZ release assets listed in `docs/EVIDENCE.md` to the
-repository root and verify them together with the bundled axis:
+## Checks
 
 ```bash
-shasum -a 256 -c docs/CHECKSUMS.txt
+python -m pytest -q --cov=src --cov-report=term-missing
+ruff format --check .
+ruff check .
+mypy
 ```
 
-Run the corrected solvers:
+CI enforces a 90% statement-coverage floor across all `src/` modules. Mypy checks
+annotated functions and a typed solver caller; unannotated research-function
+bodies and array shapes/ranges still rely on runtime checks and tests.
 
-```bash
-python method1_confidence_mst_corrected.py
-python method2_weighted_least_squares_corrected.py
-python method3_triangle_confirmed_corrected.py
-python method4_tight_tolerance_corrected.py
-```
+The Audit badge reports the latest GitHub Actions push on `main`. The coverage
+badge is a local snapshot from October 14, 2026: **403 tests passed, 91.67%
+statement coverage**, on macOS with Python 3.11 / NumPy 2.4.6 and Python 3.12 /
+NumPy 2.5.0. Refresh it after a measured change; it is not a live coverage feed.
 
-Recompute graph connectivity and the figure:
+## Data and contribution
 
-```bash
-python figures/make_field_figure.py
-```
+Real CT, AFVs, model weights, coordinate annotations and evaluation runs are
+external inputs/outputs; the README cover is the sole included real-data
+illustration. The public tests generate synthetic fixtures. Follow
+[DATA.md](DATA.md) for data handling and external terms; the project's
+[MIT license](LICENSE) applies to repository-authored code, not external assets.
 
-The exact public PPM and transform commands for both segment audits are in
-`docs/EVIDENCE.md`.
-
-## Tests
-
-```bash
-python -m unittest discover -s tests
-python sign_convention_selftest.py
-```
-
-The unit suite covers matching, graph reporting, artifact schemas, component
-handling, shuffling, transition arithmetic, PPM-header parsing, and census
-helpers. The synthetic test exercises the complete sign-sensitive pipeline.
-
-## Interpretation and next work
-
-The current radius-proximity field is useful as a weak, explicitly uncertain
-prior and as a way to localize difficult regions; it is not suitable for
-automatic winding labels. High-value alternatives remain open: monotone
-sequence alignment with insertion/deletion penalties, theta-first solves
-with robust z synchronization, local axis/radial-warp estimation, subvoxel
-ridge centers, and surface-normal/tangent or learned correspondence signals.
-Finer sampling has not been isolated experimentally and is not ruled out.
-
-## License
-
-MIT. Referenced scan data is CC BY-NC 4.0 from the Vesuvius Challenge.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and compatibility rules,
+and [SECURITY.md](SECURITY.md) for vulnerability reporting. Maintenance is
+best-effort, with no release cadence or support SLA.

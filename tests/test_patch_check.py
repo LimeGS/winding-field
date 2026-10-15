@@ -51,16 +51,25 @@ def test_no_coverage_is_not_a_pass_and_invalid_scale_is_rejected():
         evaluate_patch(np.zeros((4, 4, 4)), xyz, [0] * 3, [1] * 3, 0, 0, 2)
 
 
-def test_paris_configuration_cannot_silently_claim_rgt(monkeypatch):
+def test_tifxyz_sentinel_stays_unavailable_inside_a_negative_origin_field():
+    from patch_check import evaluate_patch
+
+    xyz = np.array([[[0, 0, 0], [-1, -1, -1]]], float)
+    result, residual = evaluate_patch(np.zeros((4, 4, 4)), xyz, [-2] * 3, [1] * 3, 1, margin=0)
+    assert result["valid_points"] == result["covered_points"] == 1
+    assert np.isnan(residual[0, 1])
+
+
+def test_configuration_cannot_silently_claim_rgt(monkeypatch, paris_inputs):
     from paris_solve import run_config
 
     monkeypatch.setenv("ORIENT", "rgt")
-    with pytest.raises(ValueError, match="ORIENT"):
-        run_config()
+    with pytest.raises(ValueError, match="orientation"):
+        run_config(paris_inputs.config)
     monkeypatch.setenv("ORIENT", "umbi")
     monkeypatch.setenv("LAM", "10")
     monkeypatch.setenv("AFV", "/tmp/independent.afv")
-    config = run_config()
+    config = run_config(paris_inputs.config)
     assert config["lam"] == 10
     assert config["afv"] == "/tmp/independent.afv"
 
@@ -88,7 +97,7 @@ def test_lasagna_normals_decode_hemisphere_not_cosine_phase():
 def test_paris_non_cubic_window_has_zyx_shape():
     from paris_solve import working_shape
 
-    assert working_shape(np.array([10, 20, 30]), np.array([30, 60, 90])) == (30, 20, 10)
+    assert working_shape(np.array([10, 20, 30]), np.array([30, 60, 90]), spacing=2) == (30, 20, 10)
 
 
 @pytest.mark.parametrize("problem", [None, "format", "dimensions", "missing_channel"])

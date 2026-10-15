@@ -19,8 +19,8 @@ python examples/benchmark_demo.py --output /tmp/winding-benchmark-demo
 ```
 
 This creates all case inputs, a synthetic candidate and analytic separation
-checks. It uses the v1 coordinate convention but contains no real Paris4 data
-or human annotations. The evaluator's `human` result key holds those synthetic
+checks. Its v2 case declares a synthetic frame and physical transform; it contains
+no real scan data or human annotations. The evaluator's `human` result key holds those synthetic
 separation checks in this demo. The generated `inputs/case.json` is a complete
 example of the case contract, and `evaluation/` contains scores and pictures.
 
@@ -47,34 +47,48 @@ Use a different output directory for each attempt. Exit 0 means preflight or
 evaluation completed; exit 2 means an input/verification error. An existing
 output is never overwritten. `ERROR.json` records failures in a newly created run.
 
-## Case contract, version 1
+## Case contract, version 2
 
 A case is a JSON document with:
 
 | Field | Meaning |
 |---|---|
-| `schema` | `winding-benchmark-case-v1` |
+| `schema` | `winding-benchmark-case-v2` |
 | `scope` | Frozen selection key, e.g. `whole_coarse` or `fine_assembled` |
-| `frame` | `PHercParis4/20260411134726:L2` for this version |
+| `frame` | Nonempty world-frame identifier matching the candidate and references |
+| `voxel_um` | Positive micrometres per world-coordinate unit |
+| `native_to_world` | Positive XYZ `scale_xyz` and finite `offset_xyz` for stored AFV coordinates |
+| `population` | `all` or `all_and_reserved`; the latter requires a valid supplied split |
 | `step` | Fixed calibration declared by the case publisher |
 | `expected_selected` | Expected population size, including unavailable predictions |
-| `expected_human` | Number of reused human development pairs |
-| `human_method` | Method containing those source records, currently `whole_coarse_secondary` |
+| `expected_human` | Number of supplied reference pairs; zero when no reference is supplied |
+| `human_method` | Selected method key in the supplied reference file, when present |
 | `requires_support` | Whether a candidate support mask is mandatory |
 | `synthetic` | Optional boolean, default false; marks demonstration tables and receipts |
-| `artifacts` | Entries `selection`, `plan`, `seal`, `audit`, `afv`, `split`, `human`, each with `path` and `sha256` |
+| `artifacts` | Required `selection`, `plan`, `seal`, `audit`, `afv`; optional `split`, `human`. Each entry has `path` and `sha256` |
 
 Artifact paths are absolute or relative to the case JSON. The seal binds selected
 pairs to their plan; the plan/audit binds the original AFV. The balanced split is
-validated against that AFV. The case is supplied by the benchmark curator,
+validated against that AFV when supplied. Without a split, an `all` case checks
+selected IDs against the AFV database and reports reserved diagnostics as not
+evaluated. Missing human references are not replaced by predictions or fake labels.
+The case is supplied by the benchmark curator,
 independently of candidate scores. Changing its hashes/population creates a
 different case, not another result on the same benchmark.
 
-Version 1 deliberately retains this Paris4 protocol: native XYZ coordinates at
-2.4 µm are divided by four into the L2 frame, with the original arclength bins,
-trilinear sampling and one candidate-grid-node outer margin. Other resolutions
-are supported, but their physical margin/coverage can differ and must be compared.
-This is not yet a generic multi-scroll dataset specification.
+Coordinates are converted by `world = native * scale_xyz + offset_xyz`.
+The plan's `native_voxel_mm` (scalar or XYZ vector) must agree with
+`scale_xyz * voxel_um / 1000`. There is no implicit `/4`, scan registry or fixed
+physical voxel size. The original arclength bins, trilinear interpolation and
+one candidate-grid-node outer margin remain unchanged. Different resolutions
+and support may change physical coverage and must be reported alongside errors.
+
+Older `winding-benchmark-case-v1` descriptors remain usable when explicit
+coordinate information is available. If it is absent, pass `--config dataset.json`
+to supply the matching frame, AFV and native/world geometry without modifying
+the original case, plan, selection or seal. That configuration becomes another
+hashed input. Alternatively, create a new v2 descriptor referencing the original
+immutable artifacts. A changed coordinate context is not the same benchmark.
 
 Real AFVs, coordinate selections and human source rows are not distributed here.
 Case descriptors and their full input hashes belong with the external data/run
@@ -84,8 +98,8 @@ preserving those identities; do not recreate a selection after seeing errors.
 ## Candidate contract
 
 The NPY must contain a numeric ZYX scalar volume. The JSON sidecar supplies
-`field_sha256`, `frame`, `origin_xyz`, positive `spacing_xyz`, `shape_zyx`, and
-`step`. Frame/units/calibration must match the case; no score-based rescaling or
+`field_sha256`, `frame`, `origin_xyz`, positive `spacing_xyz`, `shape_zyx`,
+`voxel_um`, and `step`. Frame/units/calibration must match the case; no score-based rescaling or
 offset fitting occurs. Nonfinite values are allowed only outside explicit support.
 
 An optional `solver` receipt is respected: if present, `converged` must be true.
@@ -95,8 +109,8 @@ of producers. Numerical success never certifies physical sheet identity.
 
 ## Evidence emitted
 
-- `PREFLIGHT.json`: input and evaluator-source hashes, counts, environment and
-  declared candidate receipt.
+- `PREFLIGHT.json`: input and evaluator-source hashes, coordinate transform,
+  physical units, population, counts, environment and declared candidate receipt.
 - `predictions.npz`: sampled endpoint values and per-pair errors in frozen
   selection order; unavailable values remain NaN.
 - `SUMMARY.json` / `TABLES.md`: all-fibre and reserved tables, human separation,
@@ -110,7 +124,7 @@ A case may add this block (paths resolve relative to the case JSON):
 ```json
 {
   "visualization": {
-    "schema": "ct-winding-overlays-v1",
+    "schema": "ct-winding-overlays-v2",
     "archive_manifest": {
       "path": "ct-archive/MANIFEST.json",
       "sha256": "<SHA-256 of the frozen archive manifest>"
@@ -135,13 +149,24 @@ These files are included in the run manifest and linked from `SUMMARY.json`.
 Omit `reference_key` for two columns (CT + candidate). With it, the middle column
 uses the frozen reference samples and the final column uses the **current field**.
 
-V1 consumes the existing overlay archive format: a hash-bound `RECEIPT.json` and
-`XY-samples.npz`, `XZ-samples.npz`, `YZ-samples.npz`. Each NPZ supplies observed
-uint8 `ct`; a selected reference key additionally needs matching values and a
-`<key>_valid` mask. The receipt fixes the L2 origin/extent, slice positions, 9.6 µm
-pixel size, CT window, integer contour levels and source field identities. All
-those identities/geometries are checked before scoring. CT is read locally from
-the archive; evaluation does not download or infer CT.
+V2 consumes a hash-bound `RECEIPT.json` and ordered `XY-samples.npz`,
+`XZ-samples.npz`, `YZ-samples.npz`. Each NPZ supplies finite numeric `ct`, including
+uint8/uint16 or floating-point arrays. A selected reference key additionally
+needs matching values and a `<key>_valid` mask.
+
+The receipt declares matching `frame`, `step`, `voxel_um`, world `origin_xyz`,
+integer pixel counts `size_xyz`, positive world `spacing_xyz`, `ct_window`,
+consecutive integer `contour_levels`, `field_sha256`, `input_ct` and `ct_url`.
+Each plane declares its `name`, `fixed_axis_xyz`, `fixed_position_world` and
+`ct_pixels`. Positions must identify actual slices of that grid. Physical pixel
+sizes and plot axes follow the declared XYZ spacing, not a named scan or mip.
+All identities/geometries are checked before scoring. CT is read locally from
+the archive; evaluation does not download or infer it.
+
+Legacy `ct-winding-overlays-v1` archives with `fixed_position_l2` remain readable.
+When they omit spacing, their declared mip/native-scale relationship must imply
+unit world sampling. Nonunit sampling needs explicit `spacing_xyz`; the reader
+does not guess a conversion from a scan name.
 
 Views use the inherited gauge and fixed `phi / step` levels; there is no alignment
 or contrast/range fitting per candidate. Unsupported samples stay missing.

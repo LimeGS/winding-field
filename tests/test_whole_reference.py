@@ -4,12 +4,22 @@ import sys
 import numpy as np
 import pytest
 
+GEOMETRY = dict(transform=dict(scale_xyz=[0.25] * 3, offset_xyz=[0, 0, 0]), voxel_mm=0.0096)
+
 
 @pytest.fixture
 def run_global(paris_inputs, monkeypatch):
     import whole_reference
 
     def run(name="global", *options):
+        from conftest import LB, MB
+
+        data = json.loads(json.dumps(paris_inputs.raw_config))
+        for key, channel in (("nx", "nx"), ("ny", "ny"), ("density", "grad_mag")):
+            data["sources"][key].update(path=f"{LB}_{channel}.ome.zarr/5", spacing_xyz=[8] * 3)
+        data["sources"]["surface"].update(path=MB + "/3", spacing_xyz=[8] * 3)
+        config = paris_inputs.root / "global-config.json"
+        config.write_text(json.dumps(data))
         output = paris_inputs.root / name
         monkeypatch.setattr(
             sys,
@@ -24,8 +34,8 @@ def run_global(paris_inputs, monkeypatch):
                 "16",
                 "--device",
                 "cpu",
-                "--data-root",
-                str(paris_inputs.root),
+                "--config",
+                str(config),
                 *map(str, options),
             ],
         )
@@ -68,7 +78,7 @@ def test_global_fibres_reach_solver_and_change_solution(tmp_path):
     assert hasattr(w, "global_fibre_constraints"), "global fibres are not implemented"
     db = tmp_path / "f.afv"
     fibre_db(db, [(1, [[0, 0, 0], [256, 0, 0]], {})])
-    pairs, audit = w.global_fibre_constraints(db, [0, 0, 0], [32, 32, 32], [1, 1, 3])
+    pairs, audit = w.global_fibre_constraints(db, [0, 0, 0], [32, 32, 32], [1, 1, 3], **GEOMETRY)
     np.testing.assert_array_equal(pairs, [[0, 2]])
     from field_solver import solve_field
 
@@ -88,7 +98,7 @@ def test_global_selection_has_no_400_fibre_or_2000_pair_cap(tmp_path):
     db = tmp_path / "f.afv"
     points = [[i * 128, 0, 0] for i in range(8)]
     fibre_db(db, [(i, points, {}) for i in range(501)])
-    pairs, audit = w.global_fibre_constraints(db, [0, 0, 0], [32] * 3, [1, 1, 8])
+    pairs, audit = w.global_fibre_constraints(db, [0, 0, 0], [32] * 3, [1, 1, 8], **GEOMETRY)
     assert len(audit["used_fibre_ids"]) == 501
     assert len(pairs) == 501 * 8
 
@@ -108,7 +118,7 @@ def test_global_exclusion_follows_ids_and_recorded_lineage(tmp_path):
         ],
     )
     pairs, audit = w.global_fibre_constraints(
-        db, [0, 0, 0], [32] * 3, [1, 1, 3], excluded_ids={1}, excluded_lineage={("A", "10")}
+        db, [0, 0, 0], [32] * 3, [1, 1, 3], excluded_ids={1}, excluded_lineage={("A", "10")}, **GEOMETRY
     )
     assert audit["used_fibre_ids"] == [3]
     assert audit["excluded_fibres"] == 2
@@ -121,7 +131,7 @@ def test_global_fibres_do_not_bridge_outside_runs_or_clamp(tmp_path):
     assert hasattr(w, "global_fibre_constraints"), "global fibres are not implemented"
     db = tmp_path / "f.afv"
     fibre_db(db, [(1, [[0, 0, 0], [512, 0, 0], [256, 0, 0]], {}), (2, [[0, 0, 0], [1, 0, 0]], {})])
-    pairs, audit = w.global_fibre_constraints(db, [0, 0, 0], [32] * 3, [1, 1, 3])
+    pairs, audit = w.global_fibre_constraints(db, [0, 0, 0], [32] * 3, [1, 1, 3], **GEOMETRY)
     assert pairs.shape == (0, 2)
     assert audit["used_fibre_ids"] == []
 
@@ -132,10 +142,10 @@ def test_global_constraint_geometry_checks_non_cubic_physical_frame(tmp_path):
     assert hasattr(w, "global_fibre_constraints"), "global fibres are not implemented"
     db = tmp_path / "f.afv"
     fibre_db(db, [(1, [[40, 80, 120], [296, 848, 1656]], {})])
-    pairs, _ = w.global_fibre_constraints(db, [10, 20, 30], [32, 64, 96], [5, 4, 3])
+    pairs, _ = w.global_fibre_constraints(db, [10, 20, 30], [32, 64, 96], [5, 4, 3], **GEOMETRY)
     np.testing.assert_array_equal(pairs, [[0, 59]])
     with pytest.raises(ValueError):
-        w.global_fibre_constraints(db, [10, 20, 30], [0, 64, 96], [5, 4, 3])
+        w.global_fibre_constraints(db, [10, 20, 30], [0, 64, 96], [5, 4, 3], **GEOMETRY)
 
 
 def test_reservation_rejects_another_afv_with_same_integer_ids(tmp_path):
@@ -204,9 +214,9 @@ def test_global_cli_publishes_only_hash_bound_converged_fields(run_global, mode)
         assert (output / "continuous_constraints.npz").exists()
 
 
-@pytest.mark.parametrize("change", ["none", "field", "observations", "scale", "mask"])
+@pytest.mark.parametrize("change", ["none", "field", "observations", "scale", "mask", "prediction_config"])
 def test_global_baseline_guard_binds_data_scale_and_anchors(paris_inputs, run_global, change):
-    from paris_solve import LB
+    from conftest import LB
 
     baseline = run_global("baseline") / "coarse.npy"
     if change == "field":
@@ -221,6 +231,8 @@ def test_global_baseline_guard_binds_data_scale_and_anchors(paris_inputs, run_gl
         mask = np.load(baseline.parent / "outer_anchor_mask.npy")
         mask[1, 1, 2] = True
         np.save(baseline.parent / "outer_anchor_mask.npy", mask)
+    elif change == "prediction_config":
+        paris_inputs.raw_config["prediction"]["density_scale"] *= 2
     if change == "none":
         output = run_global("candidate", "--baseline-field", baseline)
         np.testing.assert_array_equal(np.load(output / "coarse.npy"), np.load(baseline))
@@ -233,7 +245,8 @@ def test_global_baseline_guard_binds_data_scale_and_anchors(paris_inputs, run_gl
 
 @pytest.mark.parametrize("problem", ["anchors", "fibres", "numerical_overflow"])
 def test_global_cli_refuses_missing_evidence_and_failed_solves(paris_inputs, run_global, problem):
-    from paris_solve import CTB, LB
+    from conftest import CTB, LB
+
     from patch_check import sha256
 
     options = []
@@ -259,3 +272,38 @@ def test_reservation_rejects_malformed_identity_lists(paris_inputs, fibres, line
 
     with pytest.raises(ValueError, match="invalid fibre exclusion"):
         validate_reservation(dict(fibre_ids=fibres, source_lineage=lineage), paris_inputs.afv)
+
+
+def test_whole_reference_uses_declared_black_value(paris_inputs, run_global):
+    from conftest import CTB
+
+    shape = paris_inputs.volumes[CTB + "/5"].shape
+    paris_inputs.volumes[CTB + "/5"] = np.full(shape, -1000, np.int16)
+    paris_inputs.raw_config["context"]["black_value"] = -1000
+    output = run_global("nonzero-background")
+    assert np.isfinite(np.load(output / "coarse.npy")).all()
+    assert np.load(output / "outer_anchor_mask.npy").sum() == 54
+
+
+@pytest.mark.parametrize("mode", ["nodal", "trilinear_pairs"])
+def test_whole_reference_respects_solver_budget(paris_inputs, run_global, mode):
+    paris_inputs.raw_config["solver"] = dict(maxiter=1, rtol=1e-10)
+    with pytest.raises(ValueError, match="cannot publish"):
+        run_global("budget", "--constraint-mode", mode)
+    info = json.loads((paris_inputs.root / "budget/solver.json").read_text())
+    assert info["iterations"] == 1 and not info["converged"]
+
+
+def test_whole_continuous_constraints_honor_sampling_and_trace(paris_inputs, run_global):
+    from field_constraints import QuadraticConstraints
+
+    paris_inputs.raw_config["constraints"] = dict(pair_weight=0.2, pitch_mm=0.4, trace_target=83.75)
+    output = run_global("configured", "--constraint-mode", "trilinear_pairs")
+    assert QuadraticConstraints.load(output / "continuous_constraints.npz").trace == pytest.approx(83.75)
+    assert json.loads((output / "continuous-audit.json").read_text())["pitch_mm"] == 0.4
+
+
+def test_nodal_mode_rejects_an_inapplicable_uniform_sampling_request(paris_inputs, run_global):
+    paris_inputs.raw_config["constraints"] = dict(pitch_mm=0.4)
+    with pytest.raises(ValueError, match="unsupported"):
+        run_global("unsupported", "--constraint-mode", "nodal")

@@ -40,7 +40,7 @@ def test_loader_preserves_legacy_selection_boundaries_and_stable_identity(tmp_pa
     }
     path = tmp_path / "relwind.json"
     path.write_text(json.dumps({"collections": {"c": {"points": points}}}))
-    rows, colls, exclusions = load_pair_records(path)
+    rows, colls, exclusions = load_pair_records(path, 10000, 11000, max_dw=6)
     assert {(r["point_a_id"], r["point_b_id"], r["dw"]) for r in rows} == {
         ("a", "b", 1),
         ("a", "c", 6),
@@ -51,7 +51,7 @@ def test_loader_preserves_legacy_selection_boundaries_and_stable_identity(tmp_pa
     assert colls["c"].shape == (7, 3)
     assert len({r["pair_id"] for r in rows}) == 5
     path.write_text(json.dumps({"collections": {"c": {"points": dict(reversed(list(points.items())))}}}))
-    reordered, _, _ = load_pair_records(path)
+    reordered, _, _ = load_pair_records(path, 10000, 11000, max_dw=6)
     assert rows == reordered
     assert all("reason" in e for e in exclusions)
 
@@ -156,7 +156,7 @@ def test_nonfinite_samples_margin_missing_annotations_and_empty_input():
         {"step": float("nan")},
         {"step": -1},
         {"shape_zyx": [8, 3, 3]},
-        {"frame": "PHerc1447:L2"},
+        {"frame": ""},
         {"origin_xyz": [0, 0, float("inf")]},
         {"spacing_xyz": [1, 0, 1]},
     ],
@@ -179,6 +179,35 @@ def test_duplicate_pair_receipts_are_rejected():
     rows, _ = score_pairs(field, metadata(), [record()])
     with pytest.raises(ValueError, match="duplicate"):
         summarize_rows(rows + rows)
+
+
+def test_pair_frame_is_explicit_and_negative_world_coordinates_are_valid():
+    from paris_pair_check import score_pairs
+
+    field = np.broadcast_to(np.arange(8, dtype=float), (3, 3, 8))
+    meta = dict(metadata(), frame="different-volume/world", origin_xyz=[-10, -20, -30])
+    pair = dict(record(a=(-10, -19, -29), b=(-8, -19, -29)), frame=meta["frame"])
+    rows, summary = score_pairs(field, meta, [pair])
+    assert summary["correct"] == 1 and rows[0]["frame"] == meta["frame"]
+    pair["frame"] = "not-the-field-frame"
+    with pytest.raises(ValueError, match="frame"):
+        score_pairs(field, meta, [pair])
+
+
+def test_annotation_loader_has_no_implicit_scan_window_or_maximum_winding(tmp_path):
+    from paris_pair_check import load_pair_records
+
+    path = tmp_path / "labels.json"
+    path.write_text(
+        json.dumps(
+            dict(
+                frame="different-volume/world",
+                collections={"c": dict(points={"a": dict(p=[1, 1, 12], wind_a=0), "b": dict(p=[2, 1, 13], wind_a=12)})},
+            )
+        )
+    )
+    rows, _, _ = load_pair_records(path)
+    assert len(rows) == 1 and rows[0]["dw"] == 12 and rows[0]["frame"] == "different-volume/world"
 
 
 @pytest.mark.parametrize("values", [[0] * 8, [0, 0, 1, 1, 2, 2, 3, 3]])

@@ -23,8 +23,8 @@ def pilot_command(inputs, output):
         "1",
         "--device",
         "cpu",
-        "--data-root",
-        str(inputs.root),
+        "--config",
+        str(inputs.config),
         "--sweeps",
         "1",
     ]
@@ -58,8 +58,9 @@ def test_non_cubic_affine_pilot_preserves_physical_endpoints_and_zero_gauge():
 
 
 def test_pilot_cli_runs_real_solver_and_records_transport_failure(paris_inputs):
+    from conftest import LB
+
     from coarse_reference import main
-    from paris_solve import LB
     from patch_check import sha256
 
     output = paris_inputs.root / "pilot"
@@ -78,17 +79,23 @@ def test_pilot_cli_runs_real_solver_and_records_transport_failure(paris_inputs):
     assert not (failed / "assembled.npy").exists()
 
 
-@pytest.mark.parametrize("tamper", [None, "frame", "file_hash", "digest"])
+@pytest.mark.parametrize(
+    "tamper", [None, "frame", "file_hash", "digest", "units", "constraint_units", "constraint_step"]
+)
 def test_pilot_cli_checks_continuous_constraint_identity(paris_inputs, tamper):
+    from conftest import FRAME
+
     from coarse_reference import main
     from field_constraints import pair_constraints
-    from paris_data import FRAME, save_field
+    from paris_data import save_field
     from patch_check import sha256
 
     shape = (3, 40, 40)
-    metadata = dict(frame=FRAME, origin_xyz=[0, 0, 0], spacing_xyz=[1, 1, 1], shape_zyx=list(shape))
+    metadata = dict(frame=FRAME, voxel_um=9.6, origin_xyz=[0, 0, 0], spacing_xyz=[1, 1, 1], shape_zyx=list(shape))
     reference = paris_inputs.root / "reference.npy"
-    save_field(reference, np.broadcast_to(0.1 * np.arange(40, dtype=float), shape), metadata, {"converged": True})
+    save_field(
+        reference, np.broadcast_to(0.1 * np.arange(40, dtype=float), shape), metadata, {"converged": True}, step=2
+    )
     constraints = pair_constraints([[8, 20, 1]], [[32, 20, 1]], [0, 0, 0], [1, 1, 1], shape)
     path = paris_inputs.root / "constraints.npz"
     constraints.save(path)
@@ -99,6 +106,15 @@ def test_pilot_cli_checks_continuous_constraint_identity(paris_inputs, tamper):
         sidecar["file_sha256"] = "0" * 64
     elif tamper == "digest":
         sidecar["constraint_digest"] = "0" * 64
+    elif tamper == "units":
+        ref_meta_path = reference.with_suffix(".npy.json")
+        ref_meta = json.loads(ref_meta_path.read_text())
+        ref_meta["voxel_um"] = 12
+        ref_meta_path.write_text(json.dumps(ref_meta))
+    elif tamper == "constraint_units":
+        sidecar["voxel_um"] = 96
+    elif tamper == "constraint_step":
+        sidecar["step"] = 99
     path.with_suffix(".npz.json").write_text(json.dumps(sidecar))
     output = paris_inputs.root / "pilot"
     code = main(
@@ -546,3 +562,79 @@ def test_long_crossing_pair_is_preserved_by_pilot_sweeps(external_reference):
     assert any(tile["pairs"]["crossing_pairs"] for tile in receipt["tiles"])
     assert all(np.isfinite(p["global_residual_norm"]) for p in receipt["passes"])
     assert receipt["passes"][-1]["global_residual_norm"] < receipt["passes"][0]["global_residual_norm"]
+
+
+def masked_reference(root, support, spacing=(1, 1, 1)):
+    from paris_data import save_field
+    from patch_check import sha256
+
+    field = root / "masked-reference.npy"
+    metadata = dict(
+        frame="masked/world",
+        voxel_um=12,
+        origin_xyz=[0, 0, 0],
+        spacing_xyz=list(spacing),
+        shape_zyx=list(support.shape),
+        support="reference-support.npy",
+    )
+    np.save(root / metadata["support"], support)
+    metadata["support_sha256"] = sha256(root / metadata["support"])
+    values = np.broadcast_to(np.arange(support.shape[2], dtype=float) * spacing[0], support.shape)
+    save_field(field, values, metadata, {"converged": True}, step=1)
+    return field, field.with_suffix(".npy.json")
+
+
+@pytest.mark.parametrize("problem", ["unsupported", "hash", "unneeded_hole"])
+def test_reference_mask_identity_and_requested_stencils_are_enforced(tmp_path, problem):
+    from coarse_reference import load_external_reference
+
+    support = np.ones((5, 5, 5), bool)
+    support[
+        2 if problem == "unsupported" else 3, 2 if problem == "unsupported" else 3, 2 if problem == "unsupported" else 3
+    ] = False
+    field, metadata = masked_reference(tmp_path, support)
+    if problem == "hash":
+        data = json.loads(metadata.read_text())
+        data["support_sha256"] = "0" * 64
+        metadata.write_text(json.dumps(data))
+    args = (field, metadata, "masked/world", np.array([1, 1, 1]), np.ones(3), (2, 2, 2), 1)
+    if problem == "unneeded_hole":
+        load_external_reference(*args, voxel_um=12)
+    else:
+        with pytest.raises(ValueError, match="support"):
+            load_external_reference(*args, voxel_um=12)
+
+
+def test_reference_support_is_checked_on_coarse_as_well_as_fine_samples(tmp_path):
+    from coarse_reference import run_pilot_arrays
+
+    support = np.ones((5, 15, 9), bool)
+    support[0, 7, 0] = False  # y=3.5: used by coarse sampling, not integer fine samples.
+    field, metadata = masked_reference(tmp_path, support, [0.5] * 3)
+    shape = (3, 8, 5)
+    _, assembled, _, receipt = run_pilot_arrays(
+        np.broadcast_to([1.0, 0, 0], (*shape, 3)),
+        np.ones(shape),
+        1,
+        halo=1,
+        sweeps=1,
+        external_reference=field,
+        external_metadata=metadata,
+        metadata=dict(frame="masked/world", voxel_um=12),
+        sheet_step=1,
+    )
+    assert assembled is None and receipt["status"] == "ERROR"
+    assert "support" in receipt["error"]["message"].lower()
+
+
+def test_coarse_cli_honors_configured_solver_budget(paris_inputs):
+    from coarse_reference import main
+
+    data = paris_inputs.raw_config
+    data["solver"] = dict(maxiter=1, rtol=1e-10)
+    paris_inputs.config.write_text(json.dumps(data))
+    output = paris_inputs.root / "limited-pilot"
+    assert main(pilot_command(paris_inputs, output)) == 2
+    receipt = json.loads((output / "receipt.json").read_text())
+    assert receipt["configuration"]["maxiter"] == 1
+    assert receipt["solvers"]["coarse"]["iterations"] == 1

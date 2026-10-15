@@ -5,7 +5,7 @@ CLI: --field --metadata --inputs <old probe inputs.json> --patch --app-run
      --output NEW [--max-depth 3] [--max-charts 8] [--budget-seconds 540]
 Run under run_watch.py --timeout 600, CPU thread limits 4. Native charts use
 200 iterations, symmetric_dirichlet, --tol=1e-6, at most 120 seconds each.
-Pitch=1 L2=9.6um, offsets=-8,-4,0,4,8 L2. This is NOT blind autonomous recovery.
+Pitch/offsets are in the declared world units. This is NOT blind autonomous recovery.
 """
 
 import os as _os
@@ -22,7 +22,17 @@ import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from surface_export import _metadata, _sha, extract_surface, flatten_native, rasterize_surface, sample_ct_stack
-from surface_probe import context_image, evaluate_patch, seam_registration, write_json
+from surface_probe import (
+    context_image,
+    evaluate_patch,
+    load_field_support,
+    patch_coordinates,
+    seam_registration,
+    write_json,
+)
+
+from dataset_config import frame as validate_frame
+from dataset_config import positive
 
 
 def choose_human_seed(xyz, metadata):
@@ -50,7 +60,7 @@ def choose_human_seed(xyz, metadata):
         roi_center_xyz=center.tolist(),
         interior_grid_margin=16,
         excluded_uv_radius=2,
-        rule="nearest valid interior patch14 XYZ point to physical field-sample ROI center; row-major tie",
+        rule="nearest valid interior supplied-patch XYZ point to physical field-sample ROI center; row-major tie",
         selection_inputs="human geometry and ROI metadata only; no field/CT/score",
         scope="one-seed development demonstrator; not blind autonomous success or model/holdout tuning",
         frozen_utc=datetime.now(UTC).isoformat(),
@@ -127,23 +137,42 @@ def save_cuts(path, faces, leaves):
     return int(cut.sum())
 
 
-def chart_preview(path, stack, valid, layer):
+def chart_preview(path, stack, valid, layer, *, pitch_um, window=(0, 255)):
     from PIL import Image, PngImagePlugin
 
-    gray = np.rint(np.clip(np.nan_to_num(stack[layer]), 0, 255)).astype(np.uint8)
+    lo, hi = window
+    if not np.isfinite(window).all() or hi <= lo:
+        raise ValueError("invalid CT display window")
+    gray = np.rint(255 * np.clip((np.nan_to_num(stack[layer]) - lo) / (hi - lo), 0, 1)).astype(np.uint8)
     rgba = np.dstack([gray, gray, gray, valid[layer].astype(np.uint8) * 255])
     info = PngImagePlugin.PngInfo()
     info.add_text(
-        "Description", "CT /2 texture, not ink; 9.6um/pixel; common fixed [0,255] window; invalid transparent"
+        "Description", f"CT texture, not ink; {pitch_um:g}um/pixel; fixed [{lo:g},{hi:g}] window; invalid transparent"
     )
     Image.fromarray(rgba).save(path, pnginfo=info)
 
 
 def build_atlas(
-    vertices, faces, metadata, ct, ct_metadata, app_run, output, *, max_depth=3, max_charts=8, budget_seconds=540
+    vertices,
+    faces,
+    metadata,
+    ct,
+    ct_metadata,
+    app_run,
+    output,
+    *,
+    max_depth=3,
+    max_charts=8,
+    budget_seconds=540,
+    pitch_world=1,
+    depth_offsets_world=(-8, -4, 0, 4, 8),
 ):
     if not 0 <= max_depth <= 3 or not 1 <= max_charts <= 8 or budget_seconds <= 0:
         raise ValueError("bounded atlas requires depth <=3, <=8 charts and positive time budget")
+    positive(pitch_world, "pitch_world")
+    offsets = np.asarray(depth_offsets_world, float)
+    if offsets.ndim != 1 or not len(offsets) or not np.isfinite(offsets).all():
+        raise ValueError("finite depth offsets are required")
     output = Path(output)
     output.mkdir(exist_ok=False)
     start = time.monotonic()
@@ -156,9 +185,9 @@ def build_atlas(
         distortion_statistic="p95",
         distortion_limit=0.02,
         policy_version="uv-p95-v2",
-        pitch_world=1,
-        pitch_um=metadata["voxel_um"],
-        depth_offsets_world=[-8, -4, 0, 4, 8],
+        pitch_world=pitch_world,
+        pitch_um=pitch_world * metadata["voxel_um"],
+        depth_offsets_world=offsets.tolist(),
         native_iters=200,
         native_timeout_max=120,
         geometry_status="UNMEASURED",
@@ -236,8 +265,10 @@ def build_atlas(
             np.savez(directory / "uv.npz", uv=uv)
         if native["status"] == "PASS":
             try:
-                points, normals, valid, raster = rasterize_surface(v, f, uv, 1, vertex_normals_xyz=global_normals[vi])
-                raster["pitch_um"] = [metadata["voxel_um"]] * 2
+                points, normals, valid, raster = rasterize_surface(
+                    v, f, uv, pitch_world, vertex_normals_xyz=global_normals[vi]
+                )
+                raster["pitch_um"] = [pitch_world * metadata["voxel_um"]] * 2
                 np.savez(
                     directory / "grid.npz",
                     points_xyz=points,
@@ -246,7 +277,6 @@ def build_atlas(
                     pitch_um=raster["pitch_um"],
                     uv_origin=raster["uv_origin"],
                 )
-                offsets = np.array([-8.0, -4, 0, 4, 8])
                 stack, mask, sampled = sample_ct_stack(
                     ct, ct_metadata, points, normals, offsets, frame=metadata["frame"], voxel_um=metadata["voxel_um"]
                 )
@@ -259,7 +289,14 @@ def build_atlas(
                 )
                 if not mask.any():
                     raise ValueError("chart has no CT coverage")
-                chart_preview(directory / "ct_preview.png", stack, mask, 2)
+                chart_preview(
+                    directory / "ct_preview.png",
+                    stack,
+                    mask,
+                    int(np.argmin(np.abs(offsets))),
+                    pitch_um=pitch_world * metadata["voxel_um"],
+                    window=ct_metadata.get("display_window", [0, 255]),
+                )
                 node.update(render_status="PASS", status="PASS", raster=raster, sampling=sampled)
                 del points, normals, valid, stack, mask
             except (ValueError, OSError, RuntimeError) as error:
@@ -285,8 +322,10 @@ def build_atlas(
     success = conserved["status"] == "PASS" and all(c["status"] == "PASS" for c in leaves)
     result = dict(
         atlas_status="PASS" if success else "FAIL",
+        frame=metadata["frame"],
+        voxel_um=metadata["voxel_um"],
         geometry_status="UNMEASURED",
-        scientific_scope="human-seeded development atlas; physical lamina/writing-face/ink unverified",
+        scientific_scope="bounded mesh atlas; seed provenance supplied by caller; physical lamina/writing-face/ink unverified",
         plan=plan,
         conservation=conserved,
         cut_edges=cut_count,
@@ -307,8 +346,13 @@ def build_atlas(
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    for name in ("field", "metadata", "inputs", "patch", "app-run", "output"):
+    for name in ("field", "metadata", "inputs", "app-run", "output"):
         p.add_argument("--" + name, type=Path, required=True)
+    p.add_argument(
+        "--patch", type=Path, help="optional human-seed patch; otherwise use the frozen prior seed in inputs"
+    )
+    p.add_argument("--patch-frame")
+    p.add_argument("--patch-voxel-um", type=float)
     p.add_argument("--max-depth", type=int, default=3)
     p.add_argument("--max-charts", type=int, default=8)
     p.add_argument("--budget-seconds", type=float, default=540)
@@ -316,7 +360,7 @@ def main(argv=None):
     args.output.mkdir(exist_ok=False)
     result = dict(
         status="FAILED",
-        human_seed=True,
+        human_seed=args.patch is not None,
         source_sha256=_sha(__file__),
         source_hashes={n: _sha(Path(__file__).with_name(n)) for n in ("surface_export.py", "surface_probe.py")},
     )
@@ -327,43 +371,69 @@ def main(argv=None):
 
         meta = json.loads(args.metadata.read_text())
         inputs = json.loads(args.inputs.read_text())
-        if meta["frame"] != "PHercParis4/20260411134726:L2" or meta["voxel_um"] != 9.6:
-            raise ValueError("this seeded demonstrator requires the declared Paris4 L2 frame")
+        validate_frame(meta.get("frame"))
+        positive(meta.get("voxel_um"), "voxel_um")
+        render = inputs.get("render", {})
         plan = dict(
             max_depth=args.max_depth,
             max_charts=args.max_charts,
             budget_seconds=args.budget_seconds,
-            human_seed=True,
+            human_seed=args.patch is not None,
             exclude_uv_radius=2,
-            mesh_step=2,
-            pitch_world=1,
+            mesh_step=render.get("mesh_step", 2),
+            pitch_world=render.get("pitch_world", 1),
             policy_correction="approved gate is p95<=2%, not maximum<=2%; maximum still reported",
             automatic_result_unchanged=True,
             model_or_holdout_tuning=False,
         )
         write_json(args.output / "plan.json", plan)
-        xyz = np.stack([tifffile.imread(args.patch / f"{a}.tif") for a in "xyz"], axis=-1)
-        selection, excluded = choose_human_seed(xyz, meta)
-        selection["patch_sha256"] = {n: _sha(args.patch / n) for n in ("meta.json", "x.tif", "y.tif", "z.tif")}
-        write_json(args.output / "seed_geometry.json", selection)
-        np.save(args.output / "excluded_human_uv.npy", excluded)
         field = np.load(args.field, mmap_mode="r", allow_pickle=False)
         if _sha(args.field) != meta["field_sha256"] or _sha(args.metadata) != inputs["metadata_sha256"]:
             raise ValueError("frozen field/metadata hash mismatch")
+        if inputs["field_sha256"] != meta["field_sha256"]:
+            raise ValueError("frozen input field identity mismatch")
+        if args.patch is not None:
+            coordinates = patch_coordinates(
+                args.patch, meta, patch_frame=args.patch_frame, patch_voxel_um=args.patch_voxel_um
+            )
+            xyz = np.stack([tifffile.imread(args.patch / f"{a}.tif") for a in "xyz"], axis=-1)
+            selection, excluded = choose_human_seed(xyz, meta)
+            selection["patch_coordinates"] = coordinates
+            selection["patch_sha256"] = {n: _sha(args.patch / n) for n in ("meta.json", "x.tif", "y.tif", "z.tif")}
+            np.save(args.output / "excluded_human_uv.npy", excluded)
+        else:
+            if _sha(inputs["seed"]) != inputs["seed_sha256"]:
+                raise ValueError("frozen seed hash mismatch")
+            selection = json.loads(Path(inputs["seed"]).read_text())
+            if (
+                selection["field_sha256"] != meta["field_sha256"]
+                or selection.get("frame", meta["frame"]) != meta["frame"]
+            ):
+                raise ValueError("frozen seed and field identities differ")
+            selection = dict(selection, human_seed=False)
+        write_json(args.output / "seed_geometry.json", selection)
         value = sample_field(field, np.array([selection["seed_xyz"]]), meta["origin_xyz"], meta["spacing_xyz"])[0]
         if not np.isfinite(value):
-            raise ValueError("human seed has no field support")
+            raise ValueError("seed has no field support")
+        if args.patch is None:
+            tolerance = 2e-5 + 0.5 * float(np.spacing(np.asarray(abs(value), dtype=field.dtype)))
+            if not np.isclose(value, selection["level"], rtol=0, atol=tolerance):
+                raise ValueError("frozen prior level differs from field at the frozen seed")
+            value = float(selection["level"])
         selection = {
             **selection,
             "level": float(value),
-            "level_method": "trilinear raw assembled field at frozen human seed",
+            "level_method": "raw field at frozen human seed" if args.patch else "unchanged frozen prior-seed level",
             "field_sha256": meta["field_sha256"],
         }
         write_json(args.output / "seed.json", selection)
-        print("FROZEN HUMAN SEED", json.dumps(selection), flush=True)
-        support = np.load(args.field.parent / meta["support"], allow_pickle=False)
+        print("FROZEN SEED", json.dumps(selection), flush=True)
+        support, _ = load_field_support(field, args.field, meta)
+        extraction_meta = {k: v for k, v in meta.items() if k != "support"}
+        if support is not None:
+            extraction_meta["support"] = support
         vertices, faces, extraction = extract_surface(
-            field, {**meta, "support": support}, value, selection["seed_xyz"], step_size=2
+            field, extraction_meta, value, selection["seed_xyz"], step_size=render.get("mesh_step", 2)
         )
         np.savez(args.output / "surface.npz", vertices_xyz=vertices, faces=faces)
         write_json(args.output / "extraction.json", extraction)
@@ -383,8 +453,14 @@ def main(argv=None):
             max_depth=args.max_depth,
             max_charts=args.max_charts,
             budget_seconds=args.budget_seconds,
+            pitch_world=render.get("pitch_world", 1),
+            depth_offsets_world=render.get("depth_offsets_world", [-8, -4, 0, 4, 8]),
         )
-        ownership = np.load(args.field.parent / meta["core_ownership"], mmap_mode="r", allow_pickle=False)
+        ownership = (
+            np.load(args.field.parent / meta["core_ownership"], mmap_mode="r", allow_pickle=False)
+            if meta.get("core_ownership") is not None
+            else None
+        )
         result.update(
             seed=selection,
             inputs=inputs,
@@ -394,12 +470,24 @@ def main(argv=None):
             conservation=atlas["conservation"],
             successful_charts=atlas["successful_charts"],
             required_charts=len(atlas["leaves"]),
-            seams=seam_registration(vertices, faces, meta, ownership),
+            seams=seam_registration(vertices, faces, meta, ownership)
+            if ownership is not None
+            else dict(status="NOT_APPLICABLE", reason="no tiled ownership declared"),
         )
-        print("EVALUATE excluding human seed neighborhood", flush=True)
-        result["validation"] = evaluate_patch(
-            args.patch, vertices, faces, meta, ownership, exclude_uv_rc=selection["seed_uv_rc"], exact=True
-        )
+        if args.patch is not None:
+            result["validation"] = evaluate_patch(
+                args.patch,
+                vertices,
+                faces,
+                meta,
+                ownership,
+                exclude_uv_rc=selection["seed_uv_rc"],
+                exact=True,
+                patch_frame=args.patch_frame,
+                patch_voxel_um=args.patch_voxel_um,
+            )
+        else:
+            result["validation"] = dict(status="NOT_EVALUATED", reason="no human reference supplied")
         context_image(args.output / "ct_context.png", ct, ct_meta, selection, vertices)
         result["status"] = "EXPORTED_UNCERTIFIED" if atlas["atlas_status"] == "PASS" else "ATLAS_FAILED"
     except Exception as error:

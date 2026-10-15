@@ -41,7 +41,6 @@ def sample_field(field, xyz, origin, spacing, margin=0):
     grid = (xyz - origin) / spacing
     valid = (
         np.isfinite(xyz).all(-1)
-        & (xyz >= 0).all(-1)
         & (grid >= margin).all(-1)
         & (grid <= np.asarray(field.shape[::-1]) - 1 - margin).all(-1)
     )
@@ -73,6 +72,7 @@ def evaluate_patch(field, xyz, origin, spacing, step, margin=8, max_edge=100, mi
         raise ValueError("calibration step must be positive and finite")
     valid = np.isfinite(xyz).all(-1) & (xyz >= 0).all(-1)
     values = sample_field(field, xyz, origin, spacing, margin)
+    values[~valid] = np.nan  # TIFXYZ uses negative sentinels; generic world coordinates may be negative.
     covered = np.isfinite(values)
     residual = np.full(values.shape, np.nan)
     count = int(covered.sum())

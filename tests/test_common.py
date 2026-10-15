@@ -9,16 +9,10 @@ import pytest
 import common
 
 
-def test_data_directory_override_and_scroll_selection(tmp_path, monkeypatch):
+def test_fibre_reader_requires_explicit_path_even_when_data_environment_exists(tmp_path, monkeypatch):
     monkeypatch.setenv("WREV_DATA", str(tmp_path))
-    assert common.data_dir() == str(tmp_path)
-    assert common.db_path("PHercParis4") == str(tmp_path / "Paris4_v1.afv")
-    with pytest.raises(KeyError):
-        common.db_path("unknown")
-    monkeypatch.delenv("WREV_DATA")
-    monkeypatch.setattr(common.os.path, "isdir", lambda path: False)
-    with pytest.raises(FileNotFoundError, match="WREV_DATA"):
-        common.data_dir()
+    with pytest.raises(ValueError, match="explicit"):
+        common.load_fibers(None, dict(x0=0, x1=1, y0=0, y1=1, z0=0, z1=1))
 
 
 def test_fibre_blocks_are_ordered_then_clipped_with_exclusive_upper_bound(paris_inputs, monkeypatch):
@@ -29,8 +23,8 @@ def test_fibre_blocks_are_ordered_then_clipped_with_exclusive_upper_bound(paris_
     assert common.load_fibers(paris_inputs.afv, box, min_pts=4) == []
     full = common.load_fibers(paris_inputs.afv, box, clip=False)
     np.testing.assert_array_equal(full[0][1], paris_inputs.points)
-    monkeypatch.setattr(common, "db_path", lambda scroll: str(paris_inputs.afv))
-    np.testing.assert_array_equal(common.load_fibers(box)[0][1], rows[0][1])
+    with pytest.raises((TypeError, ValueError)):
+        common.load_fibers(box)
 
 
 def test_missing_fibre_database_is_not_created(tmp_path):

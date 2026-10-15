@@ -44,9 +44,76 @@ def test_outside_or_unsupported_stencils_remain_missing():
         m.sample_winding(field, meta, xyz)
 
 
-def test_plane_rejects_fractional_coordinates_and_invalid_extent():
+def test_plane_rejects_nonfinite_coordinates_and_invalid_extent():
     m = implementation()
     with pytest.raises(ValueError):
-        m.plane_coordinates([0.5, 0, 0], [3] * 3, 2, 1)
+        m.plane_coordinates([float("nan"), 0, 0], [3] * 3, 2, 1)
     with pytest.raises(ValueError):
         m.plane_coordinates([0] * 3, [3] * 3, 2, 3)
+
+
+def test_visual_archive_supports_explicit_nonunit_grid_and_uint16_ct(tmp_path):
+    import json
+
+    from patch_check import sha256
+
+    m = implementation()
+    origin, size, spacing = [-5.25, 10.5, 20.0], [4, 5, 6], [0.5, 2, 3]
+    planes = []
+    for name, axis in (("XY", 2), ("XZ", 1), ("YZ", 0)):
+        remaining = [k for k in range(3) if k != axis]
+        shape = (size[remaining[1]], size[remaining[0]])
+        ct = (1000 + np.arange(np.prod(shape))).astype(np.uint16).reshape(shape)
+        np.savez(tmp_path / f"{name}-samples.npz", ct=ct)
+        planes.append(
+            dict(
+                name=name,
+                fixed_axis_xyz=axis,
+                fixed_position_world=origin[axis] + (size[axis] // 2) * spacing[axis],
+                ct_pixels=ct.size,
+            )
+        )
+    receipt = dict(
+        frame="another-volume/world",
+        voxel_um=12,
+        step=2,
+        origin_xyz=origin,
+        size_xyz=size,
+        spacing_xyz=spacing,
+        ct_window=[0, 4095],
+        contour_levels=[0, 1, 2],
+        planes=planes,
+        field_sha256={},
+        input_ct={},
+        ct_url="synthetic://uint16",
+        synthetic=True,
+    )
+    (tmp_path / "RECEIPT.json").write_text(json.dumps(receipt))
+    manifest = {p.name: sha256(p) for p in tmp_path.iterdir() if p.is_file()}
+    (tmp_path / "MANIFEST.json").write_text(json.dumps(manifest))
+    spec = dict(
+        schema="ct-winding-overlays-v2",
+        archive_manifest=dict(path="MANIFEST.json", sha256=sha256(tmp_path / "MANIFEST.json")),
+    )
+    visual = m.prepare(spec, tmp_path, receipt["frame"], 2, voxel_um=12)
+    np.testing.assert_array_equal(visual["planes"][0]["xyz"][0, 1], [-4.75, 10.5, 29])
+    field = np.broadcast_to(2 * np.arange(4, dtype=float), (6, 5, 4)).copy()
+    np.save(tmp_path / "field.npy", field)
+    meta = dict(
+        frame=receipt["frame"],
+        voxel_um=12,
+        step=2,
+        origin_xyz=origin,
+        spacing_xyz=spacing,
+        shape_zyx=list(field.shape),
+        field_sha256=sha256(tmp_path / "field.npy"),
+    )
+    out = tmp_path / "visuals"
+    out.mkdir()
+    m.render(visual, field, meta, None, out)
+    with np.load(out / "ct-winding-samples.npz") as arrays:
+        assert arrays["XY_ct"].dtype == np.uint16
+        np.testing.assert_allclose(arrays["XY_candidate"][0], [0, 1, 2, 3])
+    recorded = json.loads((out / "VISUALS.json").read_text())
+    assert recorded["frame"] == receipt["frame"] and recorded["voxel_um"] == 12
+    assert recorded["ct_spacing_xyz"] == spacing

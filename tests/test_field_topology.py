@@ -176,3 +176,17 @@ def test_transversal_invalid_probabilities_are_rejected(parallel_layers):
     probability[1, 1, 1] = 1.1
     with pytest.raises(ValueError, match="invalid observation"):
         build_transversal_inventory(probability, directors, [0, 0, 0], [1, 1, 1], 0.0096, reference)
+
+
+def test_transversal_sampling_uses_supplied_physical_pitch(parallel_layers):
+    from field_topology import build_transversal_inventory
+
+    probability, directors, reference = parallel_layers
+    result = build_transversal_inventory(
+        probability, directors, [0, 0, 0], [1, 1, 1], 0.01, reference, max_profiles=5, profile_step_mm=0.01
+    )
+    assert result["relations"]
+    for relation in result["relations"]:
+        assert relation["physical_gap_mm"] == pytest.approx(0.2)
+    with pytest.raises(ValueError):
+        build_transversal_inventory(probability, directors, [0, 0, 0], [1, 1, 1], 0.01, reference, profile_step_mm=0)

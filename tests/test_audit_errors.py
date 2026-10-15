@@ -5,8 +5,20 @@ import json
 
 import numpy as np
 import pytest
+from conftest import FRAME
 
-from paris_pair_check import FRAME, score_pairs
+from paris_pair_check import score_pairs
+
+HOLDOUT = dict(
+    frame=FRAME,
+    spacing_xyz=[2, 2, 2],
+    grid_origin_xyz=[0, 0, 0],
+    buffer_world=256,
+    margin_world=100,
+    alignment_xyz=[16, 16, 16],
+    lower_bound_xyz=[0, 0, 0],
+    development_z_context=[9800, 11200],
+)
 
 
 def fixture_rows():
@@ -138,7 +150,7 @@ def test_holdout_plan_is_geometry_only_accounts_for_empties_and_keeps_whole_grou
 
     collections = geometry_collections()
     collections["empty"] = {"points": {}}
-    plan = plan_holdout(collections, {})
+    plan = plan_holdout(collections, {}, **HOLDOUT)
     assert plan["source_collection_count"] == 21
     assert plan["geometry_exclusions"] == [{"collection_id": "empty", "reason": "empty_collection"}]
     assert len(plan["initial_test"]["groups"]) == 3
@@ -149,7 +161,7 @@ def test_holdout_plan_is_geometry_only_accounts_for_empties_and_keeps_whole_grou
     for coll in changed.values():
         for point in coll["points"].values():
             point["wind_a"] = -9876543
-    assert plan == plan_holdout(changed, {})
+    assert plan == plan_holdout(changed, {}, **HOLDOUT)
     for group in plan["initial_test"]["groups"]:
         original = next(g for g in test_groups if g["group_id"] == group["group_id"])
         assert group["collection_ids"] == original["collection_ids"]
@@ -159,14 +171,14 @@ def test_holdout_plan_is_geometry_only_accounts_for_empties_and_keeps_whole_grou
 def test_budget_or_all_development_blocks_instead_of_trimming_groups():
     from audit_errors import plan_holdout
 
-    plan = plan_holdout(geometry_collections(), {}, max_group_voxels=1)
+    plan = plan_holdout(geometry_collections(), {}, max_group_voxels=1, **HOLDOUT)
     assert plan["initial_test"]["groups"] == []
     assert plan["initial_test"]["blocker"] == "whole_group_budget_exceeded"
     collections = geometry_collections()
     for coll in collections.values():
         for point in coll["points"].values():
             point["p"][2] = 10500
-    plan = plan_holdout(collections, {})
+    plan = plan_holdout(collections, {}, **HOLDOUT)
     assert plan["initial_test"]["groups"] == []
     assert plan["initial_test"]["blocker"] == "no_independent_test_groups"
     assert plan["split"]["buffer_voxels"] == 256
@@ -180,7 +192,7 @@ def test_sealing_writes_private_labels_without_printing_or_exporting_values(tmp_
     audit = tmp_path / "audit"
     audit.mkdir()
     output = tmp_path / "sealed"
-    public = freeze_holdout(source, audit, output)
+    public = freeze_holdout(source, audit, output, geometry=HOLDOUT)
     assert "SECRET" not in json.dumps(public)
     assert "SECRET" not in (output / "geometry-manifest.json").read_text()
     assert "SECRET" not in capsys.readouterr().out
@@ -190,7 +202,36 @@ def test_sealing_writes_private_labels_without_printing_or_exporting_values(tmp_
     private = json.loads(label.read_text())
     assert sorted(private["collections"]) == public["initial_test"]["collection_ids"]
     with pytest.raises(FileExistsError):
-        freeze_holdout(source, audit, output)
+        freeze_holdout(source, audit, output, geometry=HOLDOUT)
+
+
+def test_audit_default_reconciles_actual_counts_without_a_dataset_target(tmp_path):
+    from audit_errors import analyze_audit
+
+    write_audit(tmp_path)
+    result = analyze_audit(tmp_path)
+    assert result["summary"]["correct"] == 1 and result["summary"]["eligible"] == 4
+
+
+def test_holdout_grid_uses_supplied_frame_spacing_and_alignment():
+    from audit_errors import plan_holdout
+
+    options = dict(
+        HOLDOUT,
+        frame="different/world",
+        spacing_xyz=[4, 2, 1],
+        grid_origin_xyz=[-7, -9, -11],
+        alignment_xyz=[8, 4, 2],
+        lower_bound_xyz=None,
+        development_z_context=None,
+    )
+    result = plan_holdout(geometry_collections(), {}, **options)
+    assert result["frame"] == "different/world"
+    for group in result["initial_test"]["groups"]:
+        grid = group["grid"]
+        assert grid["spacing_xyz"] == [4, 2, 1]
+        np.testing.assert_array_equal((np.array(grid["origin_xyz"]) - [-7, -9, -11]) % [8, 4, 2], 0)
+        assert all(n > 0 for n in grid["shape_zyx"])
 
 
 def test_cli_exclusive_diagnostics_and_markdown_report(tmp_path):

@@ -7,30 +7,32 @@ import zipfile
 
 import numpy as np
 
+from dataset_config import positive
+from dataset_config import xyz as physical_xyz
 from physical_grid import point_stencils
 
 
-def plane_coordinates(origin, size, axis, index):
-    origin, size = np.asarray(origin), np.asarray(size)
+def plane_coordinates(origin, size, axis, index, spacing=(1, 1, 1)):
+    origin, size = np.asarray(origin, float), np.asarray(size)
+    spacing = physical_xyz(spacing, "CT spacing", positive=True)
     if (
         origin.shape != (3,)
         or size.shape != (3,)
-        or origin.dtype.kind not in "iu"
+        or not np.isfinite(origin).all()
         or size.dtype.kind not in "iu"
-        or (origin < 0).any()
         or (size < 2).any()
         or type(axis) is not int
         or axis not in (0, 1, 2)
         or type(index) is not int
         or not 0 <= index < size[axis]
     ):
-        raise ValueError("integer native XYZ plane and positive extent required")
+        raise ValueError("finite world origin, integer pixel extent and valid slice index required")
     axes = [k for k in range(3) if k != axis]
     u, v = np.meshgrid(np.arange(size[axes[0]]), np.arange(size[axes[1]]))
     xyz = np.empty((*u.shape, 3), float)
-    xyz[..., axis] = origin[axis] + index
-    xyz[..., axes[0]] = origin[axes[0]] + u
-    xyz[..., axes[1]] = origin[axes[1]] + v
+    xyz[..., axis] = origin[axis] + index * spacing[axis]
+    xyz[..., axes[0]] = origin[axes[0]] + u * spacing[axes[0]]
+    xyz[..., axes[1]] = origin[axes[1]] + v * spacing[axes[1]]
     return xyz, axes
 
 
@@ -48,8 +50,8 @@ def sample_winding(field, meta, xyz, support=None):
     return values.reshape(xyz.shape[:-1])
 
 
-def prepare(spec, case_directory, frame, step):
-    if spec.get("schema") != "ct-winding-overlays-v1":
+def prepare(spec, case_directory, frame, step, *, voxel_um=None):
+    if spec.get("schema") not in ("ct-winding-overlays-v1", "ct-winding-overlays-v2"):
         raise ValueError("unsupported visualization schema")
     manifest_path = (case_directory / spec["archive_manifest"]["path"]).resolve()
     inputs = {}
@@ -79,11 +81,24 @@ def prepare(spec, case_directory, frame, step):
     if (
         receipt["frame"] != frame
         or receipt["step"] != step
-        or receipt["voxel_um"] != 9.6
-        or receipt["ct_level"] != 2
-        or receipt["native_l0_scale"] != 4
+        or (voxel_um is not None and receipt["voxel_um"] != voxel_um)
     ):
         raise ValueError("CT visualization frame, scale or physical sampling differs from case")
+    positive(receipt["voxel_um"], "CT voxel_um")
+    if "spacing_xyz" in receipt:
+        spacing = physical_xyz(receipt["spacing_xyz"], "CT spacing", positive=True)
+    elif spec["schema"] == "ct-winding-overlays-v1":
+        level, native_scale = receipt["ct_level"], receipt["native_l0_scale"]
+        if (
+            type(level) is not int
+            or not 0 <= level <= 30
+            or not np.isclose(2**level / positive(native_scale, "native scale"), 1)
+        ):
+            raise ValueError("legacy visual archive needs explicit spacing_xyz for nonunit CT pixels")
+        spacing = np.ones(3)
+    else:
+        raise ValueError("visual archive requires explicit spacing_xyz")
+    receipt = dict(receipt, spacing_xyz=spacing.tolist())
     levels = np.asarray(receipt["contour_levels"], float)
     window = np.asarray(receipt["ct_window"], float)
     if (
@@ -94,7 +109,7 @@ def prepare(spec, case_directory, frame, step):
         or not (np.diff(levels) == 1).all()
         or window.shape != (2,)
         or not np.isfinite(window).all()
-        or not 0 <= window[0] < window[1] <= 255
+        or window[0] >= window[1]
     ):
         raise ValueError("invalid frozen contour levels or CT window")
     origin, size = np.asarray(receipt["origin_xyz"]), np.asarray(receipt["size_xyz"])
@@ -109,19 +124,39 @@ def prepare(spec, case_directory, frame, step):
         raise ValueError("visual archive must declare ordered XY/XZ/YZ planes")
     planes = []
     for plane, axis in zip(receipt["planes"], (2, 1, 0)):
-        if plane["fixed_axis_xyz"] != axis or type(plane["fixed_position_l2"]) is not int:
+        position = plane.get("fixed_position_world", plane.get("fixed_position_l2"))
+        if (
+            type(plane["fixed_axis_xyz"]) is not int
+            or plane["fixed_axis_xyz"] != axis
+            or type(position) not in (int, float)
+            or not np.isfinite(position)
+        ):
             raise ValueError("visual plane axis or position mismatch")
-        xyz, remaining = plane_coordinates(origin, size, axis, plane["fixed_position_l2"] - int(origin[axis]))
+        index = (position - origin[axis]) / spacing[axis]
+        if not np.isclose(index, round(index), rtol=0, atol=1e-9):
+            raise ValueError("visual plane must name a captured CT slice")
+        xyz, remaining = plane_coordinates(origin, size, axis, int(round(index)), spacing)
         data = member(plane["name"] + "-samples.npz")
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             if sum(entry.file_size for entry in archive.infolist()) > 64 * 1024 * 1024:
                 raise ValueError("visual sample archive exceeds its byte budget")
         with np.load(io.BytesIO(data), allow_pickle=False) as samples:
             ct = samples["ct"]
-            if ct.shape != xyz.shape[:-1] or ct.dtype != np.uint8 or ct.size != plane["ct_pixels"]:
+            if (
+                ct.shape != xyz.shape[:-1]
+                or ct.dtype.kind not in "fiu"
+                or not np.isfinite(ct).all()
+                or ct.size != plane["ct_pixels"]
+            ):
                 raise ValueError("CT plane shape/dtype differs from physical geometry")
             item = dict(
-                name=plane["name"], axis=axis, position=plane["fixed_position_l2"], remaining=remaining, xyz=xyz, ct=ct
+                name=plane["name"],
+                axis=axis,
+                position=position,
+                remaining=remaining,
+                xyz=xyz,
+                ct=ct,
+                spacing_xyz=spacing.tolist(),
             )
             if reference is not None:
                 values, valid = samples[reference], samples[reference + "_valid"]
@@ -172,9 +207,11 @@ def draw_figures(planes, origin, voxel_mm, levels, window, columns, output, pref
             )
             try:
                 for row, plane in zip(axes, selection):
-                    x = np.arange(plane["ct"].shape[1]) * voxel_mm
-                    y = np.arange(plane["ct"].shape[0]) * voxel_mm
-                    extent = (-voxel_mm / 2, x[-1] + voxel_mm / 2, -voxel_mm / 2, y[-1] + voxel_mm / 2)
+                    a, b = plane["remaining"]
+                    pitch = np.asarray(plane.get("spacing_xyz", [1, 1, 1])) * voxel_mm
+                    x = np.arange(plane["ct"].shape[1]) * pitch[a]
+                    y = np.arange(plane["ct"].shape[0]) * pitch[b]
+                    extent = (-pitch[a] / 2, x[-1] + pitch[a] / 2, -pitch[b] / 2, y[-1] + pitch[b] / 2)
                     for ax, (key, title) in zip(row, columns):
                         ax.imshow(
                             plane["ct"],
@@ -218,11 +255,11 @@ def draw_figures(planes, origin, voxel_mm, levels, window, columns, output, pref
                                 )
                             title += f" — {len(values) / data.size:.1%} supported"
                         a, b = plane["remaining"]
-                        ax.set_xlabel(f"{'XYZ'[a]} displacement (mm), origin {origin[a]} L2")
-                        ax.set_ylabel(f"{'XYZ'[b]} displacement (mm), origin {origin[b]} L2")
+                        ax.set_xlabel(f"{'XYZ'[a]} displacement (mm), origin {origin[a]} world")
+                        ax.set_ylabel(f"{'XYZ'[b]} displacement (mm), origin {origin[b]} world")
                         ax.set_aspect("equal")
                         ax.set_title(
-                            f"{title}\n{plane['name']} at {'XYZ'[plane['axis']]}={plane['position']} L2", fontsize=10
+                            f"{title}\n{plane['name']} at {'XYZ'[plane['axis']]}={plane['position']} world", fontsize=10
                         )
                 fig.colorbar(
                     plt.cm.ScalarMappable(norm=norm, cmap=cmap),
@@ -243,6 +280,8 @@ def draw_figures(planes, origin, voxel_mm, levels, window, columns, output, pref
 
 def render(visual, field, meta, support, output):
     source = visual["source"]
+    if meta["frame"] != source["frame"] or meta.get("voxel_um", source["voxel_um"]) != source["voxel_um"]:
+        raise ValueError("candidate and CT frame/units differ")
     samples, reports = {}, []
     for plane in visual["planes"]:
         values = sample_winding(field, meta, plane["xyz"], support)
@@ -258,7 +297,7 @@ def render(visual, field, meta, support, output):
             dict(
                 name=key,
                 fixed_axis_xyz=plane["axis"],
-                fixed_position_l2=plane["position"],
+                fixed_position_world=plane["position"],
                 ct_pixels=values.size,
                 candidate_covered=len(known),
                 candidate_range=[float(known.min()), float(known.max())] if len(known) else None,
@@ -269,7 +308,9 @@ def render(visual, field, meta, support, output):
         )
     np.savez_compressed(output / "ct-winding-samples.npz", **samples)
     synthetic = source.get("synthetic", False)
-    columns = [(None, f"{'Synthetic CT-like data' if synthetic else 'Original CT'} — 9.6 µm/pixel")]
+    ct_pitch = np.asarray(source["spacing_xyz"]) * source["voxel_um"]
+    sampling = " × ".join(f"{v:g}" for v in ct_pitch)
+    columns = [(None, f"{'Synthetic CT-like data' if synthetic else 'Original CT'} — XYZ sampling {sampling} µm")]
     if visual["reference_key"] is not None:
         columns.append(("reference", visual["reference_label"]))
     spacing = np.asarray(meta["spacing_xyz"]) * source["voxel_um"]
@@ -297,6 +338,7 @@ def render(visual, field, meta, support, output):
         origin_xyz=source["origin_xyz"],
         size_xyz=source["size_xyz"],
         voxel_um=source["voxel_um"],
+        ct_spacing_xyz=source["spacing_xyz"],
         contour_levels=visual["levels"].tolist(),
         ct_window=visual["window"].tolist(),
         planes=reports,

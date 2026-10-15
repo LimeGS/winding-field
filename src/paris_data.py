@@ -1,4 +1,7 @@
-"""Measured Paris4 inputs sampled on one explicit physical L2 grid."""
+"""Configured observations sampled on an explicit physical grid.
+
+The historical module name is retained; no dataset is selected implicitly.
+"""
 
 import json
 from pathlib import Path
@@ -6,12 +9,9 @@ from pathlib import Path
 import numpy as np
 
 from common import arclength, decode_lasagna_normals, load_fibers
-from paris_solve import CTB as CTB  # re-exported for callers
-from paris_solve import LB, MB
+from dataset_config import artifact_path, native_to_world, observation_recipe, open_source, validate_afv
 from patch_check import sha256
 from physical_grid import grid_shape, sample_volume
-
-FRAME = "PHercParis4/20260411134726:L2"
 
 
 def orient_radial(normals, origin_xyz, spacing_xyz, umbilicus):
@@ -31,46 +31,125 @@ def contiguous_inside(points, lo, hi):
     return [points[a:b] for a, b in zip(np.flatnonzero(borders == 1), np.flatnonzero(borders == -1)) if b - a >= 2]
 
 
+def sample_source(dataset, name, origin, spacing, shape, *, order=1, receipts=None):
+    source = dataset["sources"][name]
+    if source["frame"] != dataset["frame"]:
+        raise ValueError("source and dataset frames differ")
+    result = sample_volume(
+        open_source(source),
+        origin,
+        spacing,
+        shape,
+        source["spacing_xyz"],
+        source["origin_xyz"],
+        order=order,
+        receipts=receipts,
+    )
+    if receipts is not None:
+        receipts[-1].update(url=source["path"], frame=source["frame"], source_origin_xyz=source["origin_xyz"])
+    return result
+
+
+def black_value(dataset):
+    value = dataset.get("context", {}).get("black_value", 0)
+    if type(value) not in (int, float) or not np.isfinite(value):
+        raise ValueError("black_value must be a finite numeric CT value")
+    return value
+
+
+def exterior_faces(dataset):
+    """Return only caller-declared exterior faces; a crop boundary is not evidence."""
+    context = dataset.get("context", {})
+    names = context.get("exterior_faces", [])
+    known = {
+        f"{axis}_{side}": (2 - i, 0 if side == "min" else -1) for i, axis in enumerate("xyz") for side in ("min", "max")
+    }
+    if (
+        not isinstance(names, list)
+        or any(not isinstance(n, str) or n not in known for n in names)
+        or len(set(names)) != len(names)
+    ):
+        raise ValueError("invalid declared exterior faces")
+    if names and (not isinstance(context.get("exterior_authority"), str) or not context["exterior_authority"].strip()):
+        raise ValueError("exterior faces require explicit provenance in exterior_authority")
+    return [known[name] for name in names]
+
+
 def load_paris_box(
-    lo_xyz, hi_xyz, spacing=2, afv_path=None, data_root="/root/wrev", fiber_limit=400, pair_limit=2000, normal_level=4
+    lo_xyz, hi_xyz, spacing, afv_path=None, *, dataset, fiber_limit=None, pair_limit=None, shape_zyx=None
 ):
-    import zarr
+    afv_identity = validate_afv(dataset, afv_path) if afv_path is not None else None
+    split_path = artifact_path(dataset, "split") if afv_path is not None else None
+    train = None
+    if split_path is not None:
+        from evaluation_split import validate_fibre_split
+
+        split = json.loads(split_path.read_text())
+        validate_fibre_split(split, afv_identity["sha256"])
+        train = {r["fibre_id"] for r in split["fibres"] if r["split"] == "train"}
+    controls = dataset.get("constraints", {})
+    fiber_limit = controls.get("fiber_limit", 400) if fiber_limit is None else fiber_limit
+    pair_limit = controls.get("pair_limit", 2000) if pair_limit is None else pair_limit
+    if type(fiber_limit) is not int or fiber_limit < 1 or type(pair_limit) is not int or pair_limit < 1:
+        raise ValueError("positive integer fibre and pair limits required")
 
     lo, hi = np.asarray(lo_xyz, float), np.asarray(hi_xyz, float)
     h = np.broadcast_to(np.asarray(spacing, float), (3,)).copy()
-    shape = grid_shape(lo, hi, h)
+    shape = grid_shape(lo, hi, h, shape_zyx)
     receipts = []
 
-    def grab(url, source_h, order=1):
-        print("READ", url, shape, flush=True)
-        volume = zarr.open(url, mode="r")
-        out = sample_volume(volume, lo, h, shape, [source_h] * 3, order=order, receipts=receipts)
-        receipts[-1]["url"] = url
-        return out
+    def grab(name, order=1):
+        return sample_source(dataset, name, lo, h, shape, order=order, receipts=receipts)
 
-    source_h = 2**normal_level / 4
-    nx = grab(f"{LB}_nx.ome.zarr/{normal_level}", source_h)
-    ny = grab(f"{LB}_ny.ome.zarr/{normal_level}", source_h)
-    density = grab(f"{LB}_grad_mag.ome.zarr/{normal_level}", source_h) / 1000
-    normals = decode_lasagna_normals(nx, ny)
+    prediction = dataset["prediction"]
+    nx, ny = grab("nx"), grab("ny")
+    density = grab("density") * prediction["density_scale"]
+    if (density < 0).any():
+        raise ValueError("density must be nonnegative")
+    if prediction["normal_encoding"] == "hemisphere_xy":
+        normals = decode_lasagna_normals(nx, ny)
+    elif prediction["normal_encoding"] == "signed_xyz":
+        normals = np.stack([nx, ny, grab("nz")], axis=-1)
+        norm = np.linalg.norm(normals, axis=-1, keepdims=True)
+        if (norm <= 0).any():
+            raise ValueError("signed normals require nonzero observations")
+        normals /= norm
+    else:
+        raise ValueError("unsupported normal encoding")
     del nx, ny
-    root = Path(data_root)
-    cp = json.loads((root / "umbi.json").read_text())["control_points"]
-    cp = np.array([[p["x"], p["y"], p["z"]] for p in cp])
-    target = orient_radial(normals, lo, h, cp).astype(np.float32) * density[..., None]
+    centerline_sha = None
+    if dataset["orientation"]["mode"] == "radial":
+        centerline = dataset["orientation"]["centerline"]
+        centerline_sha = sha256(centerline["path"])
+        if centerline.get("sha256", centerline_sha) != centerline_sha or centerline["frame"] != dataset["frame"]:
+            raise ValueError("centerline identity or frame mismatch")
+        cp = json.loads(Path(centerline["path"]).read_text())["control_points"]
+        cp = np.array([[p["x"], p["y"], p["z"]] for p in cp], dtype=float)
+        if cp.ndim != 2 or cp.shape[1] != 3 or len(cp) < 2 or not np.isfinite(cp).all():
+            raise ValueError("centerline must contain at least two finite XYZ points")
+        normals = orient_radial(normals, lo, h, cp)
+    target = normals.astype(np.float32) * density[..., None]
     del normals, density
-    # Sample at physical positions; use a coarse source only for coarse global weights.
-    ml = max(0, int(np.floor(np.log2(h.min()))) - 1)
-    det = grab(f"{MB}/{ml}", 2**ml, order=0) > 128
-    weight = np.where(det, 1, 0.1).astype(np.float32)
+    det = grab("surface", order=0) > prediction["surface_threshold"]
+    weight = np.where(det, prediction["material_weight"], prediction["background_weight"]).astype(np.float32)
     pairs = []
+    used_fibres = set()
     if afv_path:
-        bb = dict(zip(("x0", "x1", "y0", "y1", "z0", "z1"), np.stack([lo * 4, hi * 4], 1).ravel().tolist()))
+        transform = dataset["afv"]
+        scale, offset = np.asarray(transform["scale_xyz"]), np.asarray(transform["offset_xyz"])
+        bb = dict(
+            zip(
+                ("x0", "x1", "y0", "y1", "z0", "z1"),
+                np.stack([(lo - offset) / scale, (hi - offset) / scale], 1).ravel().tolist(),
+            )
+        )
         fibers = load_fibers(str(afv_path), bb, clip=False)
+        if train is not None:
+            fibers = [(fid, p) for fid, p in fibers if fid in train]
         rng = np.random.default_rng(0)
         for fid, P in fibers[:fiber_limit]:
-            for run in contiguous_inside(P / 4, lo, hi):
-                s = arclength(run, 0.0096)
+            for run in contiguous_inside(native_to_world(P, transform), lo, hi):
+                s = arclength(run, dataset["voxel_um"] / 1000)
                 for _ in range(8):
                     i, j = rng.integers(0, len(run), 2)
                     indices = np.rint((run[[i, j]] - lo) / h).astype(int)[:, ::-1]
@@ -79,21 +158,31 @@ def load_paris_box(
                     a, b = np.ravel_multi_index(indices.T, shape)
                     if a != b and len(pairs) < pair_limit:
                         pairs.append((int(a), int(b)))
+                        used_fibres.add(int(fid))
     pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
     meta = dict(
-        frame=FRAME,
-        voxel_um=9.6,
+        frame=dataset["frame"],
+        voxel_um=dataset["voxel_um"],
         origin_xyz=lo.tolist(),
         spacing_xyz=h.tolist(),
         shape_zyx=list(shape),
         source_receipts=receipts,
-        normal_encoding="hemisphere_nx_ny",
-        normal_orientation="radial_prior_not_ground_truth",
-        density_units="raw_field_per_L2_voxel",
+        normal_encoding=prediction["normal_encoding"],
+        prediction_parameters=dict(prediction),
+        observation_config=observation_recipe(dataset),
+        normal_orientation=dataset["orientation"]["mode"],
+        density_units="raw_field_per_declared_world_unit",
         source_sha256=sha256(__file__),
-        umbi_sha256=sha256(root / "umbi.json"),
-        afv_sha256=sha256(afv_path) if afv_path else None,
+        umbi_sha256=centerline_sha,
+        dataset_config_sha256=dataset["config_sha256"],
+        native_to_world={k: dataset["afv"][k] for k in ("scale_xyz", "offset_xyz")},
+        afv_sha256=afv_identity["sha256"] if afv_identity is not None else None,
+        afv_identity=afv_identity,
         constraint_pairs=len(pairs),
+        constraint_fibre_ids=sorted(used_fibres),
+        fibre_split_sha256=sha256(split_path) if split_path is not None else None,
+        fibre_limit=fiber_limit,
+        pair_limit=pair_limit,
     )
     return target, weight, pairs, meta
 

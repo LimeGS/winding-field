@@ -1,0 +1,38 @@
+{
+  "schema": "winding-dataset-v1",
+  "frame": "my-scroll/world",
+  "voxel_um": 8.0,
+  "grid": {
+    "origin_xyz": [0, 0, 0],
+    "spacing_xyz": [4, 4, 4],
+    "shape_zyx": [64, 64, 64]
+  },
+  "sheet_step": 1.0,
+  "calibration": "REPLACE: record how raw field units were calibrated to nominal sheets",
+  "afv": {
+    "path": "../my-data/fibres.afv",
+    "native_frame": "my-scroll/native",
+    "native_voxel_um": 4.0,
+    "scale_xyz": [0.5, 0.5, 0.5],
+    "offset_xyz": [0, 0, 0]
+  },
+  "sources": {
+    "ct": {"path": "../my-data/ct.zarr/0", "frame": "my-scroll/world", "origin_xyz": [0, 0, 0], "spacing_xyz": [1, 1, 1]},
+    "surface": {"path": "../my-data/surface-mask.npy", "frame": "my-scroll/world", "origin_xyz": [0, 0, 0], "spacing_xyz": [1, 1, 1]},
+    "nx": {"path": "../my-data/nx.npy", "frame": "my-scroll/world", "origin_xyz": [0, 0, 0], "spacing_xyz": [4, 4, 4]},
+    "ny": {"path": "../my-data/ny.npy", "frame": "my-scroll/world", "origin_xyz": [0, 0, 0], "spacing_xyz": [4, 4, 4]},
+    "nz": {"path": "../my-data/nz.npy", "frame": "my-scroll/world", "origin_xyz": [0, 0, 0], "spacing_xyz": [4, 4, 4]},
+    "density": {"path": "../my-data/density.npy", "frame": "my-scroll/world", "origin_xyz": [0, 0, 0], "spacing_xyz": [4, 4, 4]}
+  },
+  "prediction": {
+    "normal_encoding": "signed_xyz",
+    "density_scale": 1.0,
+    "surface_threshold": 0.5,
+    "surface_scale": 1.0,
+    "material_weight": 1.0,
+    "background_weight": 0.1
+  },
+  "orientation": {"mode": "provided"},
+  "constraints": {"pair_weight": 0.1, "pitch_mm": 0.15},
+  "solver": {"device": "cpu", "rtol": 0.001, "maxiter": 4000}
+}

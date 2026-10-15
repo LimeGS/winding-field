@@ -248,7 +248,16 @@ def profile_relations(offsets_mm, probability, min_gap_mm=0.12, max_gap_mm=0.30)
 
 
 def build_transversal_inventory(
-    probability, directors, origin, spacing, voxel_mm, reference=None, max_profiles=2000, seed=20261012, support=None
+    probability,
+    directors,
+    origin,
+    spacing,
+    voxel_mm,
+    reference=None,
+    max_profiles=2000,
+    seed=20261012,
+    support=None,
+    profile_step_mm=None,
 ):
     """Observe native prediction profiles before mapping relations to solver nodes."""
     from patch_check import sample_field
@@ -271,7 +280,10 @@ def build_transversal_inventory(
     candidates = np.flatnonzero((p > 0.8) & support)
     if len(candidates) > max_profiles:
         candidates = np.random.default_rng(seed).choice(candidates, max_profiles, replace=False)
-    offsets = np.arange(-0.35, 0.3500001, 0.0096)
+    pitch = float(np.min(spacing)) * voxel_mm if profile_step_mm is None else float(profile_step_mm)
+    if not np.isfinite(pitch) or pitch <= 0:
+        raise ValueError("profile sampling pitch must be positive and finite")
+    offsets = np.arange(-0.35, 0.3500001, pitch)
     result = []
     ambiguous = 0
     unresolved_order = 0
@@ -316,6 +328,7 @@ def build_transversal_inventory(
         ambiguous_profiles=ambiguous,
         unresolved_order=unresolved_order,
         sampled_profiles=len(candidates),
+        profile_step_mm=pitch,
         seed=seed,
         scope="native_prediction_profile_hypotheses",
         limitation="Two peaks with a gap are conservative prediction hypotheses; no physical lamina certification.",

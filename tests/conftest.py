@@ -9,12 +9,15 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+FRAME = "PHercParis4/20260411134726:L2"  # Explicit historical-parameter fixture, never a runtime default.
+CTB = "memory://ct"
+LB = "memory://normal"
+MB = "memory://surface"
+
 
 @pytest.fixture
 def paris_inputs(tmp_path, monkeypatch):
-    from paris_solve import CTB, LB, MB
-
-    afv = tmp_path / "Paris4_v1.afv"
+    afv = tmp_path / "fibres.afv"
     points = np.column_stack([np.arange(0, 65, 16), np.full(5, 16), np.full(5, 16)]) * 4
     with closing(sqlite3.connect(afv)) as db:
         db.executescript("""
@@ -67,4 +70,56 @@ def paris_inputs(tmp_path, monkeypatch):
         return volumes[url]
 
     monkeypatch.setitem(sys.modules, "zarr", SimpleNamespace(open=open_volume))
-    return SimpleNamespace(root=tmp_path, afv=afv, points=points, volumes=volumes, development=development)
+
+    def source(path, spacing):
+        return dict(path=path, frame=FRAME, origin_xyz=[0, 0, 0], spacing_xyz=[spacing] * 3)
+
+    data = dict(
+        schema="winding-dataset-v1",
+        frame=FRAME,
+        voxel_um=9.6,
+        grid=dict(origin_xyz=[0, 0, 0], spacing_xyz=[16] * 3, shape_zyx=[3, 4, 5]),
+        sheet_step=2,
+        calibration="synthetic development fixture",
+        afv=dict(
+            path=afv.name,
+            native_frame="synthetic-regression/native",
+            native_voxel_um=2.4,
+            scale_xyz=[0.25] * 3,
+            offset_xyz=[0, 0, 0],
+        ),
+        sources=dict(
+            ct=source(CTB + "/5", 8),
+            surface=source(MB + "/0", 1),
+            nx=source(f"{LB}_nx.ome.zarr/4", 4),
+            ny=source(f"{LB}_ny.ome.zarr/4", 4),
+            density=source(f"{LB}_grad_mag.ome.zarr/4", 4),
+        ),
+        prediction=dict(
+            normal_encoding="hemisphere_xy",
+            density_scale=0.001,
+            surface_threshold=128,
+            surface_scale=1 / 255,
+            material_weight=1,
+            background_weight=0.1,
+        ),
+        orientation=dict(mode="radial", centerline=dict(path="umbi.json", frame=FRAME)),
+        context=dict(
+            exterior_faces=[f"{axis}_{side}" for axis in "xyz" for side in ("min", "max")],
+            exterior_authority="controlled synthetic complete-volume exterior",
+        ),
+    )
+    config = tmp_path / "dataset.json"
+    config.write_text(json.dumps(data))
+    from dataset_config import load_dataset
+
+    return SimpleNamespace(
+        root=tmp_path,
+        afv=afv,
+        points=points,
+        volumes=volumes,
+        development=development,
+        config=config,
+        dataset=load_dataset(config),
+        raw_config=data,
+    )

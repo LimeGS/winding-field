@@ -1,7 +1,7 @@
-"""Deterministic Paris4 geometry-only groups; returns a JSON-ready manifest.
+"""Deterministic geometry-only groups in an explicitly declared frame.
 
 This is a candidate split, not a claim of blind-test or training independence.
-No winding labels or model scores are accepted. All coordinates are XYZ L2.
+No winding labels or model scores are accepted. All coordinates are world XYZ.
 """
 
 import hashlib
@@ -9,13 +9,7 @@ import json
 
 import numpy as np
 
-FRAME = "PHercParis4/20260411134726:L2"
-# Fixed development-context windows excluded by the split policy.
-INSPECTED_BOXES = (
-    ("0000_mid_band_final", (3920, 2592, 10256), (4432, 3104, 10768)),
-    ("0003_fill_sel_20260512_105100_14", (4088, 2500, 10096), (4600, 3012, 10608)),
-    ("0003_fill_sel_20260512_105100_17", (3840, 2736, 10080), (4352, 3248, 10592)),
-)
+from dataset_config import frame as validate_frame
 
 
 def _digest(value):
@@ -145,18 +139,34 @@ def validate_fibre_split(manifest, afv_sha256):
         raise ValueError("incomplete group assignment")
 
 
-def build_split(colls, development_ids, buffer_voxels=256, min_z=None, *, development_boxes=(), surface_ids=None):
+def build_split(
+    colls,
+    development_ids,
+    buffer_voxels=256,
+    min_z=None,
+    *,
+    frame,
+    development_boxes=(),
+    surface_ids=None,
+    development_z_context=None,
+):
     """Group buffered bounding-box overlaps and shared surface IDs transitively.
 
-    colls: {collection_id: finite nonnegative Nx3 XYZ array}, ONE Paris4 L2 frame.
+    colls: {collection_id: finite Nx3 XYZ array}, ONE declared world frame.
     surface_ids: optional {collection_id: [source_surface_id, ...]} lineage aliases.
     development_boxes: extra {id, min_xyz, max_xyz} inspected XYZ boxes.
     Each bbox is expanded by buffer_voxels, so a gap <=2*buffer joins groups.
     Any development member/box or min-Z violation makes the WHOLE group dev.
-    The historical [9800,11200) collection context is always development,
-    conservatively covering the inspected 706 pairs without reading wind labels.
+    Previously inspected Z context/boxes must be supplied explicitly; no dataset
+    inherits another dataset's development exclusions or calibration history.
     Remaining group SHA-256 parity selects validation (even) or test (odd).
     """
+    validate_frame(frame)
+    if development_z_context is not None:
+        context = np.asarray(development_z_context, float)
+        if context.shape != (2,) or not np.isfinite(context).all() or context[0] >= context[1]:
+            raise ValueError("invalid declared development Z context")
+        development_z_context = context.tolist()
     if not np.isfinite(buffer_voxels) or buffer_voxels < 0:
         raise ValueError("buffer_voxels must be finite and nonnegative")
     if min_z is not None and not np.isfinite(min_z):
@@ -170,7 +180,7 @@ def build_split(colls, development_ids, buffer_voxels=256, min_z=None, *, develo
     surface_ids = surface_ids or {}
     if set(surface_ids) - set(ids):
         raise ValueError("surface lineage IDs absent from collection geometry")
-    boxes = [{"id": key, "min_xyz": list(lo), "max_xyz": list(hi)} for key, lo, hi in INSPECTED_BOXES]
+    boxes = []
     for box in development_boxes:
         lo, hi = np.asarray(box["min_xyz"], float), np.asarray(box["max_xyz"], float)
         if (
@@ -179,7 +189,6 @@ def build_split(colls, development_ids, buffer_voxels=256, min_z=None, *, develo
             or lo.shape != (3,)
             or hi.shape != (3,)
             or not np.isfinite([lo, hi]).all()
-            or (lo < 0).any()
             or (lo > hi).any()
         ):
             raise ValueError("invalid development bbox")
@@ -195,14 +204,8 @@ def build_split(colls, development_ids, buffer_voxels=256, min_z=None, *, develo
     entries, bounds, reasons = {}, {}, {}
     for cid in ids:
         points = np.asarray(colls[cid], float)
-        if (
-            points.ndim != 2
-            or points.shape[1] != 3
-            or not len(points)
-            or not np.isfinite(points).all()
-            or (points < 0).any()
-        ):
-            raise ValueError(f"{cid}: expected nonempty finite nonnegative Nx3 geometry")
+        if points.ndim != 2 or points.shape[1] != 3 or not len(points) or not np.isfinite(points).all():
+            raise ValueError(f"{cid}: expected nonempty finite Nx3 geometry")
         surfaces = surface_ids.get(cid, [])
         if not isinstance(surfaces, (list, tuple, set)) or any(not isinstance(s, str) or not s for s in surfaces):
             raise ValueError("surface_ids must contain lists of nonempty IDs")
@@ -218,8 +221,8 @@ def build_split(colls, development_ids, buffer_voxels=256, min_z=None, *, develo
         reasons[cid] = []
         if cid in development_ids:
             reasons[cid].append("explicit_development_id")
-        if hi[2] >= 9800 and lo[2] < 11200:
-            reasons[cid].append("historical_706_collection_context")
+        if development_z_context is not None and hi[2] >= development_z_context[0] and lo[2] < development_z_context[1]:
+            reasons[cid].append("declared_development_z_context")
         if min_z is not None and lo[2] < min_z:
             reasons[cid].append("below_min_z")
         for box in boxes:
@@ -264,11 +267,11 @@ def build_split(colls, development_ids, buffer_voxels=256, min_z=None, *, develo
     groups.sort(key=lambda group: group["group_id"])
     manifest = {
         "schema_version": 1,
-        "frame": FRAME,
+        "frame": frame,
         "status": "geometry_only_candidate_split",
         "buffer_voxels": float(buffer_voxels),
         "min_z": float(min_z) if min_z is not None else None,
-        "historical_development_z_context": [9800, 11200],
+        "development_z_context": development_z_context,
         "development_ids": sorted(development_ids),
         "development_boxes": boxes,
         "assignment": "SHA-256(sorted collection IDs): even validation, odd test",

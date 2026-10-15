@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 
 def test_grid_samples_fractional_non_cubic_positions():
@@ -27,3 +28,13 @@ def test_grid_shape_can_be_written_as_json_receipt():
 
     shape = grid_shape([0, 0, 0], [10, 20, 30], [2, 2, 2])
     assert json.loads(json.dumps({"shape_zyx": shape})) == {"shape_zyx": [15, 10, 5]}
+
+
+def test_decimal_extents_do_not_add_a_roundoff_sample_or_clamp_real_overflow():
+    from physical_grid import grid_shape, sample_volume
+
+    assert grid_shape([0.1] * 3, [0.4] * 3, [0.1] * 3) == (3, 3, 3)
+    outside = grid_shape([0.1] * 3, [0.401] * 3, [0.1] * 3)
+    assert outside == (4, 4, 4)
+    with pytest.raises(ValueError, match="outside"):
+        sample_volume(np.ones((3, 3, 3)), [0.1] * 3, [0.1] * 3, outside, [0.1] * 3, [0.1] * 3)

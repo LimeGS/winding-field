@@ -19,6 +19,8 @@ import metrics
 
 from evaluation_split import build_fibre_split
 
+FRAME = "synthetic-example/world"
+
 
 def build_case(folder):
     shape, step = (32, 32, 128), 2.0
@@ -27,7 +29,8 @@ def build_case(folder):
     field_path = folder / "field.npy"
     np.save(field_path, field)
     metadata = dict(
-        frame=metrics.FRAME,
+        frame=FRAME,
+        voxel_um=9.6,
         origin_xyz=[0, 0, 0],
         spacing_xyz=[1, 1, 1],
         shape_zyx=list(shape),
@@ -62,7 +65,7 @@ def build_case(folder):
 
     maximum = ((np.array(shape[::-1]) - 1) * 4).tolist()
     selection, _ = metrics.select_pairs(
-        metrics.iter_fibres(afv), {"synthetic_layers": ([0, 0, 0], maximum)}, set(), set(), limit=None
+        metrics.iter_fibres(afv), {"synthetic_layers": ([0, 0, 0], maximum)}, set(), set(), limit=None, native_mm=0.0024
     )
     selected_path = folder / "selected-pairs.json.gz"
     with gzip.open(selected_path, "xt") as stream:
@@ -71,7 +74,7 @@ def build_case(folder):
     metrics.write_json(
         folder / "plan.json",
         dict(
-            frame=metrics.FRAME,
+            frame=FRAME,
             fixed_sheet_step=step,
             native_voxel_mm=0.0024,
             bins=metrics.BINS,
@@ -112,16 +115,15 @@ def build_case(folder):
         index = shape[2 - axis] // 2
         pixels = np.take(ct, index, axis=2 - axis)
         np.savez_compressed(visual / (name + "-samples.npz"), ct=pixels)
-        planes.append(dict(name=name, fixed_axis_xyz=axis, fixed_position_l2=index, ct_pixels=pixels.size))
+        planes.append(dict(name=name, fixed_axis_xyz=axis, fixed_position_world=index, ct_pixels=pixels.size))
     metrics.write_json(
         visual / "RECEIPT.json",
         dict(
-            frame=metrics.FRAME,
+            frame=FRAME,
             step=step,
             synthetic=True,
             voxel_um=9.6,
-            ct_level=2,
-            native_l0_scale=4,
+            spacing_xyz=[1, 1, 1],
             origin_xyz=[0, 0, 0],
             size_xyz=list(shape[::-1]),
             ct_window=[0, 255],
@@ -144,9 +146,12 @@ def build_case(folder):
         "human": folder / "controls.json",
     }
     case = dict(
-        schema="winding-benchmark-case-v1",
+        schema="winding-benchmark-case-v2",
         scope="synthetic_layers",
-        frame=metrics.FRAME,
+        frame=FRAME,
+        voxel_um=9.6,
+        native_to_world=dict(scale_xyz=[0.25] * 3, offset_xyz=[0, 0, 0]),
+        population="all_and_reserved",
         step=step,
         expected_selected=6,
         expected_human=3,
@@ -155,7 +160,7 @@ def build_case(folder):
         synthetic=True,
         artifacts={name: dict(path=path.name, sha256=metrics.sha256(path)) for name, path in files.items()},
         visualization=dict(
-            schema="ct-winding-overlays-v1",
+            schema="ct-winding-overlays-v2",
             archive_manifest=dict(path="ct/MANIFEST.json", sha256=metrics.sha256(visual / "MANIFEST.json")),
         ),
     )

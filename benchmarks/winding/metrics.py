@@ -14,10 +14,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 import common as common
 from common import BINS, arclength
+from dataset_config import frame as validate_frame
+from dataset_config import native_to_world
 from patch_check import sample_field
 from patch_check import sha256 as sha256
 
-FRAME = "PHercParis4/20260411134726:L2"
 SEED = 20261012
 
 
@@ -66,7 +67,10 @@ def iter_fibres(db):
         connection.close()
 
 
-def select_pairs(fibres, scopes, blocked, blocked_lineage, limit=5000, native_mm=0.0024):
+def select_pairs(fibres, scopes, blocked, blocked_lineage, limit=5000, *, native_mm):
+    native_mm = np.broadcast_to(np.asarray(native_mm, float), (3,))
+    if not np.isfinite(native_mm).all() or (native_mm <= 0).any():
+        raise ValueError("native voxel sizes must be positive finite XYZ values")
     heaps = {name: [[] for _ in BINS] for name in scopes}
     counts = {name: [0 for _ in BINS] for name in scopes}
     excluded = Counter()
@@ -144,8 +148,9 @@ def sample_checked(field, meta, xyz, support=None, margin=1):
 def open_field(path, meta):
     if sha256(path) != meta["field_sha256"]:
         raise ValueError("field hash mismatch")
-    if meta["frame"] != FRAME or meta["solver"].get("converged") is not True:
-        raise ValueError("wrong frame or unconverged field")
+    validate_frame(meta["frame"])
+    if meta["solver"].get("converged") is not True:
+        raise ValueError("unconverged field")
     if not np.isfinite(meta["step"]) or meta["step"] <= 0:
         raise ValueError("invalid sheet step")
     f = np.load(path, mmap_mode="r", allow_pickle=False)
@@ -185,11 +190,11 @@ def summarize(rows):
     return result
 
 
-def evaluate(field, meta, rows, support=None, ownership=None):
+def evaluate(field, meta, rows, support=None, ownership=None, *, transform):
     if not rows:
         return []
-    a = np.array([r["a_native_xyz"] for r in rows]) / 4
-    b = np.array([r["b_native_xyz"] for r in rows]) / 4
+    a = native_to_world([r["a_native_xyz"] for r in rows], transform)
+    b = native_to_world([r["b_native_xyz"] for r in rows], transform)
     va = sample_checked(field, meta, a, support)
     vb = sample_checked(field, meta, b, support)
     out = []

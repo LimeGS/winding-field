@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coarse whole-Paris4 reference; only verified black OUTER box samples are pinned.
+"""Configured coarse reference; only observed black OUTER box samples are pinned.
 
 This produces a globally gauged hypothesis, not certified sheet identities.
 Interior air is never an exterior anchor (inter-layer air can be connected).
@@ -15,14 +15,14 @@ from pathlib import Path
 import numpy as np
 
 from common import arclength
+from dataset_config import artifact_path, load_dataset, mode_constraints, native_to_world, validate_afv
 from field_solver import solve_field
-from paris_data import CTB, load_paris_box, save_field
+from paris_data import black_value, exterior_faces, load_paris_box, sample_source, save_field
 from patch_check import sha256
-from physical_grid import sample_volume
 from sealed_predict import development_step
 
 
-def pin_outer_face(fixed, values, axis, side):
+def pin_outer_face(fixed, values, axis, side, background=0):
     if axis not in (0, 1, 2) or side not in (0, fixed.shape[axis] - 1):
         raise ValueError("only outer faces may be background anchors")
     shape = list(fixed.shape)
@@ -31,11 +31,13 @@ def pin_outer_face(fixed, values, axis, side):
         raise ValueError("invalid face samples")
     sl = [slice(None)] * 3
     sl[axis] = slice(side, side + 1)
-    fixed[tuple(sl)] = np.where(values == 0, 0, np.nan)
+    fixed[tuple(sl)] = np.where(values == background, 0, np.nan)
 
 
-def global_fibre_constraints(afv_path, origin_xyz, spacing_xyz, shape_zyx, excluded_ids=(), excluded_lineage=()):
-    """Stream all AFV fibres, preserving native XYZ -> Paris4 L2 -> ZYX geometry.
+def global_fibre_constraints(
+    afv_path, origin_xyz, spacing_xyz, shape_zyx, excluded_ids=(), excluded_lineage=(), *, transform, voxel_mm
+):
+    """Stream all AFV fibres with the declared native/world/ZYX geometry.
 
     Eight distinct nodal pairs per fibre at most; no global/local fibre cap.
     Nearest-node quantization is explicit and can merge sheets on a coarse grid.
@@ -88,10 +90,11 @@ def global_fibre_constraints(afv_path, origin_xyz, spacing_xyz, shape_zyx, exclu
             if fid in excluded_ids or lineage & excluded_lineage:
                 audit["excluded_fibres"] += 1
                 continue
-            points = np.concatenate(chunks) / 4
+            points = np.concatenate(chunks)
             if len(points) < 2 or not np.isfinite(points).all():
                 audit["invalid_fibres"] += 1
                 continue
+            points = native_to_world(points, transform)
             inside = ((points >= origin) & (points <= last)).all(1)
             borders = np.diff(np.r_[False, inside, False].astype(np.int8))
             candidates = []
@@ -99,7 +102,7 @@ def global_fibre_constraints(afv_path, origin_xyz, spacing_xyz, shape_zyx, exclu
                 run = points[a:b]
                 if len(run) < 2:
                     continue
-                s = arclength(run, 0.0096)
+                s = arclength(run, voxel_mm)
                 nodes = np.rint((run - origin) / h).astype(int)[:, ::-1]
                 assert (nodes >= 0).all() and (nodes < shape).all()
                 flat = np.ravel_multi_index(nodes.T, shape)
@@ -123,9 +126,9 @@ def global_fibre_constraints(afv_path, origin_xyz, spacing_xyz, shape_zyx, exclu
     return result, audit
 
 
-def solve_global_reference(target, weights, spacing, pairs, fixed, device, lam=3.0):
+def solve_global_reference(target, weights, spacing, pairs, fixed, device, lam=3.0, rtol=0.001, maxiter=4000):
     return solve_field(
-        target, weights, spacing, pairs=pairs, lam=lam, fixed=fixed, device=device, rtol=0.001, maxiter=4000
+        target, weights, spacing, pairs=pairs, lam=lam, fixed=fixed, device=device, rtol=rtol, maxiter=maxiter
     )
 
 
@@ -147,12 +150,12 @@ def validate_reservation(excluded, afv):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--development", type=Path, required=True)
-    p.add_argument("--step", type=float, default=32)
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--fibre-weight", type=float, default=3.0)
-    p.add_argument("--data-root", default="/root/wrev")
-    p.add_argument("--afv", type=Path, help="default: DATA_ROOT/Paris4_v1.afv")
+    p.add_argument("--config", type=Path, required=True)
+    p.add_argument("--development", type=Path, help="optional evidence that must agree with configured calibration")
+    p.add_argument("--step", type=float, help="optional isotropic reconstruction spacing override")
+    p.add_argument("--device")
+    p.add_argument("--fibre-weight", type=float)
+    p.add_argument("--afv", type=Path, help="optional AFV override using the declared native geometry")
     p.add_argument("--exclude-fibres", type=Path, help="JSON with fibre_ids and source_lineage")
     p.add_argument("--baseline-field", type=Path, help="verify unchanged grid, observations, anchors and calibration")
     p.add_argument(
@@ -163,10 +166,23 @@ def main():
     p.add_argument("--split-manifest", type=Path, help="AFV-bound lineage/length split; train-only unless --production")
     p.add_argument("--production", action="store_true", help="use all eligible fibres; never call its scores held-out")
     a = p.parse_args()
+    dataset = load_dataset(a.config)
+    controls = mode_constraints(
+        dataset,
+        {"pair_weight"} if a.constraint_mode == "nodal" else {"pair_weight", "pitch_mm", "trace_target"},
+        "whole-reference " + a.constraint_mode,
+    )
+    solver_options = dataset.get("solver", {})
+    if a.split_manifest is None:
+        a.split_manifest = artifact_path(dataset, "split")
+    if a.fibre_weight is None:
+        a.fibre_weight = dataset.get("constraints", {}).get("pair_weight", 3.0)
     if not np.isfinite(a.fibre_weight) or a.fibre_weight < 0:
         p.error("fibre weight must be finite and nonnegative")
+    a.device = a.device or dataset.get("solver", {}).get("device", "cpu")
     a.output.mkdir(exist_ok=False)
-    afv = a.afv or Path(a.data_root) / "Paris4_v1.afv"
+    afv = a.afv or Path(dataset["afv"]["path"])
+    validate_afv(dataset, afv)
     excluded = json.loads(a.exclude_fibres.read_text()) if a.exclude_fibres else dict(fibre_ids=[], source_lineage=[])
     if a.exclude_fibres:
         validate_reservation(excluded, afv)
@@ -179,32 +195,42 @@ def main():
             excluded["fibre_ids"] = sorted(
                 set(excluded["fibre_ids"]) | {r["fibre_id"] for r in split["fibres"] if r["split"] == "reserved"}
             )
-    import zarr
-
-    native = zarr.open(CTB + "/0", mode="r")
-    hi = np.asarray(native.shape[::-1], float) / 4
+    grid = dataset["grid"]
+    lo = np.asarray(grid["origin_xyz"], float)
+    h = np.full(3, a.step) if a.step is not None else np.asarray(grid["spacing_xyz"], float)
+    hi = lo + np.asarray(grid["spacing_xyz"]) * np.asarray(grid["shape_zyx"][::-1])
     target, weights, pairs, meta = load_paris_box(
-        [0, 0, 0], hi, spacing=a.step, afv_path=None, data_root=a.data_root, normal_level=5
+        lo, hi, spacing=h, dataset=dataset, shape_zyx=grid["shape_zyx"] if a.step is None else None
     )
     fixed = np.full(weights.shape, np.nan, np.float32)
-    ct = zarr.open(CTB + "/5", mode="r")
     faces = []
-    for axis in range(3):
-        for side in (0, weights.shape[axis] - 1):
-            shape = list(weights.shape)
-            shape[axis] = 1
-            origin = np.zeros(3)
-            origin[2 - axis] = side * a.step
-            receipts = []
-            values = sample_volume(ct, origin, [a.step] * 3, shape, [8] * 3, order=0, receipts=receipts)
-            pin_outer_face(fixed, values, axis, side)
-            faces.append(
-                dict(axis_zyx=axis, index=side, black=int((values == 0).sum()), total=values.size, source=receipts)
+    for axis, edge in exterior_faces(dataset):
+        side = 0 if edge == 0 else weights.shape[axis] - 1
+        shape = list(weights.shape)
+        shape[axis] = 1
+        origin = lo.copy()
+        origin[2 - axis] += side * h[2 - axis]
+        receipts = []
+        values = sample_source(dataset, "ct", origin, h, shape, order=0, receipts=receipts)
+        pin_outer_face(fixed, values, axis, side, black_value(dataset))
+        faces.append(
+            dict(
+                axis_zyx=axis,
+                index=side,
+                black=int((values == black_value(dataset)).sum()),
+                black_value=black_value(dataset),
+                total=values.size,
+                source=receipts,
             )
+        )
     pins = int(np.isfinite(fixed).sum())
     if pins < 10:
         raise ValueError("insufficient verified outer background anchors")
-    step = development_step(json.loads(a.development.read_text())["rows"])
+    step = dataset["sheet_step"]
+    if a.development and not np.isclose(
+        development_step(json.loads(a.development.read_text())["rows"]), step, rtol=1e-12, atol=0
+    ):
+        raise ValueError("development calibration differs from the fixed baseline/configured scale")
     if a.baseline_field:
         baseline = json.loads(Path(str(a.baseline_field) + ".json").read_text())
         if sha256(a.baseline_field) != baseline["field_sha256"]:
@@ -214,6 +240,10 @@ def main():
             "origin_xyz",
             "spacing_xyz",
             "shape_zyx",
+            "voxel_um",
+            "prediction_parameters",
+            "normal_encoding",
+            "normal_orientation",
             "source_receipts",
             "umbi_sha256",
             "source_sha256",
@@ -227,12 +257,21 @@ def main():
         ):
             raise ValueError("baseline scale or outer anchors changed")
     pairs, audit = global_fibre_constraints(
-        afv, meta["origin_xyz"], meta["spacing_xyz"], weights.shape, excluded["fibre_ids"], excluded["source_lineage"]
+        afv,
+        meta["origin_xyz"],
+        meta["spacing_xyz"],
+        weights.shape,
+        excluded["fibre_ids"],
+        excluded["source_lineage"],
+        transform=dataset["afv"],
+        voxel_mm=dataset["voxel_um"] / 1000,
     )
     if not len(pairs):
         raise ValueError("global reference requires nonempty usable fibre constraints")
     audit.update(
         exclusion_manifest_sha256=sha256(a.exclude_fibres) if a.exclude_fibres else None,
+        split_manifest_sha256=sha256(a.split_manifest) if a.split_manifest else None,
+        production=a.production,
         selector_source_sha256=sha256(__file__),
         lambda_value=a.fibre_weight,
     )
@@ -246,11 +285,12 @@ def main():
     )
     config = dict(
         scope="whole_scan_coarse_reference_hypothesis",
-        native_shape_zyx=list(native.shape),
+        dataset_config_sha256=dataset["config_sha256"],
         working_shape_zyx=list(weights.shape),
-        spacing_l2=a.step,
-        voxel_um=9.6 * a.step,
+        spacing_xyz=h.tolist(),
+        sample_spacing_um=(h * dataset["voxel_um"]).tolist(),
         fixed_outer_samples=pins,
+        exterior_authority=dataset.get("context", {}).get("exterior_authority"),
         faces=faces,
         global_calibration_step=step,
         fibre_constraints=dict(
@@ -268,7 +308,17 @@ def main():
     (a.output / "config.json").write_text(json.dumps(config, indent=2))
     print("WHOLE SOLVE", weights.shape, "pins", pins, "fibre pairs", len(pairs), flush=True)
     if a.constraint_mode == "nodal":
-        field, info = solve_global_reference(target, weights, [a.step] * 3, pairs, fixed, a.device, lam=a.fibre_weight)
+        field, info = solve_global_reference(
+            target,
+            weights,
+            h,
+            pairs,
+            fixed,
+            a.device,
+            lam=a.fibre_weight,
+            rtol=solver_options.get("rtol", 0.001),
+            maxiter=solver_options.get("maxiter", 4000),
+        )
     else:
         from coherence_pipeline import compile_fibres, match_trace
         from common import iter_fibre_records
@@ -286,11 +336,17 @@ def main():
                 )
                 if record["fibre_id"] in omitted or source & lineage:
                     continue
-                record["points_xyz"] = record["points_xyz"] / 4
+                record["points_xyz"] = native_to_world(record["points_xyz"], dataset["afv"])
                 yield record
 
         continuous, consensus, compiled = compile_fibres(
-            usable(), meta["origin_xyz"], meta["spacing_xyz"], weights.shape, pair_weight=a.fibre_weight
+            usable(),
+            meta["origin_xyz"],
+            meta["spacing_xyz"],
+            weights.shape,
+            voxel_mm=dataset["voxel_um"] / 1000,
+            pair_weight=a.fibre_weight,
+            pitch_mm=controls.get("pitch_mm", 0.15),
         )
         endpoints = dict(a_xyz=compiled.pop("a_xyz"), b_xyz=compiled.pop("b_xyz"))
         np.savez_compressed(a.output / "physical_constraint_points.npz", **endpoints)
@@ -298,6 +354,9 @@ def main():
         if a.constraint_mode in ("fibre_consensus", "robust_consensus"):
             active, normalization = match_trace(consensus, continuous.trace)
             compiled["trace_normalization"] = normalization
+        if "trace_target" in controls:
+            active, normalization = match_trace(active, controls["trace_target"])
+            compiled["common_trace_matching"] = normalization
         active.save(a.output / "continuous_constraints.npz")
         compiled.update(
             mode=a.constraint_mode,
@@ -314,13 +373,13 @@ def main():
         field, info = solve_with_relations(
             target,
             weights,
-            [a.step] * 3,
+            h,
             constraints=active,
             robust_delta=0.5 * step if a.constraint_mode == "robust_consensus" else None,
             fixed=fixed,
             device=a.device,
-            rtol=0.001,
-            maxiter=4000,
+            rtol=solver_options.get("rtol", 0.001),
+            maxiter=solver_options.get("maxiter", 4000),
         )
         np.save(a.output / "robust_factors.npy", np.array(info.pop("robust_factors"), np.float32))
     (a.output / "solver.json").write_text(json.dumps(info, indent=2))

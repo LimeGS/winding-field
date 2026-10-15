@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
+from dataset_config import load_dataset, mode_constraints
 from patch_check import sha256
 
 
@@ -52,45 +53,68 @@ def seal_extra_global(output, field):
 
 
 def baseline_environment(args, baseline, lo, hi):
-    env = {k: v for k, v in os.environ.items() if k not in ("AUDIT_DIR", "RGT", "SLAB", "OUT", "AFV")}
+    dataset = load_dataset(args.config)
+    controls = dataset.get("constraints", {})
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("AUDIT_DIR", "RGT", "SLAB", "OUT", "AFV", "WREV_CONFIG", "ORIENT")
+    }
     env.update(
-        ORIENT="umbi",
-        LAM="3",
-        FIBER_LIMIT="400",
-        PAIR_LIMIT="2000",
-        WREV_DATA=str(args.data_root),
+        ORIENT=dataset["orientation"]["mode"],
+        LAM=str(controls.get("pair_weight", 3)),
+        FIBER_LIMIT=str(controls.get("fiber_limit", 400)),
+        PAIR_LIMIT=str(controls.get("pair_limit", 2000)),
+        WREV_CONFIG=str(args.config.resolve()),
         PREDICT_ONLY="1",
-        WREV_DEVICE=args.device,
-        OUT=str(baseline),
-        AFV=str(args.data_root / "Paris4_v1.afv"),
+        WREV_DEVICE=args.device or dataset.get("solver", {}).get("device", "cpu"),
+        OUT=str(Path(baseline).resolve()),
+        AFV=dataset["afv"]["path"],
         SLAB=",".join(map(str, np.stack([lo, hi], 1).ravel())),
     )
     return env
 
 
 def predict(args):
+    from coarse_reference import load_external_reference
     from field_solver import solve_field
     from paris_data import load_paris_box, save_field
+    from physical_grid import grid_shape
 
-    out = args.output
+    dataset = load_dataset(args.config)
+    mode_constraints(dataset, {"pair_weight", "fiber_limit", "pair_limit"}, "sealed nodal prediction")
+    out = args.output.resolve()
     out.mkdir(exist_ok=False)
     geometry = json.loads(args.manifest.read_text())
-    step = development_step(json.loads(args.development.read_text())["rows"])
+    geometry_frame = geometry.get("frame", geometry.get("split", {}).get("frame"))
+    if (
+        geometry_frame != dataset["frame"]
+        or geometry.get("split", {}).get("frame", dataset["frame"]) != dataset["frame"]
+    ):
+        raise ValueError("geometry manifest and dataset frames differ")
+    if geometry.get("voxel_um", dataset["voxel_um"]) != dataset["voxel_um"]:
+        raise ValueError("geometry manifest and dataset units differ")
+    step = dataset["sheet_step"]
+    if not np.isclose(development_step(json.loads(args.development.read_text())["rows"]), step, rtol=1e-12, atol=0):
+        raise ValueError("development evidence differs from configured calibration")
     config = dict(
         geometry_sha256=sha256(args.manifest),
+        dataset_config_sha256=dataset["config_sha256"],
         development_sha256=sha256(args.development),
         global_step=step,
-        lam=3,
-        rtol=0.001,
-        maxiter=4000,
-        fiber_limit=400,
-        pair_limit=2000,
+        lam=dataset.get("constraints", {}).get("pair_weight", 3),
+        rtol=dataset.get("solver", {}).get("rtol", 0.001),
+        maxiter=dataset.get("solver", {}).get("maxiter", 4000),
+        fiber_limit=dataset.get("constraints", {}).get("fiber_limit", 400),
+        pair_limit=dataset.get("constraints", {}).get("pair_limit", 2000),
         calibration="median of collection medians of abs(phi_b-phi_a)/dw on development only",
         candidate="physical_grid_signed_shared_operator",
-        baseline="archived_audited_solver_local_ridge_calibration",
+        baseline="configured_legacy_index_solver_fixed_calibration",
         predictor_sha256=sha256(__file__),
+        legacy_solver_sha256=sha256(args.legacy_solver),
         code_sha256={
-            n: sha256(Path(__file__).with_name(n)) for n in ("field_solver.py", "physical_grid.py", "paris_data.py")
+            n: sha256(Path(__file__).with_name(n))
+            for n in ("field_solver.py", "physical_grid.py", "paris_data.py", "dataset_config.py")
         },
         private_scoring_subset_opened=False,
         label_access_isolated=False,
@@ -103,32 +127,80 @@ def predict(args):
     for i, group in enumerate(geometry["initial_test"]["groups"]):
         grid = group["grid"]
         lo, hi = np.array(grid["origin_xyz"]), np.array(grid["hi_xyz"])
+        spacing = np.asarray(grid["spacing_xyz"], float)
+        shape = grid_shape(lo, hi, spacing, grid.get("shape_zyx"))
         baseline = out / f"group{i}_baseline.npy"
         env = baseline_environment(args, baseline, lo, hi)
         print("PREDICT baseline", i, group["group_id"], flush=True)
+        command = [
+            sys.executable,
+            str(args.legacy_solver.resolve()),
+            "--config",
+            str(args.config.resolve()),
+            "--output",
+            str(baseline),
+            "--prediction-only",
+            "--spacing",
+            *map(str, spacing),
+        ]
         with (out / f"group{i}_baseline.log").open("x") as f:
             subprocess.run(
-                [sys.executable, str(args.legacy_solver)],
+                command,
                 env=env,
                 stdout=f,
                 stderr=subprocess.STDOUT,
                 check=True,
                 timeout=600,
             )
-        g, w, pairs, meta = load_paris_box(
-            lo, hi, spacing=grid["spacing_xyz"], afv_path=args.data_root / "Paris4_v1.afv", data_root=args.data_root
+        initial, baseline_meta, baseline_identity = load_external_reference(
+            baseline,
+            Path(str(baseline) + ".json"),
+            dataset["frame"],
+            lo,
+            spacing,
+            shape,
+            step,
+            voxel_um=dataset["voxel_um"],
         )
-        start = -np.load(baseline).astype(np.float32)
+        if (
+            baseline_meta["origin_xyz"] != lo.tolist()
+            or baseline_meta["spacing_xyz"] != spacing.tolist()
+            or baseline_meta["shape_zyx"] != list(shape)
+        ):
+            raise ValueError("baseline grid differs from requested geometry")
+        g, w, pairs, meta = load_paris_box(
+            lo,
+            hi,
+            spacing=grid["spacing_xyz"],
+            afv_path=dataset["afv"]["path"],
+            dataset=dataset,
+            shape_zyx=shape,
+        )
+        start = -np.asarray(initial, dtype=np.float32)
         start -= start.flat[0]
         print("PREDICT candidate", i, flush=True)
         field, info = solve_field(
-            g, w, grid["spacing_xyz"], pairs, lam=3, initial=start, device=args.device, rtol=0.001, maxiter=4000
+            g,
+            w,
+            grid["spacing_xyz"],
+            pairs,
+            lam=config["lam"],
+            initial=start,
+            device=args.device or dataset.get("solver", {}).get("device", "cpu"),
+            rtol=config["rtol"],
+            maxiter=config["maxiter"],
         )
         name = out / f"group{i}_candidate.npy"
         save_field(name, field, meta, info, step=step)
+        if (
+            sha256(baseline) != baseline_identity["field_sha256"]
+            or sha256(str(baseline) + ".json") != baseline_identity["metadata_sha256"]
+        ):
+            raise ValueError("baseline changed after validation")
         artifacts.append(
             dict(
                 group=group,
+                baseline_command=command,
                 baseline=str(baseline),
                 baseline_sha256=sha256(baseline),
                 candidate=str(name),
@@ -173,7 +245,7 @@ def score(args):
                 or sha256(art[kind] + ".json") != art[kind + "_metadata_sha256"]
             ):
                 raise ValueError("prediction changed after sealing")
-    records, _, exclusions = load_pair_records(args.labels, 0, 20000)
+    records, _, exclusions = load_pair_records(args.labels)
     results = {k: [] for k in ("baseline", "candidate", "constant_control")}
     if extra:
         results["whole_coarse_secondary"] = []
@@ -216,9 +288,9 @@ def build_parser():
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--development", type=Path)
     parser.add_argument("--labels", type=Path)
-    parser.add_argument("--data-root", type=Path, default=Path("/root/wrev"))
+    parser.add_argument("--config", type=Path, help="required dataset configuration for prediction")
     parser.add_argument("--legacy-solver", type=Path, default=Path(__file__).resolve().with_name("paris_solve.py"))
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device")
     return parser
 
 
@@ -226,8 +298,8 @@ if __name__ == "__main__":
     parser = build_parser()
     args = parser.parse_args()
     if args.mode == "predict":
-        if not args.manifest or not args.development:
-            parser.error("predict needs geometry manifest and development receipts")
+        if not args.manifest or not args.development or not args.config:
+            parser.error("predict needs --config, geometry manifest and development receipts")
         predict(args)
     else:
         if not args.labels:

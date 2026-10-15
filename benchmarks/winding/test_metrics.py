@@ -77,7 +77,9 @@ class BenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "f.npy"
             np.save(p, np.zeros((3, 4, 5), np.float32))
-            meta = dict(field_sha256="0" * 64, shape_zyx=[3, 4, 5], step=1, frame=b.FRAME, solver={"converged": True})
+            meta = dict(
+                field_sha256="0" * 64, shape_zyx=[3, 4, 5], step=1, frame="test/world", solver={"converged": True}
+            )
             with self.assertRaisesRegex(ValueError, "hash"):
                 b.open_field(p, meta)
 
@@ -86,7 +88,13 @@ class BenchmarkTests(unittest.TestCase):
         field = np.zeros((5, 6, 7), np.float32)
         meta = dict(origin_xyz=[0, 0, 0], spacing_xyz=[1, 1, 1], step=1)
         rows = [dict(bin=0, fiber_id=1, a_native_xyz=[0, 8, 8], b_native_xyz=[8, 8, 8])]
-        result = b.evaluate(field, meta, rows, ownership=np.zeros(field.shape, np.int8))
+        result = b.evaluate(
+            field,
+            meta,
+            rows,
+            ownership=np.zeros(field.shape, np.int8),
+            transform=dict(scale_xyz=[0.25] * 3, offset_xyz=[0, 0, 0]),
+        )
         self.assertIsNone(result[0]["error"])
         self.assertEqual(result[0]["seam"], "same")
         table = b.summarize([r for r in result if r["seam"] == "same"])

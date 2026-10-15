@@ -88,8 +88,17 @@ def test_seed_neighborhood_does_not_enter_heldout_distance_denominator(tmp_path)
     vertices = xyz[[0, 0, -1, -1], [0, -1, -1, 0]]
     faces = np.array([[0, 1, 2], [0, 2, 3]])
     owner = np.zeros((64, 64, 64), np.int8)
+    meta = metadata(owner.shape, (0, 0, 0), (1, 1, 1))
     result = evaluate_patch(
-        tmp_path, vertices, faces, metadata(owner.shape, (0, 0, 0), (1, 1, 1)), owner, exclude_uv_rc=[4, 4], exact=True
+        tmp_path,
+        vertices,
+        faces,
+        meta,
+        owner,
+        exclude_uv_rc=[4, 4],
+        exact=True,
+        patch_frame=meta["frame"],
+        patch_voxel_um=meta["voxel_um"],
     )
     assert result["excluded_seed_neighborhood_points"] == 25
     assert result["covered_human_points"] == 56
@@ -105,7 +114,7 @@ def test_context_image_declares_actual_integer_ct_plane_and_human_supervision(tm
     out = tmp_path / "context.png"
     context_image(out, ct, metadata(ct.shape, (0, 0, 0), (1, 1, 1)), selection, np.array([[10, 10, 20.3]]))
     with Image.open(out) as image:
-        assert image.info["CT_z_L2"] == "20.0"
+        assert image.info["CT_z_world"] == "20.0"
         assert "human seed" in image.info["Description"]
 
 

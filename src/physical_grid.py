@@ -52,13 +52,26 @@ def point_stencils(xyz, origin_xyz, spacing_xyz, shape_zyx, support=None):
     return nodes, weights, valid
 
 
-def grid_shape(lo_xyz, hi_xyz, spacing_xyz):
+def grid_shape(lo_xyz, hi_xyz, spacing_xyz, shape_zyx=None):
     lo, hi, spacing = (np.asarray(a, float) for a in (lo_xyz, hi_xyz, spacing_xyz))
     if any(a.shape != (3,) for a in (lo, hi, spacing)) or not np.isfinite([lo, hi, spacing]).all():
         raise ValueError("expected finite XYZ vectors")
     if (hi <= lo).any() or (spacing <= 0).any():
         raise ValueError("nonpositive extent/spacing")
-    return tuple(int(v) for v in np.ceil((hi - lo) / spacing)[::-1])
+    if shape_zyx is not None:
+        shape = np.asarray(shape_zyx)
+        if shape.shape != (3,) or shape.dtype.kind not in "iu" or (shape < 1).any():
+            raise ValueError("declared shape must contain positive integer ZYX dimensions")
+        expected_hi = lo + shape[::-1] * spacing
+        tolerance = 4 * np.spacing(np.maximum(np.abs(hi), np.abs(expected_hi)))
+        if not np.isfinite(expected_hi).all() or (np.abs(hi - expected_hi) > tolerance).any():
+            raise ValueError("declared shape disagrees with physical bounds")
+        return tuple(int(v) for v in shape)
+    extent = (hi - lo) / spacing
+    nearest = np.rint(extent)
+    near_integer = (nearest >= 1) & (np.abs(extent - nearest) <= 4 * np.spacing(np.maximum(np.abs(nearest), 1)))
+    extent = np.where(near_integer, nearest, extent)
+    return tuple(int(v) for v in np.ceil(extent)[::-1])
 
 
 def sample_volume(

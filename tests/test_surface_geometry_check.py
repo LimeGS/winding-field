@@ -55,7 +55,7 @@ def test_conversion_rejects_invalid_declared_geometry(tmp_path, damage):
     if damage == "mask_type":
         valid = valid.astype(np.uint8)
     if damage == "frame":
-        frame = "PHercParis4/20260411134726:L0"
+        frame = ""
     grid = tmp_path / "grid.npz"
     np.savez(grid, points_xyz=points, valid=valid, pitch_um=[9.6, 9.6])
     with pytest.raises(ValueError):
@@ -72,3 +72,17 @@ def test_unmeasured_gate_is_not_pass_even_when_gate_cli_returns_zero():
         gate_outcome({"geometry_qc_state": "GEOMETRY_CERTIFIED", "measurement_complete": True, "status": "PASS"})
         == "PASS"
     )
+
+
+def test_tifxyz_uses_another_declared_frame_and_physical_unit(tmp_path):
+    from surface_geometry_check import export_tifxyz
+
+    points = np.ones((3, 4, 3)) * 50
+    grid = tmp_path / "grid.npz"
+    np.savez(grid, points_xyz=points, valid=np.ones((3, 4), bool), pitch_um=[24, 12])
+    out = tmp_path / "tifxyz"
+    receipt = export_tifxyz(grid, dict(frame="different-scroll/world", voxel_um=12), out)
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["frame"] == "different-scroll/world" and meta["voxel_um"] == 12
+    assert meta["scale"] == [1, 0.5]
+    assert receipt["maximum_float32_error_um"] == 0

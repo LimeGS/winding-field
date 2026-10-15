@@ -44,6 +44,7 @@ py-modules = [
   "coarse_reference",
   "coherence_pipeline",
   "common",
+  "dataset_config",
   "evaluation_split",
   "field_constraints",
   "field_solver",

@@ -23,7 +23,7 @@ def _array_hash(array):
     return hashlib.sha256(np.ascontiguousarray(array).view(np.uint8)).hexdigest()
 
 
-def load_external_reference(field_path, metadata_path, frame, origin, h, shape, sheet_step=None):
+def load_external_reference(field_path, metadata_path, frame, origin, h, shape, sheet_step=None, *, voxel_um=None):
     """Verify a sealed NPY/JSON pair before sampling; retain raw values and gauge."""
     meta = json.loads(Path(metadata_path).read_text())
     digest = _file_hash(field_path)
@@ -31,6 +31,11 @@ def load_external_reference(field_path, metadata_path, frame, origin, h, shape, 
         raise ValueError("external reference field hash mismatch")
     if not frame or frame != meta.get("frame"):
         raise ValueError("external reference frame mismatch")
+    if voxel_um is not None:
+        from dataset_config import positive
+
+        if not np.isclose(positive(meta.get("voxel_um"), "reference voxel_um"), voxel_um, rtol=1e-12, atol=0):
+            raise ValueError("external reference physical units differ")
     if meta.get("solver", {}).get("converged") is not True:
         raise ValueError("external reference source solver is not converged")
     if meta.get("chart_local_potential"):
@@ -47,16 +52,42 @@ def load_external_reference(field_path, metadata_path, frame, origin, h, shape, 
     if (
         field.ndim != 3
         or list(field.shape) != meta["shape_zyx"]
-        or not np.isfinite(field).all()
+        or field.dtype.kind not in "fiu"
         or sh.shape != (3,)
         or so.shape != (3,)
         or not np.isfinite([sh, so]).all()
         or (sh <= 0).any()
     ):
         raise ValueError("invalid external reference grid/values")
+    support_name = meta.get("support")
+    support_declared = support_name is not None or any(
+        meta.get(k) is not None for k in ("support_sha256", "support_array_sha256")
+    )
+    if support_declared:
+        if not isinstance(support_name, str) or not support_name:
+            raise ValueError("external reference support requires a mask path")
+        support_path = (Path(field_path).resolve().parent / support_name).resolve()
+        support = np.load(support_path, mmap_mode="r", allow_pickle=False)
+        if support.shape != field.shape or support.dtype != np.bool_:
+            raise ValueError("external reference support must match the boolean source grid")
+        expected_file, expected_array = meta.get("support_sha256"), meta.get("support_array_sha256")
+        if expected_file is None and expected_array is None:
+            raise ValueError("external reference support requires a declared hash")
+        actual = _file_hash(support_path)
+        if (expected_file is not None and actual != expected_file) or (
+            expected_array is not None and _array_hash(support) != expected_array
+        ):
+            raise ValueError("external reference support hash mismatch")
+        if not np.isfinite(field[support]).all():
+            raise ValueError("external reference has nonfinite supported values")
+        meta = dict(meta, support=str(support_path), support_sha256=actual)
+    elif not np.isfinite(field).all():
+        raise ValueError("invalid external reference values without support")
     last = origin + (np.asarray(shape[::-1]) - 1) * h
     if (origin < so).any() or (last > so + (np.asarray(field.shape[::-1]) - 1) * sh).any():
         raise ValueError("pilot extends outside external reference support")
+    if support_declared:
+        sample_reference(field, meta, origin, h, shape, validate_only=True)
     provenance = dict(
         kind="external_resampled_reference",
         field_path=str(Path(field_path).resolve()),
@@ -64,6 +95,9 @@ def load_external_reference(field_path, metadata_path, frame, origin, h, shape, 
         field_sha256=digest,
         metadata_sha256=_file_hash(metadata_path),
         frame=frame,
+        voxel_um=meta.get("voxel_um"),
+        support_path=meta.get("support"),
+        support_sha256=meta.get("support_sha256"),
         source_solver=meta["solver"],
         source_origin_xyz=so.tolist(),
         source_spacing_xyz=sh.tolist(),
@@ -72,6 +106,45 @@ def load_external_reference(field_path, metadata_path, frame, origin, h, shape, 
         resampling="physical_grid.sample_volume order=1; no gauge/scale fitting",
     )
     return field, meta, provenance
+
+
+def sample_reference(field, metadata, origin, spacing, shape, *, receipts=None, validate_only=False):
+    """Sample only supported positive-weight stencils, including fractional coarse nodes."""
+    from physical_grid import point_stencils
+
+    if metadata.get("support") is None:
+        return sample_volume(
+            field, origin, spacing, shape, metadata["spacing_xyz"], metadata["origin_xyz"], order=1, receipts=receipts
+        )
+    path = Path(metadata["support"])
+    if _file_hash(path) != metadata["support_sha256"]:
+        raise ValueError("reference support changed after admission")
+    support = np.load(path, mmap_mode="r", allow_pickle=False)
+    count = int(np.prod(shape))
+    result = None if validate_only else np.empty(count, np.float32)
+    for start in range(0, count, 100_000):
+        end = min(count, start + 100_000)
+        indices = np.array(np.unravel_index(np.arange(start, end), shape)).T[:, ::-1]
+        points = np.asarray(origin) + indices * np.asarray(spacing)
+        nodes, weights, valid = point_stencils(
+            points, metadata["origin_xyz"], metadata["spacing_xyz"], field.shape, support
+        )
+        if not valid.all():
+            raise ValueError("requested reference interpolation stencil is unsupported")
+        if result is not None:
+            values = field.ravel()[nodes]
+            result[start:end] = np.sum(np.where(weights > 0, values, 0) * weights, axis=1)
+    if receipts is not None:
+        receipts.append(
+            dict(
+                method="support_checked_trilinear",
+                origin_xyz=list(origin),
+                spacing_xyz=list(spacing),
+                shape_zyx=list(shape),
+                support_sha256=metadata["support_sha256"],
+            )
+        )
+    return None if result is None else result.reshape(shape)
 
 
 def _pairs(pairs, shape):
@@ -282,7 +355,14 @@ def run_pilot_arrays(
     external = refmeta = reference = None
     if external_reference is not None:
         external, refmeta, reference = load_external_reference(
-            external_reference, external_metadata, (metadata or {}).get("frame"), origin, h, shape, sheet_step
+            external_reference,
+            external_metadata,
+            (metadata or {}).get("frame"),
+            origin,
+            h,
+            shape,
+            sheet_step,
+            voxel_um=(metadata or {}).get("voxel_um"),
         )
         sheet_step = reference["step"]
     elif sheet_step is None:
@@ -416,9 +496,7 @@ def run_pilot_arrays(
             samples = []
 
             def sample_external(hs, sh):
-                return sample_volume(
-                    external, origin, hs, sh, refmeta["spacing_xyz"], refmeta["origin_xyz"], order=1, receipts=samples
-                )
+                return sample_reference(external, refmeta, origin, hs, sh, receipts=samples)
 
             coarse, base = sample_external(ch, cshape), sample_external(h, shape)
             receipt["coarse_grid"].update(kind="external_resampled_reference", sample_receipts=samples)
@@ -532,6 +610,7 @@ def run_pilot_arrays(
                 assembled,
                 assembly_info,
                 support="support.npy",
+                support_sha256=receipt.get("support_sha256"),
                 core_ownership="core_ownership.npy",
             )
             previous = assembled
@@ -546,6 +625,7 @@ def run_pilot_arrays(
             assembled,
             assembly_info,
             support="support.npy",
+            support_sha256=receipt.get("support_sha256"),
             core_ownership="core_ownership.npy",
             pilot_gate_status=receipt["status"],
         )
@@ -640,14 +720,14 @@ def compare_pilot_outputs(first, second):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True, help="new output directory")
-    parser.add_argument("--origin", nargs=3, type=float, default=[4088, 2500, 10096])
-    parser.add_argument("--size", nargs=3, type=float, default=[512, 512, 512])
-    parser.add_argument("--step", type=float, default=2.0)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--data-root", default="/root/wrev")
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--origin", nargs=3, type=float)
+    parser.add_argument("--size", nargs=3, type=float)
+    parser.add_argument("--step", type=float)
+    parser.add_argument("--device")
     parser.add_argument("--afv")
-    parser.add_argument("--sweeps", type=int, default=4)
-    parser.add_argument("--halo", type=int, default=16, choices=[16, 32])
+    parser.add_argument("--sweeps", type=int)
+    parser.add_argument("--halo", type=int)
     parser.add_argument(
         "--sheet-step", type=float, help="default: external reference step, otherwise 1; must match reference"
     )
@@ -660,38 +740,59 @@ def main(argv=None):
         parser.error("--reference-field and --reference-metadata are required together")
     args.output.mkdir(exist_ok=False)
     try:
+        from dataset_config import load_dataset, mode_constraints
         from paris_data import load_paris_box
 
+        dataset = load_dataset(args.config)
+        allowed = {"pair_weight", "fiber_limit", "pair_limit"} if not args.continuous_constraints or args.afv else set()
+        controls = mode_constraints(
+            dataset,
+            allowed,
+            "coarse pilot with frozen constraints" if args.continuous_constraints else "nodal coarse pilot",
+        )
+        grid = dataset["grid"]
+        origin = args.origin if args.origin is not None else grid["origin_xyz"]
+        spacing = args.step if args.step is not None else grid["spacing_xyz"]
+        size = args.size if args.size is not None else np.array(grid["spacing_xyz"]) * np.array(grid["shape_zyx"][::-1])
         target, weights, pairs, meta = load_paris_box(
-            args.origin,
-            np.array(args.origin) + args.size,
-            spacing=args.step,
-            afv_path=args.afv,
-            data_root=args.data_root,
+            origin,
+            np.array(origin) + size,
+            spacing=spacing,
+            afv_path=args.afv or (dataset["afv"]["path"] if args.continuous_constraints is None else None),
+            dataset=dataset,
+            shape_zyx=grid["shape_zyx"] if args.size is None and args.step is None else None,
         )
         continuous = None
         if args.continuous_constraints:
             from field_constraints import QuadraticConstraints
 
             cm = json.loads(Path(str(args.continuous_constraints) + ".json").read_text())
-            for key in ("frame", "origin_xyz", "spacing_xyz", "shape_zyx"):
-                if cm[key] != meta[key]:
+            for key in ("frame", "origin_xyz", "spacing_xyz", "shape_zyx", "voxel_um"):
+                if cm.get(key) != meta[key]:
                     raise ValueError("continuous constraint physical metadata mismatch")
+            effective_step = args.sheet_step if args.sheet_step is not None else dataset["sheet_step"]
+            if cm.get("step") is not None and not np.isclose(cm["step"], effective_step, rtol=1e-12, atol=0):
+                raise ValueError("continuous constraint calibration mismatch")
             if _file_hash(args.continuous_constraints) != cm["file_sha256"]:
                 raise ValueError("constraint file hash mismatch")
             continuous = QuadraticConstraints.load(args.continuous_constraints)
             if continuous.digest != cm["constraint_digest"]:
                 raise ValueError("constraint rows changed")
+            if np.any(continuous.targets != 0) and cm.get("step") is None:
+                raise ValueError("nonzero constraint targets require an explicit calibrated step")
         _, _, _, receipt = run_pilot_arrays(
             target,
             weights,
-            args.step,
+            spacing,
             pairs,
-            origin_xyz=args.origin,
-            sweeps=args.sweeps,
-            halo=args.halo,
-            sheet_step=args.sheet_step,
-            device=args.device,
+            origin_xyz=origin,
+            sweeps=args.sweeps if args.sweeps is not None else dataset.get("context", {}).get("sweeps", 4),
+            halo=args.halo if args.halo is not None else dataset.get("context", {}).get("halo", 16),
+            lam=controls.get("pair_weight", 3),
+            rtol=dataset.get("solver", {}).get("rtol", 1e-5),
+            maxiter=dataset.get("solver", {}).get("maxiter", 4000),
+            sheet_step=args.sheet_step if args.sheet_step is not None else dataset["sheet_step"],
+            device=args.device or dataset.get("solver", {}).get("device", "cpu"),
             output=args.output,
             metadata=meta,
             external_reference=args.reference_field,

@@ -1,7 +1,7 @@
 """CPU-only baseline receipt diagnosis and geometry-only holdout freezing.
 
 python audit_errors.py audit --audit-dir baseline-audit --output diagnostics.json --report REPORT.md
-python audit_errors.py freeze --relwind /root/wrev/relwind.json --audit-dir baseline-audit --output-dir sealed
+python audit_errors.py freeze --config dataset.json --relwind labels.json --audit-dir baseline-audit --output-dir sealed
 The freeze command never scores or examines winding values; label subsets stay private.
 """
 
@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
+from dataset_config import load_dataset, xyz
 from evaluation_split import build_split
 from paris_pair_check import summarize_rows
 from patch_check import sha256
@@ -175,7 +176,7 @@ def _metadata(directory):
     return {p.name[4:-9]: json.loads(p.read_text()) for p in sorted(Path(directory).glob("slab[0-9]*.npy.json"))}
 
 
-def analyze_audit(directory, expected_correct=373, expected_eligible=706):
+def analyze_audit(directory, expected_correct=None, expected_eligible=None):
     """Reconcile complete slab receipts against the aggregate; hash small inputs."""
     directory = Path(directory)
     if not (directory / "DONE").is_file():
@@ -203,7 +204,9 @@ def analyze_audit(directory, expected_correct=373, expected_eligible=706):
         raise ValueError("slab rows do not reconcile with aggregate rows")
     result = diagnose_rows(receipt["rows"], metas)
     summary = result["summary"]
-    if summary["correct"] != expected_correct or summary["eligible"] != expected_eligible:
+    if (expected_correct is not None and summary["correct"] != expected_correct) or (
+        expected_eligible is not None and summary["eligible"] != expected_eligible
+    ):
         raise ValueError("observed counts differ from expected baseline counts")
     for name in ("selection.json", "DONE", "progress.json"):
         if (directory / name).is_file():
@@ -287,10 +290,38 @@ def render_report(result):
     return "\n".join(lines) + "\n"
 
 
-def plan_holdout(collections, slab_metadata, max_groups=3, max_group_voxels=40_000_000, max_total_voxels=120_000_000):
+def plan_holdout(
+    collections,
+    slab_metadata,
+    max_groups=3,
+    max_group_voxels=40_000_000,
+    max_total_voxels=120_000_000,
+    *,
+    frame,
+    spacing_xyz,
+    buffer_world,
+    margin_world,
+    alignment_xyz,
+    grid_origin_xyz=(0, 0, 0),
+    lower_bound_xyz=None,
+    upper_bound_xyz=None,
+    development_z_context=None,
+    development_boxes=(),
+):
     """Use only point geometry; whole-group stable-ID prefix, never score selection."""
     if max_groups < 1 or max_group_voxels < 1 or max_total_voxels < 1:
         raise ValueError("positive holdout budgets required")
+    spacing = xyz(spacing_xyz, "holdout spacing", positive=True)
+    alignment = xyz(alignment_xyz, "holdout alignment", positive=True)
+    origin = xyz(grid_origin_xyz, "holdout grid origin")
+    if not np.isfinite(margin_world) or margin_world < 0:
+        raise ValueError("holdout margin must be finite and nonnegative")
+    lower_bound = xyz(lower_bound_xyz, "lower bound") if lower_bound_xyz is not None else None
+    upper_bound = xyz(upper_bound_xyz, "upper bound") if upper_bound_xyz is not None else None
+    if lower_bound is not None and upper_bound is not None and (upper_bound <= lower_bound).any():
+        raise ValueError("invalid holdout domain bounds")
+    if any(meta.get("frame") != frame for meta in slab_metadata.values()):
+        raise ValueError("baseline and holdout frames differ")
     colls, exclusions = {}, []
     for cid, collection in sorted(collections.items()):
         points = collection["points"]
@@ -309,13 +340,33 @@ def plan_holdout(collections, slab_metadata, max_groups=3, max_group_voxels=40_0
         }
         for sid, meta in sorted(slab_metadata.items())
     ]
-    split = build_split(colls, dev, buffer_voxels=256, development_boxes=boxes)
+    split = build_split(
+        colls,
+        dev,
+        buffer_voxels=buffer_world,
+        frame=frame,
+        development_boxes=[*boxes, *development_boxes],
+        development_z_context=development_z_context,
+    )
     candidates = [g for g in split["groups"] if g["split"] == "test"]
     selected, total, blocker = [], 0, None if candidates else "no_independent_test_groups"
     for group in candidates[:max_groups]:
-        lo = np.maximum(np.floor((np.array(group["min_xyz"]) - 100) / 16) * 16, 0).astype(int)
-        hi = (np.ceil((np.array(group["max_xyz"]) + 100) / 16) * 16).astype(int)
-        shape = ((hi - lo) // 2)[::-1]
+        minimum, maximum = np.array(group["min_xyz"]), np.array(group["max_xyz"])
+        if (lower_bound is not None and (minimum < lower_bound).any()) or (
+            upper_bound is not None and (maximum >= upper_bound).any()
+        ):
+            blocker = "whole_group_outside_declared_domain"
+            break
+        lo = origin + np.floor((minimum - margin_world - origin) / alignment) * alignment
+        hi = origin + np.ceil((maximum + margin_world - origin) / alignment) * alignment
+        if lower_bound is not None:
+            lo = np.maximum(lo, lower_bound)
+        if upper_bound is not None:
+            hi = np.minimum(hi, upper_bound)
+        shape = np.ceil((hi - lo) / spacing).astype(int)[::-1]
+        if (shape <= 0).any():
+            blocker = "empty_solver_domain"
+            break
         voxels = math.prod(int(v) for v in shape)
         if voxels > max_group_voxels or total + voxels > max_total_voxels:
             blocker = "whole_group_budget_exceeded"
@@ -335,7 +386,7 @@ def plan_holdout(collections, slab_metadata, max_groups=3, max_group_voxels=40_0
                 "grid": {
                     "origin_xyz": lo.tolist(),
                     "hi_xyz": hi.tolist(),
-                    "spacing_xyz": [2, 2, 2],
+                    "spacing_xyz": spacing.tolist(),
                     "shape_zyx": shape.tolist(),
                     "working_voxels": voxels,
                 },
@@ -343,6 +394,7 @@ def plan_holdout(collections, slab_metadata, max_groups=3, max_group_voxels=40_0
         )
         total += voxels
     return {
+        "frame": frame,
         "source_collection_count": len(collections),
         "geometry_exclusions": exclusions,
         "split": split,
@@ -355,17 +407,20 @@ def plan_holdout(collections, slab_metadata, max_groups=3, max_group_voxels=40_0
             "max_groups": max_groups,
             "max_group_voxels": max_group_voxels,
             "max_total_voxels": max_total_voxels,
-            "margin_l2": 100,
-            "alignment_l2": 16,
+            "margin_world": margin_world,
+            "alignment_xyz": alignment.tolist(),
+            "grid_origin_xyz": origin.tolist(),
             "selection": "stable group-ID prefix, stop before a whole group exceeds budget or overlaps another group; no label values",
         },
     }
 
 
-def freeze_holdout(relwind_path, audit_directory, output_directory):
+def freeze_holdout(relwind_path, audit_directory, output_directory, *, geometry):
     """Write a new manifest and mode-0600 opaque label subsets; return public data only."""
     data = json.loads(Path(relwind_path).read_text())
-    plan = plan_holdout(data["collections"], _metadata(audit_directory))
+    if data.get("frame", geometry["frame"]) != geometry["frame"]:
+        raise ValueError("annotation/holdout frame mismatch")
+    plan = plan_holdout(data["collections"], _metadata(audit_directory), **geometry)
     output = Path(output_directory)
     output.mkdir(exist_ok=False)
     labels = {}
@@ -378,7 +433,11 @@ def freeze_holdout(relwind_path, audit_directory, output_directory):
         path = output / name
         with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as handle:
             # Labels are copied opaquely, never used for selection or printed.
-            json.dump({"collections": {cid: data["collections"][cid] for cid in ids}}, handle, sort_keys=True)
+            json.dump(
+                {"frame": geometry["frame"], "collections": {cid: data["collections"][cid] for cid in ids}},
+                handle,
+                sort_keys=True,
+            )
         labels[name] = {"path": str(path), "sha256": sha256(path), "collections": len(ids)}
     plan.update(
         relwind_sha256=sha256(relwind_path),
@@ -404,15 +463,31 @@ def main(argv=None):
     audit.add_argument("--audit-dir", type=Path, required=True)
     audit.add_argument("--output", type=Path, required=True)
     audit.add_argument("--report", type=Path, required=True)
-    audit.add_argument("--expected-correct", type=int, default=373)
-    audit.add_argument("--expected-eligible", type=int, default=706)
+    audit.add_argument("--expected-correct", type=int)
+    audit.add_argument("--expected-eligible", type=int)
     freeze = commands.add_parser("freeze")
     freeze.add_argument("--relwind", type=Path, required=True)
+    freeze.add_argument("--config", type=Path, required=True)
     freeze.add_argument("--audit-dir", type=Path, required=True)
     freeze.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.command == "freeze":
-        public = freeze_holdout(args.relwind, args.audit_dir, args.output_dir)
+        dataset = load_dataset(args.config)
+        policy = dataset.get("context", {}).get("holdout")
+        if policy is None:
+            raise ValueError("declare context.holdout buffer_world, margin_world and alignment_xyz")
+        grid = dataset["grid"]
+        geometry = dict(
+            policy,
+            frame=dataset["frame"],
+            spacing_xyz=grid["spacing_xyz"],
+            grid_origin_xyz=grid["origin_xyz"],
+            lower_bound_xyz=grid["origin_xyz"],
+            upper_bound_xyz=(
+                np.array(grid["origin_xyz"]) + np.array(grid["spacing_xyz"]) * np.array(grid["shape_zyx"][::-1])
+            ).tolist(),
+        )
+        public = freeze_holdout(args.relwind, args.audit_dir, args.output_dir, geometry=geometry)
         print(
             json.dumps(
                 {

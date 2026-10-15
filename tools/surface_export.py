@@ -2,16 +2,16 @@
 """Bounded level-set mesh -> gated native flatten/PCA -> XYZ raster -> CT stack.
 
 Usage (all paths local; output must not exist):
-  python surface_export.py --field phi.npy --metadata phi.npy.json --voxel-um 9.6 \
-    --level 1.25 --seed-xyz 4300 2700 10300 --pitch .25 --output new_surface \
+  python surface_export.py --field phi.npy --metadata phi.npy.json \
+    --level 1.25 --seed-xyz 10 20 30 --pitch .25 --output new_surface \
     --ct ct.npy --ct-metadata ct.json --depth-offsets -2 -1 0 1 2
 
 Metadata: frame, origin_xyz, spacing_xyz, voxel_um, optional shape_zyx.
 origin_xyz is the CENTER of array [0,0,0]; arrays are ZYX, coordinates XYZ.
-voxel_um is micrometres per WORLD UNIT (9.6 for Paris4 L2, not 19.2 for
-its solver grid). Pitch and depth offsets are in these same world units.
-CT metadata must name the SAME frame and voxel_um. For native-L0 CT expressed
-in L2 coordinates, explicitly supply origin=L0_origin/4, spacing=[.25]*3;
+voxel_um is micrometres per WORLD UNIT, not the physical solver-grid pitch.
+Pitch and depth offsets are in these same world units.
+CT metadata must name the SAME frame and voxel_um. Express the CT source's
+origin and XYZ sampling pitches in that declared world frame;
 the exporter never guesses a frame conversion from a name or array shape.
 
 extract_surface(field, metadata, level, seed_xyz=None, *, step_size=1)
@@ -745,17 +745,23 @@ def _sha(path):
         return hashlib.file_digest(f, "sha256").hexdigest()
 
 
-def _preview(path, values, valid):
+def _preview(path, values, valid, window=None):
     from PIL import Image, PngImagePlugin
 
-    lo, hi = np.percentile(values[valid], [1, 99])
+    lo, hi = np.percentile(values[valid], [1, 99]) if window is None else window
+    if not np.isfinite([lo, hi]).all() or (window is not None and hi <= lo):
+        raise ValueError("invalid declared CT display window")
     gray = np.zeros(values.shape, np.uint8)
     gray[valid] = np.rint(255 * np.clip((values[valid] - lo) / max(hi - lo, 1e-12), 0, 1)).astype(np.uint8)
     rgba = np.dstack([gray, gray, gray, valid.astype(np.uint8) * 255])
     text = PngImagePlugin.PngInfo()
     text.add_text("Description", "CT texture preview, not ink; transparent pixels are unobserved")
     Image.fromarray(rgba).save(path, pnginfo=text)
-    return dict(window=[float(lo), float(hi)], normalization="p01_p99_preview_only", invalid="transparent")
+    return dict(
+        window=[float(lo), float(hi)],
+        normalization="p01_p99_preview_only" if window is None else "declared_window",
+        invalid="transparent",
+    )
 
 
 def main(argv=None):
@@ -861,7 +867,7 @@ def main(argv=None):
             layer = int(np.argmin(np.abs(args.depth_offsets)))
             if coverage[layer].any():
                 receipt["preview"] = {
-                    **_preview(args.output / "ct_preview.png", stack[layer], coverage[layer]),
+                    **_preview(args.output / "ct_preview.png", stack[layer], coverage[layer], cm.get("display_window")),
                     "layer": layer,
                     "depth_offset_world": args.depth_offsets[layer],
                 }

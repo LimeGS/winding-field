@@ -82,7 +82,7 @@ def match_trace(constraints, target_trace):
 
 
 def compile_fibres(
-    fibres, origin, spacing, shape, voxel_mm=0.0096, pitch_mm=0.15, support=None, chart_volume=None, pair_weight=0.1
+    fibres, origin, spacing, shape, *, voxel_mm, pitch_mm=0.15, support=None, chart_volume=None, pair_weight=0.1
 ):
     a = []
     b = []

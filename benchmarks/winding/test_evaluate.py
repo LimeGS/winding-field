@@ -54,6 +54,7 @@ def case(tmp_path):
     np.save(field, np.broadcast_to(np.arange(80, dtype=float) / 30, (5, 6, 80)))
     meta = dict(
         frame=frame,
+        voxel_um=9.6,
         origin_xyz=[0, 0, 0],
         spacing_xyz=[1, 1, 1],
         shape_zyx=[5, 6, 80],
@@ -114,6 +115,8 @@ def case(tmp_path):
                 schema="winding-benchmark-case-v1",
                 scope="whole_coarse",
                 frame=frame,
+                voxel_um=9.6,
+                native_to_world=dict(scale_xyz=[0.25] * 3, offset_xyz=[0, 0, 0]),
                 step=2.0,
                 expected_selected=3,
                 expected_human=1,
@@ -137,6 +140,87 @@ def arguments(case, name="run"):
         "--output",
         str(case["root"] / name),
     ]
+
+
+def reseal_fixture(case, descriptor, plan, selection=None, human=None):
+    root = case["root"]
+    if selection is not None:
+        with gzip.open(root / "selected.json.gz", "wt") as stream:
+            json.dump(selection, stream)
+    if human is not None:
+        (root / "human.json").write_text(json.dumps(human))
+    (root / "plan.json").write_text(json.dumps(plan))
+    artifacts = descriptor["artifacts"]
+    for name in ("selection", "plan", "human", "afv"):
+        if name in artifacts:
+            artifacts[name]["sha256"] = sha256(root / artifacts[name]["path"])
+    (root / "seal.json").write_text(
+        json.dumps(dict(selected_sha256=artifacts["selection"]["sha256"], plan_sha256=artifacts["plan"]["sha256"]))
+    )
+    artifacts["seal"]["sha256"] = sha256(root / "seal.json")
+    case["case"].write_text(json.dumps(descriptor))
+
+
+def test_another_frame_scale_and_offset_preserve_physical_scores(case):
+    descriptor = json.loads(case["case"].read_text())
+    plan = json.loads((case["root"] / "plan.json").read_text())
+    with gzip.open(case["root"] / "selected.json.gz", "rt") as stream:
+        selection = json.load(stream)
+    transform = dict(scale_xyz=[0.5, 1, 2], offset_xyz=[10, -8, 4])
+    descriptor.update(
+        schema="winding-benchmark-case-v2",
+        frame="another-scroll/world",
+        voxel_um=12,
+        native_to_world=transform,
+        population="all_and_reserved",
+    )
+    meta = json.loads(case["metadata"].read_text())
+    meta.update(frame=descriptor["frame"], voxel_um=12, origin_xyz=[10, -8, 4], spacing_xyz=[0.8] * 3)
+    case["metadata"].write_text(json.dumps(meta))
+    for row in selection["whole_coarse"]:
+        for endpoint in ("a_native_xyz", "b_native_xyz"):
+            row[endpoint] = (np.array(row[endpoint]) * 0.2 / np.array(transform["scale_xyz"])).tolist()
+    plan.update(frame=descriptor["frame"], native_voxel_mm=[0.006, 0.012, 0.024])
+    plan["fields"]["whole_coarse"]["metadata"] = meta
+    human = json.loads((case["root"] / "human.json").read_text())
+    for row in human["methods"]["whole_coarse_secondary"]["rows"]:
+        for endpoint in ("a_xyz", "b_xyz"):
+            row[endpoint] = (np.array(row[endpoint]) * 0.8 + [10, -8, 4]).tolist()
+        row["frame"] = descriptor["frame"]
+    reseal_fixture(case, descriptor, plan, selection, human)
+    assert evaluator().main(arguments(case)) == 0
+    result = json.loads((case["root"] / "run/SUMMARY.json").read_text())
+    candidate = result["methods"]["candidate"]
+    assert candidate["all"][0]["covered"] == 2
+    assert candidate["all"][0]["median"] == pytest.approx(1)
+    assert candidate["human"]["correct"] == 1
+    assert result["independent_interpolation"]["max_abs_difference"] < 2e-5
+
+
+def test_absent_human_and_split_are_explicitly_not_evaluated(case):
+    import sqlite3
+
+    descriptor = json.loads(case["case"].read_text())
+    descriptor.update(schema="winding-benchmark-case-v2", population="all", expected_human=0)
+    for name in ("human", "split"):
+        del descriptor["artifacts"][name]
+    afv = case["root"] / "fibres.afv"
+    afv.unlink()
+    with sqlite3.connect(afv) as db:
+        db.execute("CREATE TABLE fibers(id INTEGER PRIMARY KEY)")
+        db.executemany("INSERT INTO fibers VALUES (?)", [(1,), (2,), (3,)])
+    audit = case["root"] / "audit.json"
+    audit.write_text(json.dumps(dict(afv_sha256=sha256(afv))))
+    descriptor["artifacts"]["audit"]["sha256"] = sha256(audit)
+    plan = json.loads((case["root"] / "plan.json").read_text())
+    plan["constraint_audit_sha256"] = sha256(audit)
+    reseal_fixture(case, descriptor, plan)
+    assert evaluator().main(arguments(case)) == 0
+    candidate = json.loads((case["root"] / "run/SUMMARY.json").read_text())["methods"]["candidate"]
+    assert candidate["all"][0]["covered"] == 2
+    assert candidate["reserved"] is None
+    assert candidate["human"]["status"] == "NOT_EVALUATED" and candidate["human"]["eligible"] == 0
+    assert "not evaluated" in (case["root"] / "run/TABLES.md").read_text().lower()
 
 
 def test_known_answer_and_controls_keep_all_and_reserved_denominators(case):

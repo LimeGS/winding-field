@@ -6,8 +6,10 @@ import gzip
 import hashlib
 import json
 import platform
+import sqlite3
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
 
 import numpy as np
@@ -22,12 +24,18 @@ import metrics as bench
 import evaluation_split
 import paris_pair_check
 import patch_check
+from dataset_config import frame as validate_frame
+from dataset_config import load_dataset, native_to_world, positive, xyz
 
 
 def load_inputs(args):
     case = json.loads(args.case.read_text())
-    if case.get("schema") != "winding-benchmark-case-v1" or case.get("frame") != bench.FRAME:
-        raise ValueError("unsupported benchmark case schema/frame")
+    if case.get("schema") not in ("winding-benchmark-case-v1", "winding-benchmark-case-v2"):
+        raise ValueError("unsupported benchmark case schema")
+    validate_frame(case.get("frame"))
+    population = case.get("population", "all_and_reserved" if case["schema"].endswith("v1") else None)
+    if population not in ("all", "all_and_reserved"):
+        raise ValueError("case must declare all or all_and_reserved population")
     if type(case.get("synthetic", False)) is not bool:
         raise ValueError("synthetic case flag must be boolean")
     step = float(case["step"])
@@ -35,7 +43,9 @@ def load_inputs(args):
         raise ValueError("case scale must be positive and finite")
     inputs = {}
     paths = {}
-    for name in ("selection", "plan", "seal", "audit", "afv", "split", "human"):
+    names = ["selection", "plan", "seal", "audit", "afv"]
+    names += [name for name in ("split", "human") if name in case["artifacts"]]
+    for name in names:
         entry = case["artifacts"][name]
         path = (args.case.parent / entry["path"]).resolve()
         actual = bench.sha256(path)
@@ -50,18 +60,54 @@ def load_inputs(args):
     audit = json.loads(paths["audit"].read_text())
     if plan["constraint_audit_sha256"] != inputs["audit"]["sha256"] or audit["afv_sha256"] != inputs["afv"]["sha256"]:
         raise ValueError("selection plan/audit is not bound to this AFV")
+    configured = None
+    config_path = getattr(args, "config", None)
+    if config_path is not None:
+        configured = load_dataset(config_path)
+        if configured["frame"] != case["frame"] or bench.sha256(configured["afv"]["path"]) != inputs["afv"]["sha256"]:
+            raise ValueError("dataset configuration differs from case frame/AFV")
+        inputs["dataset_config"] = dict(
+            path=str(config_path.resolve()), sha256=bench.sha256(config_path), bytes=config_path.stat().st_size
+        )
+    transform = case.get("native_to_world", configured["afv"] if configured else None)
+    unit = case.get("voxel_um", configured["voxel_um"] if configured else None)
+    if transform is None or unit is None:
+        raise ValueError("explicit native_to_world and voxel_um are required; supply a new case descriptor or --config")
+    unit = positive(unit, "case voxel_um")
+    native_to_world(np.empty((0, 3)), transform)
+    transform = {key: list(transform[key]) for key in ("scale_xyz", "offset_xyz")}
+    if configured is not None and (
+        unit != configured["voxel_um"]
+        or any(not np.allclose(transform[key], configured["afv"][key], rtol=1e-12, atol=0) for key in transform)
+    ):
+        raise ValueError("case/config coordinate transform differs")
+    native_mm = np.broadcast_to(np.asarray(plan["native_voxel_mm"], float), (3,))
     if (
         plan["frame"] != case["frame"]
         or plan["fixed_sheet_step"] != step
-        or plan["native_voxel_mm"] != 0.0024
+        or not np.isfinite(native_mm).all()
+        or not np.allclose(
+            native_mm, xyz(transform["scale_xyz"], "scale", positive=True) * unit / 1000, rtol=1e-12, atol=0
+        )
         or plan["bins"] != [list(b) for b in bench.BINS]
     ):
         raise ValueError("case differs from frozen frame, scale, units or bins")
-    split = json.loads(paths["split"].read_text())
-    evaluation_split.validate_fibre_split(split, inputs["afv"]["sha256"])
-    known_ids = {r["fibre_id"] for r in split["fibres"]}
-    reserved = {r["fibre_id"] for r in split["fibres"] if r["split"] == "reserved"}
-    del split
+    if "split" in paths:
+        split = json.loads(paths["split"].read_text())
+        evaluation_split.validate_fibre_split(split, inputs["afv"]["sha256"])
+        known_ids = {r["fibre_id"] for r in split["fibres"]}
+        reserved = (
+            {r["fibre_id"] for r in split["fibres"] if r["split"] == "reserved"}
+            if population == "all_and_reserved"
+            else None
+        )
+        del split
+    else:
+        if population != "all":
+            raise ValueError("reserved diagnostics require an identity-bound split")
+        with closing(sqlite3.connect(paths["afv"].as_uri() + "?mode=ro", uri=True)) as db:
+            known_ids = {r[0] for r in db.execute("SELECT id FROM fibers")}
+        reserved = None
     with gzip.open(paths["selection"], "rt") as stream:
         rows = json.load(stream)[case["scope"]]
     if len(rows) != case["expected_selected"] or not rows:
@@ -84,7 +130,7 @@ def load_inputs(args):
         lo, hi = bench.BINS[bin_index]
         if coordinates.shape != (2, 3) or not np.isfinite(coordinates).all() or not lo <= row["span_mm"] < hi:
             raise ValueError("invalid selected coordinates or arclength bin")
-    human = json.loads(paths["human"].read_text())["methods"][case["human_method"]]["rows"]
+    human = json.loads(paths["human"].read_text())["methods"][case["human_method"]]["rows"] if "human" in paths else []
     if len(human) != case["expected_human"]:
         raise ValueError("human development control population changed")
     meta = json.loads(args.metadata.read_text())
@@ -93,6 +139,8 @@ def load_inputs(args):
         raise ValueError("candidate field hash mismatch")
     if meta["frame"] != case["frame"] or not np.isclose(meta["step"], step, rtol=1e-12, atol=0):
         raise ValueError("candidate frame/scale differs from case; no refitting is permitted")
+    if "voxel_um" in meta and not np.isclose(meta["voxel_um"], unit, rtol=1e-12, atol=0):
+        raise ValueError("candidate world units differ from case")
     if "solver" in meta and meta["solver"].get("converged") is not True:
         raise ValueError("candidate declares a nonconverged solver")
     if meta.get("pilot_gate_status", "PASS") != "PASS":
@@ -150,6 +198,7 @@ def load_inputs(args):
         Path(paris_pair_check.__file__),
         Path(patch_check.__file__),
         Path(bench.common.__file__),
+        Path(native_to_world.__code__.co_filename),
     ]
     receipt = dict(
         status="PASS_PREFLIGHT",
@@ -157,7 +206,10 @@ def load_inputs(args):
         frame=case["frame"],
         step=step,
         selected=len(rows),
-        reserved_selected=sum(r["fiber_id"] in reserved for r in rows),
+        reserved_selected=sum(r["fiber_id"] in reserved for r in rows) if reserved is not None else None,
+        population=population,
+        voxel_um=unit,
+        native_to_world=transform,
         human_eligible=len(human),
         inputs=inputs,
         source_sha256={str(p): bench.sha256(p) for p in sources},
@@ -167,12 +219,20 @@ def load_inputs(args):
         synthetic=case.get("synthetic", False),
     )
     result = dict(
-        case=case, rows=rows, reserved=reserved, human=human, meta=meta, field=field, support=support, receipt=receipt
+        case=case,
+        rows=rows,
+        reserved=reserved,
+        human=human,
+        meta=meta,
+        field=field,
+        support=support,
+        receipt=receipt,
+        transform=transform,
     )
     if "visualization" in case:
         import ct_visuals
 
-        visual = ct_visuals.prepare(case["visualization"], args.case.parent, case["frame"], step)
+        visual = ct_visuals.prepare(case["visualization"], args.case.parent, case["frame"], step, voxel_um=unit)
         inputs.update(visual["inputs"])
         receipt["source_sha256"].update(
             {
@@ -193,11 +253,11 @@ def evaluate(inputs, output):
     max_roundoff = 0.0
     for start in range(0, len(rows), 10000):
         chunk = rows[start : start + 10000]
-        sampled = bench.evaluate(field, meta, chunk, support=support)
+        sampled = bench.evaluate(field, meta, chunk, support=support, transform=inputs["transform"])
         for endpoint, column in (("a", 0), ("b", 1)):
             actual = np.array([np.nan if r["phi_" + endpoint] is None else r["phi_" + endpoint] for r in sampled])
-            xyz = np.array([r[endpoint + "_native_xyz"] for r in chunk]) / 4
-            independent = verify.interpolate(field, meta, xyz, support)
+            coordinates = native_to_world([r[endpoint + "_native_xyz"] for r in chunk], inputs["transform"])
+            independent = verify.interpolate(field, meta, coordinates, support)
             if not np.array_equal(np.isfinite(actual), np.isfinite(independent)):
                 raise ValueError("independent interpolation coverage mismatch")
             known = np.isfinite(actual)
@@ -227,7 +287,9 @@ def evaluate(inputs, output):
         _, human = paris_pair_check.score_pairs(human_field, meta, inputs["human"])
         methods[name] = dict(
             all=bench.summarize(compact),
-            reserved=bench.summarize([r for r in compact if r["fiber_id"] in inputs["reserved"]]),
+            reserved=bench.summarize([r for r in compact if r["fiber_id"] in inputs["reserved"]])
+            if inputs["reserved"] is not None
+            else None,
             human=human,
         )
         del compact, human_field
@@ -261,6 +323,9 @@ def write_tables(output, result):
         lines += ["Synthetic demonstration only — no real scroll data or human annotations.", ""]
     for name, method in result["methods"].items():
         for population in ("all", "reserved"):
+            if method[population] is None:
+                lines += [f"## {name} / {population}", "", "Not evaluated: no reserved-population claim.", ""]
+                continue
             lines += [
                 f"## {name} / {population}",
                 "",
@@ -273,7 +338,11 @@ def write_tables(output, result):
             lines.append("")
         h = method["human"]
         label = "Synthetic separation control" if result.get("synthetic", False) else "Human control"
-        lines.append(f"{label}: {h['correct']}/{h['eligible']} correct; {h['covered']} covered.\n")
+        lines.append(
+            f"{label}: {h['correct']}/{h['eligible']} correct; {h['covered']} covered.\n"
+            if h["scored"]
+            else f"{label}: not evaluated; {h['covered']}/{h['eligible']} covered.\n"
+        )
     (output / "TABLES.md").write_text("\n".join(lines) + "\n")
 
 
@@ -282,6 +351,9 @@ def main(argv=None):
     for name in ("case", "field", "metadata", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--support", type=Path)
+    parser.add_argument(
+        "--config", type=Path, help="explicit geometry for a historical case lacking coordinate metadata"
+    )
     parser.add_argument("--support-sha256", help="expected support-file hash, e.g. from a frozen producer receipt")
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args(argv)

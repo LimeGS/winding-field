@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export the actual L2 pointmap, then run the unchanged repository geometry gate.
+"""Export a declared-world pointmap, then run the unchanged geometry gate.
 
 No new intersection algorithm. --output must be new; use run_watch.py timeout180.
 The underlying gate's exit 0 can mean UNMEASURED, so inspect its receipt.
@@ -20,7 +20,9 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
-FRAME = "PHercParis4/20260411134726:L2"
+from dataset_config import frame as validate_frame
+from dataset_config import positive
+
 TOOLS = ("helena_tifxyz_geometry_gate.py", "helena_audit_mesh_integrity.py")
 
 
@@ -36,8 +38,8 @@ def save_json(path, value):
 
 
 def export_tifxyz(grid_path, metadata, output):
-    if metadata.get("frame") != FRAME or metadata.get("voxel_um") != 9.6:
-        raise ValueError("require the declared Paris4 L2 frame, 9.6 um/world unit; no L0 conversion")
+    frame = validate_frame(metadata.get("frame"))
+    unit = positive(metadata.get("voxel_um"), "voxel_um")
     with np.load(grid_path, allow_pickle=False) as grid:
         points, valid, pitch_um = grid["points_xyz"], grid["valid"], np.asarray(grid["pitch_um"], float)
     if (
@@ -66,19 +68,19 @@ def export_tifxyz(grid_path, metadata, output):
         format="tifxyz",
         type="seg",
         uuid=output.name,
-        frame=FRAME,
-        coordinate_units="L2_voxels",
-        voxel_um=9.6,
-        scale=(9.6 / pitch_um[::-1]).tolist(),
-        scale_convention="[column,row] cells per L2 voxel",
+        frame=frame,
+        coordinate_units="declared_world_units",
+        voxel_um=unit,
+        scale=(unit / pitch_um[::-1]).tolist(),
+        scale_convention="[column,row] cells per declared world unit",
         shape_hw=list(valid.shape),
         invalid_xyz_sentinel=-1.0,
         source_grid_sha256=sha(grid_path),
     )
     save_json(output / "meta.json", meta)
     receipt = dict(
-        frame=FRAME,
-        voxel_um=9.6,
+        frame=frame,
+        voxel_um=unit,
         pointmap=str(Path(grid_path).resolve()),
         source_grid_sha256=meta["source_grid_sha256"],
         valid_points=int(valid.sum()),
@@ -86,7 +88,7 @@ def export_tifxyz(grid_path, metadata, output):
         pixel_um_row_column=pitch_um.tolist(),
         scale=meta["scale"],
         maximum_float32_error_world=error,
-        maximum_float32_error_um=error * 9.6,
+        maximum_float32_error_um=error * unit,
         xyz_transform="identity; no origin/scale applied to XYZ",
         invalid_xyz_sentinel=-1.0,
         files={n: sha(output / n) for n in ("x.tif", "y.tif", "z.tif", "meta.json")},
@@ -148,8 +150,16 @@ def main(argv=None):
             str(x): sha(x) for x in (args.grid, args.source_receipt, args.metadata, args.registration_report)
         }
         metadata = json.loads(args.metadata.read_text())
+        if (
+            source.get("frame", metadata["frame"]) != metadata["frame"]
+            or source.get("voxel_um", metadata["voxel_um"]) != metadata["voxel_um"]
+        ):
+            raise ValueError("pointmap receipt and metadata coordinate frames/units differ")
         result["conversion"] = export_tifxyz(args.grid, metadata, args.output / "tifxyz")
         registration = json.loads(args.registration_report.read_text())
+        expected_metadata = registration.get("inputs", {}).get("metadata_sha256")
+        if expected_metadata is not None and expected_metadata != sha(args.metadata):
+            raise ValueError("registration metadata identity differs")
         result["physical_registration"] = {
             k: registration[k] for k in ("human_seed", "seed", "seams", "validation") if k in registration
         }
@@ -160,7 +170,7 @@ def main(argv=None):
             "--surface-dir",
             str(args.output / "tifxyz"),
             "--voxel-um",
-            "9.6",
+            str(metadata["voxel_um"]),
             "--require-meta-json",
             "--write-masks",
             "--maximum-candidate-pairs",

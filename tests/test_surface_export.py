@@ -615,7 +615,10 @@ def test_probe_heldout_distance_is_labeled_upper_bound_and_normals_are_measured(
     vertices = xyz[[0, 0, -1, -1], [0, -1, -1, 0]]
     faces = np.array([[0, 1, 2], [0, 2, 3]])
     owner = np.zeros((64, 64, 64), dtype=np.int8)
-    r = evaluate_patch(tmp_path, vertices, faces, metadata(owner.shape, (0, 0, 0), (1, 1, 1)), owner)
+    meta = metadata(owner.shape, (0, 0, 0), (1, 1, 1))
+    r = evaluate_patch(
+        tmp_path, vertices, faces, meta, owner, patch_frame=meta["frame"], patch_voxel_um=meta["voxel_um"]
+    )
     assert r["covered_human_points"] == 25
     assert r["human_to_mesh_vertex_upper_bound_um"]["p50"] > 0  # all lie on the actual triangles
     assert "UPPER BOUNDS" in r["distance_kind"]

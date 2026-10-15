@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""Shared helpers for winding-field experiments (speculative, unpublished).
+"""Shared numerical and read-only fibre helpers.
 
 Conventions (follow these in every script here):
-- Fibre coordinates are ALWAYS raw XYZ voxels at level 0 of the scroll that
-  owns the .afv file (see DB_META below). Callers convert to their own grid.
+- Fibre coordinates are raw stored XYZ values; callers declare their physical
+  units and conversion to the selected field's world frame.
 - A "field" maps position -> winding index (float sheets from the outside).
   Level sets at integers are sheets.
 - Benchmark numbers come in (span_mm, abs difference in sheets) pairs and
   are reported with report() using Jaime's bins, so tables stay comparable.
 
-Data layout: scripts find files through data_dir(), which honours $WREV_DATA
-and otherwise tries the known locations (this laptop, then the GPU box).
+Data paths are explicit; no scroll registry or host-location search is used.
 """
 
 import itertools
 import json
-import os
 import sqlite3
 import struct
 from contextlib import closing
@@ -38,9 +36,6 @@ BINS = [
     (30, 45),
 ]
 
-# Voxel size (mm) of the level-0 frame each fibre collection lives in.
-VOX_MM = {"PHerc1447": 0.00864, "PHercParis4": 0.0024}
-
 
 def decode_lasagna_normals(nx, ny):
     """Hemisphere encoding per villa/lasagna/docs/normal_smoothing.md."""
@@ -51,35 +46,15 @@ def decode_lasagna_normals(nx, ny):
     return n / np.maximum(np.linalg.norm(n, axis=-1, keepdims=True), 1e-9)
 
 
-_MAC_TMP = "/var/folders/s_/nnzqmcgs1sdffgsfx68wj7wr0000gn/T/opencode"
+def load_fibers(db, bbox, min_pts=2, clip=True):
+    """Fibre centrelines inside a native XYZ bbox: [(fiber_id, float64 points)].
 
-
-def data_dir():
-    """Directory holding .afv / .npy artefacts (env override wins)."""
-    for p in (os.environ.get("WREV_DATA"), _MAC_TMP, "/root/wrev"):
-        if p and os.path.isdir(p):
-            return p
-    raise FileNotFoundError("no data dir (set $WREV_DATA)")
-
-
-def db_path(scroll="PHerc1447"):
-    """Fibre collection for a scroll (Qual's .afv, sqlite + rtree)."""
-    name = {"PHerc1447": "1447_5mm_v1.afv", "PHercParis4": "Paris4_v1.afv"}[scroll]
-    return os.path.join(data_dir(), name)
-
-
-def load_fibers(db_or_bbox=None, bbox=None, min_pts=2, clip=True, scroll="PHerc1447"):
-    """Fibre centrelines for an XYZ L0 bbox: [(fiber_id, P)] with P float64 XYZ.
-
-    Call as load_fibers(bbox) for the default 1447 collection. Points are
-    stored in 256-point blocks; block order is preserved (matters for
+    Block order is preserved (matters for
     zero-cost backbones: never sort, only dedupe consecutive voxels).
     With clip=False the full centrelines are returned (callers mask manually).
     """
-    if isinstance(db_or_bbox, dict):
-        # Called as load_fibers(bbox): default collection, clip to bbox.
-        db_or_bbox, bbox = None, db_or_bbox
-    db = db_or_bbox if db_or_bbox is not None else db_path(scroll)
+    if not isinstance(db, (str, Path)) or not str(db):
+        raise ValueError("explicit AFV path required")
     q = """SELECT DISTINCT b.fiber_id FROM block_bounds r JOIN blocks b ON b.id=r.id
            WHERE r.max_x>=:x0 AND r.min_x<=:x1 AND r.max_y>=:y0 AND r.min_y<=:y1
              AND r.max_z>=:z0 AND r.min_z<=:z1"""

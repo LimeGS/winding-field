@@ -8,7 +8,9 @@ import pytest
 
 @pytest.fixture
 def scoring_case(tmp_path):
-    from paris_data import FRAME, save_field
+    from conftest import FRAME
+
+    from paris_data import save_field
     from patch_check import sha256
 
     labels = tmp_path / "labels.json"
@@ -69,7 +71,7 @@ def test_secondary_seal_preserves_primary_and_refuses_after_scoring(tmp_path):
         seal_extra_global(root, field)
 
 
-def test_portable_baseline_parser_and_actual_cpu_child(tmp_path, monkeypatch):
+def test_portable_baseline_parser_and_actual_cpu_child(tmp_path, monkeypatch, paris_inputs):
     import json
     import os
     import subprocess
@@ -80,7 +82,7 @@ def test_portable_baseline_parser_and_actual_cpu_child(tmp_path, monkeypatch):
     from sealed_predict import baseline_environment, build_parser
 
     args = build_parser().parse_args(
-        ["predict", "--output", str(tmp_path / "out"), "--device", "cpu", "--data-root", str(tmp_path)]
+        ["predict", "--output", str(tmp_path / "out"), "--device", "cpu", "--config", str(paris_inputs.config)]
     )
     assert args.legacy_solver.is_file()
     assert args.legacy_solver.parent == Path(sealed_predict.__file__).resolve().parent
@@ -92,7 +94,7 @@ def test_portable_baseline_parser_and_actual_cpu_child(tmp_path, monkeypatch):
     assert got["device"] == "cpu"
 
 
-def test_baseline_prediction_runs_without_any_winding_label_file(tmp_path, monkeypatch):
+def test_baseline_prediction_runs_without_any_winding_label_file(tmp_path, monkeypatch, paris_inputs):
     import json
     import sqlite3
     import sys
@@ -102,9 +104,9 @@ def test_baseline_prediction_runs_without_any_winding_label_file(tmp_path, monke
 
     import paris_solve
 
-    monkeypatch.setattr(paris_solve, "DEV", "cpu")
     for name, value in {
-        "WREV_DATA": str(tmp_path),
+        "WREV_CONFIG": str(paris_inputs.config),
+        "WREV_DEVICE": "cpu",
         "SLAB": "0,16,0,16,0,16",
         "OUT": str(tmp_path / "field.npy"),
         "PREDICT_ONLY": "1",
@@ -128,7 +130,7 @@ def test_baseline_prediction_runs_without_any_winding_label_file(tmp_path, monke
         return np.full((16, 16, 16), value, np.uint8)
 
     monkeypatch.setitem(sys.modules, "zarr", SimpleNamespace(open=volume))
-    paris_solve.main()
+    paris_solve.main([])
     assert not (tmp_path / "relwind.json").exists()
     assert np.isfinite(np.load(tmp_path / "field.npy")).all()
 
@@ -195,7 +197,20 @@ def test_tampering_aborts_scoring_without_a_result(scoring_case, tampered):
     assert not (args.output / "test_results.json").exists()
 
 
-def test_prediction_seals_real_solver_artifacts_without_opening_labels(paris_inputs):
+@pytest.mark.parametrize(
+    "damage",
+    [
+        None,
+        "geometry_frame",
+        "baseline_frame",
+        "baseline_units",
+        "baseline_grid",
+        "baseline_hash",
+        "nonconverged",
+        "different_spacing",
+    ],
+)
+def test_prediction_seals_real_solver_artifacts_without_opening_labels(paris_inputs, damage):
     from patch_check import sha256
     from sealed_predict import build_parser, predict
 
@@ -204,12 +219,17 @@ def test_prediction_seals_real_solver_artifacts_without_opening_labels(paris_inp
     manifest.write_text(
         json.dumps(
             {
+                "frame": "different-frame" if damage == "geometry_frame" else paris_inputs.dataset["frame"],
                 "initial_test": {
                     "groups": [
                         {
                             "group_id": "synthetic",
                             "collection_ids": ["c"],
-                            "grid": {"origin_xyz": [0, 0, 0], "hi_xyz": [80, 64, 48], "spacing_xyz": [16, 16, 16]},
+                            "grid": {
+                                "origin_xyz": [0, 0, 0],
+                                "hi_xyz": [80, 64, 48],
+                                "spacing_xyz": [8, 8, 8] if damage == "different_spacing" else [16, 16, 16],
+                            },
                         }
                     ]
                 },
@@ -220,9 +240,22 @@ def test_prediction_seals_real_solver_artifacts_without_opening_labels(paris_inp
     # A real child process supplies the historical baseline; there is no label file.
     child = root / "baseline.py"
     child.write_text(
-        "import os\nfrom pathlib import Path\nimport numpy as np\n"
-        "path = os.environ['OUT']\nnp.save(path, np.zeros((3, 4, 5), np.float32))\n"
-        "Path(path + '.json').write_text('{}')\n"
+        "import os,json,hashlib,sys\nfrom pathlib import Path\nimport numpy as np\n"
+        f"damage={damage!r}\n"
+        "config=json.loads(Path(os.environ['WREV_CONFIG']).read_text())\n"
+        "h=np.array([float(v) for v in sys.argv[sys.argv.index('--spacing')+1:sys.argv.index('--spacing')+4]]) if '--spacing' in sys.argv else np.array([16.,16.,16.])\n"
+        "bounds=np.array([float(v) for v in os.environ['SLAB'].split(',')]).reshape(3,2)\n"
+        "shape=np.ceil((bounds[:,1]-bounds[:,0])/h).astype(int)[::-1]\n"
+        "path = os.environ['OUT']\nnp.save(path, np.zeros(tuple(shape), np.float32))\n"
+        "meta=dict(frame=config['frame'],voxel_um=config['voxel_um'],origin_xyz=bounds[:,0].tolist(),"
+        "spacing_xyz=h.tolist(),shape_zyx=shape.tolist(),step=config['sheet_step'],solver={'converged':True},"
+        "field_sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest())\n"
+        "if damage=='baseline_frame': meta['frame']='different-frame'\n"
+        "if damage=='baseline_units': meta['voxel_um']=12\n"
+        "if damage=='baseline_grid': meta['spacing_xyz']=[32,32,32]\n"
+        "if damage=='baseline_hash': meta['field_sha256']='0'*64\n"
+        "if damage=='nonconverged': meta['solver']['converged']=False\n"
+        "Path(path + '.json').write_text(json.dumps(meta))\n"
     )
     args = build_parser().parse_args(
         [
@@ -233,21 +266,28 @@ def test_prediction_seals_real_solver_artifacts_without_opening_labels(paris_inp
             str(manifest),
             "--development",
             str(paris_inputs.development),
-            "--data-root",
-            str(root),
+            "--config",
+            str(paris_inputs.config),
             "--legacy-solver",
             str(child),
             "--device",
             "cpu",
         ]
     )
+    if damage not in (None, "different_spacing"):
+        with pytest.raises(ValueError):
+            predict(args)
+        assert not (args.output / "PREDICTIONS_SEALED.json").exists()
+        assert not (args.output / "group0_candidate.npy").exists()
+        return
     predict(args)
     seal = json.loads((args.output / "PREDICTIONS_SEALED.json").read_text())
     artifact = seal["artifacts"][0]
     assert artifact["candidate_sha256"] == sha256(artifact["candidate"])
     assert artifact["baseline_metadata_sha256"] == sha256(artifact["baseline"] + ".json")
     candidate = np.load(artifact["candidate"])
-    assert candidate.shape == (3, 4, 5) and np.isfinite(candidate).all() and np.ptp(candidate) > 0
+    expected_shape = (6, 8, 10) if damage == "different_spacing" else (3, 4, 5)
+    assert candidate.shape == expected_shape and np.isfinite(candidate).all() and np.ptp(candidate) > 0
     assert seal["config"]["global_step"] == 2
     assert seal["config"]["private_scoring_subset_opened"] is False
     assert seal["config"]["label_access_isolated"] is False

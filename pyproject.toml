@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "winding-field-experiments"
-version = "1.0.1"
+version = "1.1.0"
 description = "Experimental winding-field construction over Herculaneum scroll surface predictions (research code, not a complete reconstruction)"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"

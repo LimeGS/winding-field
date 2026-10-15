@@ -65,7 +65,8 @@ def main():
             background_weight=0.1,
         ),
         orientation=dict(mode="provided"),
-        solver=dict(device="cpu", rtol=1e-6, maxiter=1000),
+        # Leave float32 roundoff headroom across CPU backends; check the full analytic field below.
+        solver=dict(device="cpu", rtol=1e-5, maxiter=1000),
     )
     path = root / "dataset.json"
     path.write_text(json.dumps(config, indent=2) + "\n")

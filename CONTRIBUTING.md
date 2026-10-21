@@ -29,7 +29,7 @@ Tests must stay CPU-only, synthetic and independent of live services. Install
   public checkout.
 - **No real data**: no CT, labels, coordinates, AFV files, weights, or
   screenshots of scroll data in commits beyond the documented README
-  illustration. See [`DATA.md`](DATA.md).
+  illustrations. See [`DATA.md`](DATA.md).
 
 ## Style
 

@@ -94,7 +94,11 @@ def test_pilot_cli_checks_continuous_constraint_identity(paris_inputs, tamper):
     metadata = dict(frame=FRAME, voxel_um=9.6, origin_xyz=[0, 0, 0], spacing_xyz=[1, 1, 1], shape_zyx=list(shape))
     reference = paris_inputs.root / "reference.npy"
     save_field(
-        reference, np.broadcast_to(0.1 * np.arange(40, dtype=float), shape), metadata, {"converged": True}, step=2
+        reference,
+        np.broadcast_to((0.1 * np.arange(40, dtype=float)).astype(np.float32), shape),
+        metadata,
+        {"converged": True},
+        step=2,
     )
     constraints = pair_constraints([[8, 20, 1]], [[32, 20, 1]], [0, 0, 0], [1, 1, 1], shape)
     path = paris_inputs.root / "constraints.npz"

@@ -188,14 +188,30 @@ def load_paris_box(
 
 
 def save_field(path, field, metadata, info, step=1):
+    """Publish without invalidating a solver's declared float32/float64 precision.
+
+    Legacy receipts without dtype retain float32 output only for lossless casts;
+    a lossy export requires a newly verified receipt, never an inherited PASS.
+    """
     path = Path(path)
     if path.exists() or Path(str(path) + ".json").exists():
         raise FileExistsError(path)
     if not info["converged"] or not np.isfinite(field).all() or not np.isfinite(step) or step <= 0:
         raise ValueError("cannot publish unconverged/nonfinite/uncalibrated field")
+    field = np.asarray(field)
+    dtype = info.get("dtype", "float32")
+    if dtype not in ("float32", "float64") or field.dtype.kind not in "biuf":
+        raise ValueError("cannot publish unsupported field precision")
+    if "dtype" in info and field.dtype != np.dtype(dtype):
+        raise ValueError("field dtype differs from solver receipt precision")
+    with np.errstate(over="ignore", invalid="ignore"):
+        stored = field.astype(dtype, copy=False)
+        lossless = np.isfinite(stored).all() and np.array_equal(stored.astype(field.dtype), field)
+    if not lossless:
+        raise ValueError("lossy precision export cannot inherit solver convergence")
     metadata = {**metadata, "step": float(step), "solver": info}
     json.dumps(metadata, allow_nan=False)  # reject bad receipts before publishing array bytes
-    np.save(path, field.astype(np.float32))
+    np.save(path, stored)
     metadata["field_sha256"] = sha256(path)
     Path(str(path) + ".json").write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n")
     return metadata

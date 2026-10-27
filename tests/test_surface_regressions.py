@@ -14,7 +14,7 @@ from test_surface_mesh import source
 import field_store
 from field_runtime import ResourceUnavailable
 from field_store import BlockStore
-from surface_mesh import extract_mesh, import_mesh
+from surface_mesh import MeshReader, extract_mesh, import_mesh
 from surface_sources import FieldSource
 
 
@@ -106,6 +106,38 @@ def test_decoder_implementation_is_part_of_resume_identity(tmp_path, monkeypatch
     with FieldSource(descriptor, geometry) as field:
         with pytest.raises(ValueError):
             extract_mesh(field, root, [2.5], tile=1, resume=True)
+
+
+@pytest.mark.parametrize("member", ["metadata", "levels"])
+def test_manifest_cannot_relabel_committed_mesh(tmp_path, member):
+    root = tmp_path / "mesh"
+    values = np.broadcast_to(np.arange(7.0), (5, 6, 7)).copy()
+    with source(tmp_path, values) as field:
+        extract_mesh(field, root, [1.5, 3.5], tile=2)
+    manifest = json.loads((root / "MESH.json").read_bytes())
+    if member == "metadata":
+        manifest["metadata"]["frame"] = "unrelated-world"
+    else:
+        manifest["levels"][0]["level"] = 999
+    (root / "MESH.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError):
+        with MeshReader(root):
+            pass
+
+
+def test_completed_resume_preserves_changed_manifest(tmp_path):
+    root = tmp_path / "mesh"
+    values = np.broadcast_to(np.arange(7.0), (5, 6, 7)).copy()
+    with source(tmp_path, values) as field:
+        extract_mesh(field, root, [1.5, 3.5], tile=2)
+        file = root / "MESH.json"
+        manifest = json.loads(file.read_bytes())
+        manifest["metadata"]["frame"] = "foreign-frame"
+        file.write_text(json.dumps(manifest))
+        before = file.read_bytes()
+        with pytest.raises(ValueError):
+            extract_mesh(field, root, [1.5, 3.5], tile=2, resume=True)
+        assert file.read_bytes() == before
 
 
 def test_npz_declared_shape_is_bounded_before_numpy_allocation(tmp_path, monkeypatch):

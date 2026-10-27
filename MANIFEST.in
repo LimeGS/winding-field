@@ -1,8 +1,1 @@
-include examples/block_field.py
 include tests/prefetch_fixtures.py
-include tools/benchmark_blocks.py
-include tools/run_field.py
-include examples/field-run.example.json
-include examples/surface-run.example.json
-include examples/surface_pipeline.py
-include tools/run_surfaces.py

@@ -137,8 +137,9 @@ Optional extras: `surface` for mesh/atlas tools, `data` for Zarr, `plot` for
 Matplotlib, or `all` for the runtime/test features. Modules install flat
 (`field_solver`, `physical_grid`, etc.); use a virtual environment to avoid name
 collisions. The wheel contains `src/`; command-line tools live in the checkout.
-The installed `winding-field` command runs prepared block construction/resume;
-the equivalent checkout entry point is `python tools/run_field.py`.
+This library installs no `winding-field` executable. Prepared workflows and
+rendering are provided by [winding-field-cli](https://github.com/LimeGS/winding-field-cli),
+which imports this library directly.
 
 ## Minimal example
 
@@ -173,108 +174,16 @@ backend. Existing dense APIs and dataset CLI defaults remain unchanged. These
 interfaces require explicit geometry, observations and resource budgets; they do
 not infer a scroll's calibration, orientation, source data or GPU assignment.
 
-### Build and resume prepared fields
+### Prepared workflows moved to winding-field-cli
 
-The installed entry point delegates to the same block solver and checkpoint
-store used by Python callers:
-
-```bash
-winding-field build --config /path/to/field-run.json --output /path/to/new-field
-winding-field resume --config /path/to/field-run.json --output /path/to/new-field --prefetch
-
-# Optional owned worker, immutable code/config binding and resource-only retries:
-winding-field build --config /path/to/field-run.json --output /path/to/other-field --supervised
-```
-
-Start from [`examples/field-run.example.json`](examples/field-run.example.json).
-Its paths, hashes and calibration are placeholders; replace them with your
-prepared inputs and justified physical metadata. Paths resolve relative to the
-JSON file. No raw CT/AFV preparation, orientation inference or calibration is
-hidden in this entry point. A recipe supplies these inputs; the principal
-library owns construction and recovery.
-
-The `winding-field-run-v1` configuration requires:
-
-- `frame`, positive `voxel_um`, `sheet_step`, and explicit `calibration`
-  provenance. Raw values remain in the declared field units; `sheet_step`
-  records their conversion to nominal sheet units, not an implicit rescaling.
-- `grid.origin_xyz`, `spacing_xyz` in that physical frame, and integer
-  `shape_zyx`. Each axis has at least two nodes. Gradients/components are XYZ;
-  array axes and chunk traversal are ZYX.
-- `observations.target`, `weights`, `observed`, each with local `path` and full
-  lowercase `sha256`. Target is floating ZYX3; weights floating ZYX; both may be
-  float32/float64 and are read as float32 crops. Observed is boolean ZYX. Targets
-  must remain finite and weights strictly positive even where observed is false;
-  missing support is not automatically a measured zero or a boundary anchor.
-- `execution.chunk`, `halo`, `sweeps`. Multiple cores require positive halo.
-  Optional `cache_bytes=0`, `read_workers=1`, `constraint_cache_bytes=0`,
-  `reserve_bytes=0`, `max_bytes=null` control the existing storage/reader budgets.
-  `solver` defaults to CPU, float64, `rtol=1e-5`, `maxiter=4000`; float32 is also
-  supported. These are numerical controls, not a convergence certificate.
-
-Optional `fixed` is a pinned float32/float64 ZYX NPY: finite values (including
-zero) are exact fixed nodes, NaN means free. Precision is retained. Without any
-finite fixed value the global first node is the numerical zero gauge. Optional
-`constraints` is a pinned archive written by `StencilConstraints.save(path)`;
-`StencilConstraints.load(path)` preserves its rows, targets, weights and groups.
-The archive is resident: template-cache limits do not bound its input arrays.
-For very large fibre inputs use the Python block-provider interface below.
-Optional `order` is a pinned integer Nx3 NPY containing every chunk key exactly
-once; omitted order is lexicographic ZYX. `source_identity` may record additional
-JSON provenance, for example the preparation recipe and its inputs.
-
-CUDA requires `solver.device="cuda:0"`, a `gpu` object with explicit `index`,
-`uuid`, `lock_path` (relative to the config or absolute), and a matching
-`CUDA_VISIBLE_DEVICES` UUID set before launch. Optional `min_free_bytes` and Unix
-`deadline` use the existing lease checks. Prefetch here is CPU-only and opt-in.
-Admission does not infer a safe RAM/VRAM budget for arbitrary inputs; Python
-callers can supply `admit=` for their own working-set policy.
-
-`field/CHECKPOINT.json` (or `OUTPUT/CHECKPOINT.json` for the command above) is the
-recovery authority. `RUN.json` records physical/source identity when the first
-core is admitted; `STATUS.json` records progress and terminal status. Resume
-rejects changed sources, geometry, calibration, numerical settings or library
-code. Reader/cache budgets may change for a direct resume. Exit0 means budget
-completion or a checkpointed STOP, exit75 means explicit resource unavailability,
-exit2 invalid configuration/input, and exit1 numerical/operational failure.
-
-With `--supervised`, sibling `OUTPUT.service/` holds source-bound service state
-and worker logs; automatic retries require exit75 plus the same child's resource
-receipt. Keep that service's code/config immutable. Touch `OUTPUT/STOP` or
-`OUTPUT.service/STOP` for a bounded checkpoint request. Remove your STOP markers
-before explicitly running `resume --supervised`; a dead stopped checkpoint may
-be handed off, but a scientific failure is never automatically retried. A long
-solver call is not an immediate cancellation point. The supervisor itself returns
-0 for normal budget/STOP, 1 for failure and 130 for an interrupt.
-
-Python callers use `field_workflow.run_field(config, output, resume=False,
-prefetch=False, stop=None, admit=None)` with the same contract. For custom
-streaming preparation or conditional constraints, call `solve_blocks` with
-explicit loaders/providers and source identity. Neither path copies the solver
-into an experiment.
-
-### Run the complete synthetic example
-
-After installing this checkout, choose a new directory:
-
-```bash
-python -I examples/block_field.py --output /tmp/winding-blocks --stop-after-blocks 1
-python -I examples/block_field.py --output /tmp/winding-blocks --resume --prefetch
-
-# A separate example using an owned worker and resource-only retries:
-python -I examples/block_field.py --output /tmp/winding-supervised --supervised --prefetch
-```
-
-The example checks a certified synthetic presence source and CPU density/normal
-preparation, then solves a separate analytic field from hash-bound NPY inputs on
-a nonzero-origin, anisotropic grid with cross-block constraints. It demonstrates
-checkpoint stop/resume and optional **CPU** observation prefetch. `RESULT.json`
-reports the synthetic error; `field/CHECKPOINT.json` is the recovery authority.
-It writes `field-run.json` and `constraints.npz`, then calls
-`field_workflow.run_field`; you can also pass that JSON to the installed command
-with a different new output directory.
-The expected terminal status is `SWEEP_BUDGET_REACHED`, with
-`global_converged=false`: finishing a sweep budget is not assembled convergence.
+Install the CLI alongside this library for `winding-field prepared build|resume`,
+supervised workers and runnable block/surface examples. The
+[prepared workflow guide](https://github.com/LimeGS/winding-field-cli/blob/feat/core-cli-separation/docs/PREPARED.md)
+contains recipes, resource controls, exit statuses and migration instructions.
+Python imports are now `winding_field.field_workflow`,
+`winding_field.surface_workflow` and `winding_field.surface_render`.
+Existing implementation-bound runs require their original packages or a new
+output; moving a workflow does not authorize rewriting its saved identity.
 
 ### Interfaces
 
@@ -290,7 +199,6 @@ The expected terminal status is `SWEEP_BUDGET_REACHED`, with
 | `NpyObservations` | Picklable, hash-bound target/weights/observed memmaps; copies only requested crops and emits bounds-specific source receipts. Inputs must remain immutable. |
 | `NpyFixedValues` | Pinned fixed-value NPY memmap, owned half-open ZYX crops, retained float32/float64 precision; finite values are fixed and NaN means free. |
 | [`solve_blocks`](src/block_solver.py) | Explicit order/core/halo, fresh shared-field internal faces and exterior constraints, one writer, local numerical gates, cumulative sweep statistics and durable stop/resume. Accepts observation/fixed-value loaders and admission/stop callbacks. |
-| [`run_field`, `load_run_config`](src/field_workflow.py) | Prepared construction/resume from explicit physical metadata and SHA-bound inputs; installed CLI and examples call the same workflow. |
 | [`ObservationPrefetch`](src/field_prefetch.py) | At most one immutable observation request, bounded serialized frames, full-frame timeouts, initial primary/secondary parity in the runner and owned-child cleanup. Off by default; CPU unless an explicit GPU lease is supplied. |
 | [`GpuLease`, `check_resources`, `run_supervised`](src/field_runtime.py) | Explicit UUID/lock/deadline and effective-memory admission. Supervision binds source hashes and argv, preserves STOP, retries only same-child resource failures, and stops on numerical/integrity failures. |
 
@@ -340,166 +248,24 @@ source/data/parity failures remain errors.
 For GPU prefetch, device admission and the lifetime lease are established before
 unpickling or initializing the observation loader.
 
-### Measure complete cycles
+## Agnostic tiled mesh library (unreleased)
 
-```bash
-OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python tools/benchmark_blocks.py \
-  --output /tmp/winding-performance-probe --repetitions 2
-```
+`surface_sources.FieldSource` provides bounded, validated float64/bool crops from
+explicitly pinned NPY or chunked fields. `surface_mesh.extract_mesh` and
+`import_mesh` publish immutable indexed bundles and OBJ exports; `MeshReader`
+streams world-space triangles. All components, declared physical geometry and
+strict support are retained. SQLite transactions bind source progress and
+geometry; completed resume validates rather than replacing committed products.
 
-The probe alternates serial/uncached and bounded/parallel variants from the same
-zero initial iterate, including input binding, reads, solves, durable commits and
-readback. It checks identical stored fields and separately exercises resident
-operator reuse with changing targets. Timings and cache statistics go into
-`REPORT.json`; setup time is separate and included in the whole-probe total.
-This is a small CPU smoke measurement, **not a real-data or GPU speedup claim**.
+The float32 Marching-Cubes kernel and adaptive precision retries are explicit in
+the identity. Rounded crossings use smaller internal tiles and axis reflections;
+edge coordinates are reconstructed from original float64 values without proximity
+welding. Unrepresentable sign underflow fails explicitly. These are geometric
+diagnostics, not physical-sheet validation.
 
-## Agnostic tiled meshes and 3D renders (unreleased)
-
-The same installed command now processes a prepared field or an existing mesh:
-
-```bash
-winding-field surfaces --config /path/to/surfaces.json --output /path/to/new-bundle
-winding-field surfaces --config /path/to/surfaces.json --output /path/to/new-bundle --resume
-
-# Separate extraction/import and rendering:
-winding-field mesh --config /path/to/surfaces.json --output /path/to/new-bundle
-winding-field render --mesh /path/to/new-bundle --output /path/to/new-views
-```
-
-Install this checkout with the `surface` extra. Checkout equivalent:
-`python tools/run_surfaces.py surfaces ...`. No GPU, dataset registry, model,
-centerline or native viewer is required for these geometry renders. The existing
-dense export/UV tools remain separate.
-
-### Run the full CPU example
-
-```bash
-python -I examples/surface_pipeline.py --output /tmp/winding-surfaces --stop-after-tiles 3
-python -I examples/surface_pipeline.py --output /tmp/winding-surfaces --resume
-# Repeating this completed resume must also succeed without changing mesh bytes.
-python -I examples/surface_pipeline.py --output /tmp/winding-surfaces --resume
-```
-
-This creates an anisotropic, translated synthetic field containing two objects,
-extracts two levels across tile boundaries, exports every component, renders real
-front/oblique PNGs, then imports an exported OBJ and renders it too. It checks two
-components at each level and visible pixels. No physical-scroll claim is made.
-
-### Configuration and supported inputs
-
-Start from [surface-run.example.json](examples/surface-run.example.json). Its
-hashes/paths/calibration are placeholders. The `winding-surfaces-v1` object has
-exactly one `field` or `mesh` source, a `geometry` object, and optional `execution`
-and `render` controls. Paths belong to the config file, not CWD.
-
-For field extraction:
-
-- `geometry`: explicit `frame`, positive `voxel_um`, `origin_xyz`, positive
-  `spacing_xyz`, `shape_zyx` (at least two nodes per axis), positive `sheet_step`;
-  optional `calibration` provenance. Arrays are ZYX, mesh points XYZ world units.
-- `levels`: nonempty distinct finite **raw phi** isovalues, at most4096.
-  To request a winding value W, declare `phi=W*sheet_step` yourself.
-- NPY: `field={"kind":"npy","path":"phi.npy","sha256":"…"}`; optional
-  `mask={"path":"support.npy","sha256":"…"}` inside that object. Numeric fields
-  are read by bounded memmap crops; masks are boolean ZYX. NaN/Inf is excluded.
-- Chunked: `field={"kind":"chunks","path":"field/CHECKPOINT.json",
-  "sha256":"…","support_policy":"observed"}`. Supports the public/native
-  numeric-zero manifest with delta32+offset64+observed-bitpack payloads, including
-  the experimental175A representation, without importing its runner. `observed`
-  requires observation bits; explicit `stored` admits all referenced payload nodes
-  as inferred geometry. Absent chunks remain inadmissible in either policy.
-- Paris4's legacy sparse Blosc brick store is a different format; it still needs
-  its existing reader/export route or an explicit bounded adapter.
-
-For existing geometry, replace `field`/`levels` with
-`mesh={"path":"surface.obj","sha256":"…"}` or numeric NPZ. Supply at least
-`geometry.frame` and `voxel_um`; coordinates must already be in that world frame.
-NPZ needs `vertices_xyz` Nx3 and integer zero-based `faces` Mx3. OBJ is streamed,
-requires triangular faces and previously defined XYZ vertices, and accepts
-negative indices. UV/material records are not rendered as textures. Import group0
-is a mesh group, not a measured phi0 surface. `vertices_mm` requires an explicit
-unit conversion, not a renamed key.
-
-`execution` defaults: `tile=128` owned **cells**, `level_batch=4`, `cache_bytes=0`,
-`reserve_bytes=0`, `mesh_bytes=536870912`. Tiles are at most256 cells per axis;
-each read includes its required border nodes. Cache retention is not total RSS.
-NPZ header/data lengths must fit the uncompressed import allowance before array
-allocation; use streaming OBJ for larger imported geometry.
-
-### Persistence, topology and outputs
-
-`mesh.sqlite` is the authoritative on-disk indexed mesh and checkpoint. Each tile
-commits all its levels, source-progress cursor and new geometry digests in one
-transaction. Shared grid edges and exact-level nodes get canonical global keys;
-there is no proximity welding, per-tile largest-component selection, smoothing
-or decimation. Components connect through full edges across all tiles. SQLite
-retains the complete component table; `MESH.json` reports per-level counts,
-world-unit area, boundary/nonmanifold/inconsistent edges
-and duplicate faces. `level-0000.obj`, etc. map to its explicit level inventory.
-All-component retention does not certify physical-sheet identity or exact global
-self-intersection freedom.
-
-`RUN.json` binds source/geometry/numerical code and versions. `STATUS.json` is a
-progress view; SQLite is recovery authority. `OUTPUT/STOP` is checked between
-tiles; remove your marker before resume. Complete resume validates then preserves
-the database byte-for-byte; it also recovers interrupted export/render publication.
-Existing changed OBJ/PNG/JSON files are preserved and rejected, not overwritten.
-Interrupted owned temporaries remain for inspection.
-
-Resume checks committed tile geometry and the cursor journal, then hashes all
-referenced source payloads before adopting prior progress. This is streaming but
-can be substantial I/O. Source, geometry, levels, tile size and numerical-code
-changes fail; cache/reserve/level-batch controls may change. Sources must remain
-immutable, and extraction should target a frozen checkpoint after its writer and
-pin creation have quiesced. No input writer lease or source checkpoint is created.
-
-Disk reserve admission covers initialization, bounded SQL/import/OBJ write
-intervals and PNG publication. It is a measured guard with margins, not an OS
-reservation against other jobs. Global graph data stays in SQLite with a bounded
-page cache; input crops, mesher arrays, imported NPZ and raster buffers need
-additional working RAM. Real-data peak RSS/throughput is not measured here.
-
-### Views and Python API
-
-Renders are orthographic, depth-buffered native triangle geometry with two-sided
-normal shading and transparent background. Default views are front (+X, Z up)
-and oblique (azimuth35°, elevation20°). Geometry is not sampled into a scatter
-plot. Large projected triangles use bounded raster patches. Empty levels remain
-honest empty geometry; views may be blank when edge-on.
-
-`render` controls: `width=1024`, `height=1024`, `triangle_batch=8192`, `views`
-with simple unique `name`, `azimuth`, `elevation` in degrees; optional raw `levels`
-filter. Maximum16M pixels,65536 triangles/batch,32 views. `PLAN`/`RENDER` names
-are reserved. A full-bundle camera and stable level palette allow comparable
-views across level filters. The workflow propagates `execution.reserve_bytes`;
-standalone render accepts its own `reserve_bytes` in a render-only JSON.
-
-`winding-field render --config views.json` expects that **render object only**,
-not the complete field config. Outputs: `front.png`, `oblique.png`, per-view JSON,
-`PLAN.json` and `RENDER.json` with input SHA, frame, camera, coverage and diagnostic
-status. These are geometry images, not CT textures, flattened sheets or ink.
-
-Python interfaces:
-
-- `surface_sources.FieldSource(field,geometry,cache_bytes=0)`: owned float64/bool
-  ZYX crops, explicit support, source validation and bounded immutable cache.
-- `surface_mesh.extract_mesh(source,output,levels,tile=128,level_batch=4,
-  resume=False,stop=None,reserve_bytes=0)` and `import_mesh(...)`.
-- `surface_mesh.MeshReader(bundle).triangles(batch_size=8192,level=None)` streams
-  world triangles plus group IDs; context manager, validates immutable binding.
-- `surface_render.render_view(triangles_callable,bounds_xyz,...)` returns RGBA and
-  camera/pixel statistics without whole-mesh allocation.
-- `surface_workflow.run_surfaces(config,output,resume=False,render=True,stop=None)`
-  and `render_bundle(mesh,output,settings=None)` orchestrate those same modules.
-
-Exits:0 completed or checkpointed STOP,75 explicit resource unavailability,
-2 input/integrity error,1 processing failure. Check receipts: output is diagnostic,
-never physical acceptance. The float32 Marching-Cubes kernel and adaptive precision
-retries are explicit in the identity. Rounded crossings trigger smaller internal
-tiles and single-cell axis reflections; edge coordinates are reconstructed from
-the original float64 values without proximity welding. Tiny faces survive until
-that reconstruction. Unrepresentable float32 sign underflow still fails explicitly.
+Prepared JSON recipes, PNG rendering, the synthetic block/surface examples and
+complete-cycle performance probe now live in
+[winding-field-cli](https://github.com/LimeGS/winding-field-cli/tree/feat/core-cli-separation).
 
 ## Generate and evaluate
 
@@ -585,15 +351,15 @@ controls remain explicit; missing human references are reported as not evaluated
 ## Layout
 
 - `src/`: solver, constraints, physical grids, bounded storage/block execution,
-  prepared construction/resume workflow, observation preparation, references,
+  observation preparation, geometric extraction, references,
   topology, data adapters and evaluation helpers.
 - `benchmarks/winding/`: artifact evaluator, metrics, independent interpolation,
   CT renderer and tests.
-- `tools/`: prepared field/coherence runners, supervision, error auditing and surface
+- `tools/`: research coherence runners, error auditing and surface
   export/probe/atlas tools.
 - `tests/`: synthetic unit, integration and regression tests.
-- `examples/`: offline construction/evaluation demos and editable dataset and
-  prepared-run configurations.
+- `examples/`: offline construction/evaluation demos and editable dataset
+  configurations. Prepared workflow examples live in winding-field-cli.
 - `.github/`: CI, dependency-update configuration and contribution templates.
 
 ## Checks

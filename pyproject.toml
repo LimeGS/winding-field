@@ -17,11 +17,14 @@ dependencies = [
   "tifffile>=2023.7",
 ]
 
+[project.scripts]
+winding-field = "field_workflow:main"
+
 [project.optional-dependencies]
 # Mesh export and atlas tools (also exercised by the test suite).
 surface = ["Pillow>=10", "scikit-image>=0.22"]
 # Runtime access to the public Vesuvius datasets.
-data = ["zarr>=3,<4"]
+data = ["zarr>=3,<4", "numcodecs>=0.13,<1"]
 # QC figure rendering.
 plot = ["matplotlib>=3.8,<4"]
 test = ["pytest>=8,<10", "pytest-cov>=5,<8", "Pillow>=10", "scikit-image>=0.22", "matplotlib>=3.8,<4"]
@@ -30,6 +33,7 @@ all = [
   "Pillow>=10",
   "scikit-image>=0.22",
   "zarr>=3,<4",
+  "numcodecs>=0.13,<1",
   "matplotlib>=3.8,<4",
   "pytest>=8,<10",
   "pytest-cov>=5,<8",
@@ -41,20 +45,32 @@ all = [
 package-dir = { "" = "src" }
 py-modules = [
   "anisotropic_reference",
+  "block_solver",
   "coarse_reference",
   "coherence_pipeline",
+  "constraint_templates",
   "common",
   "dataset_config",
   "evaluation_split",
   "field_constraints",
+  "field_observations",
+  "field_prefetch",
+  "field_runtime",
   "field_solver",
+  "field_sources",
+  "field_store",
   "field_topology",
+  "field_workflow",
   "paris_data",
   "paris_pair_check",
   "paris_solve",
   "patch_check",
   "physical_grid",
   "sealed_predict",
+  "surface_mesh",
+  "surface_render",
+  "surface_sources",
+  "surface_workflow",
   "whole_reference",
 ]
 

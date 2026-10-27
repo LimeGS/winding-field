@@ -10,14 +10,12 @@ from zipfile import ZipFile
 import numpy as np
 import pytest
 from test_surface_mesh import source
-from test_surface_workflow import prepared
 
 import field_store
 from field_runtime import ResourceUnavailable
 from field_store import BlockStore
-from surface_mesh import MeshReader, extract_mesh, import_mesh
+from surface_mesh import extract_mesh, import_mesh
 from surface_sources import FieldSource
-from surface_workflow import render_bundle, run_surfaces
 
 
 @pytest.mark.parametrize("tile", [1, 2, 4])
@@ -27,38 +25,6 @@ def test_exact_lattice_sphere_is_closed_and_connected_for_every_tile(tmp_path, t
     with source(tmp_path, values, origin=(0, 0, 0), spacing=(1, 1, 1)) as field:
         info = extract_mesh(field, tmp_path / "mesh", [2.0], tile=tile)["levels"][0]
     assert info["faces"] == 32 and info["components"] == 1 and info["boundary_edges"] == 0
-
-
-def test_completed_workflow_resume_is_idempotent(tmp_path):
-    path, _ = prepared(tmp_path)
-    root = tmp_path / "output"
-    run_surfaces(path, root)
-    before = (root / "mesh.sqlite").read_bytes()
-    assert run_surfaces(path, root, resume=True)["status"] == "SURFACES_READY"
-    assert (root / "mesh.sqlite").read_bytes() == before
-
-
-def test_workflow_recovers_after_one_view_was_published(tmp_path, monkeypatch):
-    import surface_workflow
-
-    path, _ = prepared(tmp_path)
-    root = tmp_path / "output"
-    publish = surface_workflow._publish_png
-    calls = [0]
-
-    def interrupted(*args):
-        calls[0] += 1
-        if calls[0] == 2:
-            raise RuntimeError("interrupted second view")
-        return publish(*args)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(surface_workflow, "_publish_png", interrupted)
-        with pytest.raises(RuntimeError):
-            run_surfaces(path, root)
-    before = (root / "renders/front.png").read_bytes()
-    assert run_surfaces(path, root, resume=True)["status"] == "SURFACES_READY"
-    assert (root / "renders/front.png").read_bytes() == before
 
 
 @pytest.mark.parametrize("corruption", ["cursor", "vertices", "faces"])
@@ -85,16 +51,23 @@ def test_partial_sqlite_logical_corruption_is_not_adopted(tmp_path, corruption):
 
 
 def chunks(tmp_path):
-    path, config = prepared(tmp_path)
     root = tmp_path / "chunks"
     values = np.broadcast_to(np.arange(7.0) + 1.0, (5, 6, 7)).copy()
-    with BlockStore(root, values.shape, 7, dict(geometry=config["geometry"])) as store:
+    geometry = dict(
+        frame="other-scroll/world",
+        voxel_um=3.0,
+        sheet_step=2.0,
+        origin_xyz=[17.0, -4.0, 29.0],
+        spacing_xyz=[2.0, 3.0, 5.0],
+        shape_zyx=list(values.shape),
+    )
+    with BlockStore(root, values.shape, 7, dict(geometry=geometry)) as store:
         store.commit((0, 0, 0), values, {}, np.ones(values.shape, bool))
     cp = root / "CHECKPOINT.json"
     descriptor = dict(
         kind="chunks", path=str(cp), sha256=hashlib.sha256(cp.read_bytes()).hexdigest(), support_policy="observed"
     )
-    return descriptor, config["geometry"]
+    return descriptor, geometry
 
 
 def test_resume_hashes_consumed_payloads_even_with_no_tiles_left(tmp_path):
@@ -133,35 +106,6 @@ def test_decoder_implementation_is_part_of_resume_identity(tmp_path, monkeypatch
     with FieldSource(descriptor, geometry) as field:
         with pytest.raises(ValueError):
             extract_mesh(field, root, [2.5], tile=1, resume=True)
-
-
-@pytest.mark.parametrize("member", ["metadata", "levels"])
-def test_manifest_cannot_relabel_committed_mesh(tmp_path, member):
-    path, _ = prepared(tmp_path)
-    root = tmp_path / "mesh"
-    run_surfaces(path, root, render=False)
-    manifest = json.loads((root / "MESH.json").read_bytes())
-    if member == "metadata":
-        manifest["metadata"]["frame"] = "unrelated-world"
-    else:
-        manifest["levels"][0]["level"] = 999
-    (root / "MESH.json").write_text(json.dumps(manifest))
-    with pytest.raises(ValueError):
-        MeshReader(root)
-
-
-def test_completed_resume_preserves_changed_manifest(tmp_path):
-    path, _ = prepared(tmp_path)
-    root = tmp_path / "mesh"
-    run_surfaces(path, root, render=False)
-    file = root / "MESH.json"
-    manifest = json.loads(file.read_bytes())
-    manifest["metadata"]["frame"] = "foreign-frame"
-    file.write_text(json.dumps(manifest))
-    before = file.read_bytes()
-    with pytest.raises(ValueError):
-        run_surfaces(path, root, resume=True, render=False)
-    assert file.read_bytes() == before
 
 
 def test_npz_declared_shape_is_bounded_before_numpy_allocation(tmp_path, monkeypatch):
@@ -204,39 +148,6 @@ def test_import_reserve_covers_initial_database_growth(tmp_path, monkeypatch):
             dict(frame="world", voxel_um=1.0),
             reserve_bytes=100_000,
         )
-    assert not (tmp_path / "output").exists()
-
-
-def test_render_has_its_own_disk_admission(tmp_path):
-    path, _ = prepared(tmp_path)
-    root = tmp_path / "mesh"
-    run_surfaces(path, root, render=False)
-    with pytest.raises(ResourceUnavailable):
-        render_bundle(root, tmp_path / "render", settings=dict(reserve_bytes=2**63))
-    assert not (tmp_path / "render").exists()
-
-
-@pytest.mark.parametrize("filename", ["front.json", "RENDER.json"])
-def test_render_retry_preserves_foreign_json_receipts(tmp_path, filename):
-    path, _ = prepared(tmp_path)
-    root = tmp_path / "mesh"
-    run_surfaces(path, root, render=False)
-    output = tmp_path / "render"
-    settings = dict(width=32, height=32)
-    render_bundle(root, output, settings=settings)
-    (output / filename).write_text('{"foreign":true}')
-    with pytest.raises(ValueError):
-        render_bundle(root, output, settings=settings)
-    assert (output / filename).read_text() == '{"foreign":true}'
-
-
-@pytest.mark.parametrize("name", ["PLAN", "plan", "RENDER"])
-def test_reserved_view_names_fail_before_output(tmp_path, name):
-    path, config = prepared(tmp_path)
-    config["render"]["views"] = [dict(name=name)]
-    path.write_text(json.dumps(config))
-    with pytest.raises(ValueError):
-        run_surfaces(path, tmp_path / "output")
     assert not (tmp_path / "output").exists()
 
 

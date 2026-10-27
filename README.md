@@ -1,7 +1,7 @@
 # Winding fields and reproducible evaluation
 
 [![Audit](https://github.com/LimeGS/winding-field/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/LimeGS/winding-field/actions/workflows/ci.yml)
-[![Coverage (local): 92.94%](https://img.shields.io/badge/coverage%20%28local%29-92.94%25-brightgreen)](#checks)
+[![Coverage (local): 92.35%](https://img.shields.io/badge/coverage%20%28local%29-92.35%25-brightgreen)](#checks)
 [![Code license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 Experimental software for constructing continuous winding-coordinate fields over
@@ -128,18 +128,27 @@ Target interpreters: Python 3.11 and 3.12 on Linux and macOS. CI is configured f
 both Python versions on Linux. Tests run on CPU; GPU execution needs a compatible
 CUDA installation. Process-supervision tools use Unix facilities.
 
+This branch provides `winding-field-experiments==1.3.0.dev0`. Clone it before
+running the checkout examples below (use `python3.12` instead if preferred):
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
+git clone --branch feat/core-cli-separation https://github.com/LimeGS/winding-field.git
+cd winding-field
+python3.11 -m venv .venv
+source .venv/bin/activate
 python -m pip install -e ".[test,dev]"
 ```
 
 Optional extras: `surface` for mesh/atlas tools, `data` for Zarr, `plot` for
 Matplotlib, or `all` for the runtime/test features. Modules install flat
 (`field_solver`, `physical_grid`, etc.); use a virtual environment to avoid name
-collisions. The wheel contains `src/`; command-line tools live in the checkout.
+collisions. The wheel installs the flat modules; research scripts and examples
+run from this checkout.
 This library installs no `winding-field` executable. Prepared workflows and
-rendering are provided by [winding-field-cli](https://github.com/LimeGS/winding-field-cli),
-which imports this library directly.
+rendering are provided by
+[winding-field-cli](https://github.com/LimeGS/winding-field-cli/tree/feat/core-cli-separation#quick-start),
+which imports this library directly. Its quick start fetches the exact original
+revision recorded in the CLI's `provenance/core.json`.
 
 ## Minimal example
 
@@ -276,7 +285,7 @@ python examples/build_demo.py --output /tmp/winding-build-demo
 ```
 
 This offline example creates synthetic observations and fibres, writes a dataset
-JSON, invokes the **real construction CLI**, and checks the resulting analytic
+JSON, invokes the research runner `tools/run_coherence.py`, and checks the resulting analytic
 field. It requires no real scan or GPU. Its values are demonstration parameters,
 not calibration for a real roll.
 
@@ -376,9 +385,12 @@ annotated functions and a typed solver caller; unannotated research-function
 bodies and array shapes/ranges still rely on runtime checks and tests.
 
 The Audit badge reports the latest GitHub Actions push on `main`. The coverage
-badge is a local snapshot from October 22, 2026: **1375 tests passed, 92.94%
+badge is a local snapshot from October 27, 2026: **1227 tests passed, 92.35%
 statement coverage**, on macOS with Python 3.11.13 / NumPy 2.2.6. Refresh it after
-a measured change; it is not a live coverage feed.
+a measured change; it is not a live coverage feed. The separated core wheel also
+passed all 1227 tests outside the checkout. Workflow/render tests now run in the
+CLI repository; see its
+[separation verification](https://github.com/LimeGS/winding-field-cli/blob/feat/core-cli-separation/docs/verification/core-cli-separation.md).
 
 ## Data and contribution
 

@@ -666,8 +666,8 @@ def import_mesh(
                                 0, [f"input:{i}" for i in range(start, start + len(part))], part, np.empty((0, 3), int)
                             )
                         for start in range(0, len(faces), 8192):
-                            ids, remap = np.unique(faces[start : start + 8192], return_inverse=True)
-                            store.add(0, [f"input:{i}" for i in ids], vertices[ids], remap.reshape(-1, 3))
+                            vertex_ids, remap = np.unique(faces[start : start + 8192], return_inverse=True)
+                            store.add(0, [f"input:{i}" for i in vertex_ids], vertices[vertex_ids], remap.reshape(-1, 3))
                     else:
                         count = 0
                         while raw := stream.readline(1024**2 + 1):

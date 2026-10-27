@@ -1,9 +1,12 @@
 """Physical sample constraints, eliminated segment means, exact tile restriction."""
 
 import hashlib
+import warnings
+from copy import copy
 
 import numpy as np
 import torch
+from numpy.typing import ArrayLike
 from scipy.sparse import coo_matrix, csr_matrix, vstack
 
 from physical_grid import point_stencils
@@ -144,35 +147,86 @@ class QuadraticConstraints:
         factors = np.minimum(1, delta / np.maximum(r, delta))
         return QuadraticConstraints(self.matrix, self.weights * factors, self.targets, self.groups), factors
 
-    def operator(self, device, dtype=np.float32):
-        return _QuadraticOperator(self, device)
+    def _structural_arrays(self):
+        return (
+            self.matrix.data,
+            self.matrix.indices,
+            self.matrix.indptr,
+            self.weights,
+            self.groups,
+            self.group_sum,
+            self.members.data,
+            self.members.indices,
+            self.members.indptr,
+            self.diagonal,
+        )
+
+    def with_targets(self, targets: ArrayLike) -> "QuadraticConstraints":
+        """Own new finite targets while sharing/sealing the existing static structure.
+
+        Neither source nor result structural arrays may subsequently be modified.
+        PreparedField additionally snapshots/checks them against writable aliases.
+        """
+        if np.iscomplexobj(targets):
+            raise ValueError("constraint targets must be real")
+        targets = np.broadcast_to(np.asarray(targets, float), (self.matrix.shape[0],)).copy()
+        if not np.isfinite(targets).all():
+            raise ValueError("invalid constraint targets")
+        for array in self._structural_arrays():
+            array.setflags(write=False)
+        result = copy(self)
+        result.targets = targets
+        return result
+
+    def operator(self, device: str | torch.device, dtype=np.float32, *, layout: str = "coo") -> "_QuadraticOperator":
+        return _QuadraticOperator(self, device, dtype, layout=layout)
 
 
 class _QuadraticOperator:
-    def __init__(self, c, device):
+    def __init__(self, c, device, dtype=np.float32, *, layout="coo"):
+        try:
+            precision = np.dtype(dtype)
+        except TypeError as error:
+            raise ValueError("unsupported operator dtype") from error
+        if precision not in (np.dtype("float32"), np.dtype("float64")) or layout not in ("coo", "csr"):
+            raise ValueError("operator requires float32/float64 and coo/csr layout")
+        scalar = torch.float64 if precision == np.float64 else torch.float32
+
+        def tensor(a, dtype=scalar):
+            return torch.tensor(a, dtype=dtype, device=device)
+
         def sparse(a):
+            if layout == "csr":
+                a = a.tocsr()
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message="Sparse CSR tensor support is in beta state.*")
+                    return torch.sparse_csr_tensor(
+                        tensor(a.indptr, torch.long),
+                        tensor(a.indices, torch.long),
+                        tensor(a.data),
+                        size=a.shape,
+                        check_invariants=True,
+                    )
             a = a.tocoo()
             indices = torch.as_tensor(np.stack([a.row, a.col]), dtype=torch.long, device=device)
-            return torch.sparse_coo_tensor(
-                indices, torch.as_tensor(a.data, dtype=torch.float32, device=device), a.shape, check_invariants=True
-            ).coalesce()
+            return torch.sparse_coo_tensor(indices, tensor(a.data), a.shape, check_invariants=True).coalesce()
 
         with torch.sparse.check_sparse_tensor_invariants(True):
             self.a = sparse(c.matrix)
-            self.at = self.a.transpose(0, 1).coalesce()
-        self.w = torch.as_tensor(c.weights, dtype=torch.float32, device=device)
-        self.target = torch.as_tensor(c.targets, dtype=torch.float32, device=device)
-        self.groups = torch.as_tensor(c.groups, dtype=torch.long, device=device)
+            self.at = sparse(c.matrix.T) if layout == "csr" else self.a.transpose(0, 1).coalesce()
+        self.w = tensor(c.weights)
+        self.target = tensor(c.targets)
+        self.groups = tensor(c.groups, torch.long)
         self.use = self.groups >= 0
-        self.sum = torch.as_tensor(c.group_sum, dtype=torch.float32, device=device)
-        self.diagonal = torch.as_tensor(c.diagonal, dtype=torch.float32, device=device)
+        self.sum = tensor(c.group_sum)
+        self.diagonal = tensor(c.diagonal)
 
     def center_weight(self, r):
         v = self.w * r
         if len(self.sum):
             total = torch.zeros_like(self.sum)
             total.index_add_(0, self.groups[self.use], v[self.use])
-            mean = total / self.sum.clamp_min(torch.finfo(torch.float32).tiny)
+            mean = total / self.sum.clamp_min(torch.finfo(self.w.dtype).tiny)
             v = v.clone()
             v[self.use] -= self.w[self.use] * mean[self.groups[self.use]]
         return v
@@ -250,10 +304,15 @@ def solve_with_relations(
     if separation is not None and (separation.groups >= 0).any():
         raise ValueError("separation cannot have consensus groups")
     current = constraints
+    dtype = kwargs.get("dtype", "float32")
+    if dtype not in ("float32", "float64"):
+        raise ValueError("dtype must be float32 or float64")
+    if kwargs.get("return_tensor", False):
+        raise ValueError("solve_with_relations requires NumPy results")
     initial = kwargs.pop("initial", None)
     if initial is None:
-        initial = np.zeros(weights.shape, np.float32)
-    field = np.asarray(initial, np.float32)
+        initial = np.zeros(weights.shape, dtype)
+    field = np.asarray(initial, dtype)
     factors = np.ones(0 if constraints is None else len(constraints.weights))
     history = []
     info = {}

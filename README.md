@@ -124,31 +124,19 @@ Paris4 measurements.
 
 ## Install
 
-Target interpreters: Python 3.11 and 3.12 on Linux and macOS. CI is configured for
-both Python versions on Linux. Tests run on CPU; GPU execution needs a compatible
-CUDA installation. Process-supervision tools use Unix facilities.
-
-This branch provides `winding-field-experiments==1.3.0.dev0`. Clone it before
-running the checkout examples below (use `python3.12` instead if preferred):
+Python 3.11 or 3.12 on Linux or macOS. GPU execution requires compatible CUDA.
 
 ```bash
-git clone --branch feat/core-cli-separation https://github.com/LimeGS/winding-field.git
+git clone https://github.com/LimeGS/winding-field.git
 cd winding-field
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[test,dev]"
 ```
 
-Optional extras: `surface` for mesh/atlas tools, `data` for Zarr, `plot` for
-Matplotlib, or `all` for the runtime/test features. Modules install flat
-(`field_solver`, `physical_grid`, etc.); use a virtual environment to avoid name
-collisions. The wheel installs the flat modules; research scripts and examples
-run from this checkout.
-This library installs no `winding-field` executable. Prepared workflows and
-rendering are provided by
-[winding-field-cli](https://github.com/LimeGS/winding-field-cli/tree/feat/core-cli-separation#quick-start),
-which imports this library directly. Its quick start fetches the exact original
-revision recorded in the CLI's `provenance/core.json`.
+Optional extras: `surface` for mesh tools, `data` for Zarr, `plot` for Matplotlib,
+or `all` for all runtime/test features. For the CT-to-atlas command-line pipeline,
+see [winding-field-cli](https://github.com/LimeGS/winding-field-cli#quick-start).
 
 ## Minimal example
 
@@ -164,117 +152,19 @@ field[0,0,:]: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
 ```
 
 The main library interface is [`field_solver.solve_field`](src/field_solver.py).
-It accepts NumPy arrays, nested sequences or PyTorch tensors and by default returns
-a NumPy `float32` field plus a JSON-compatible receipt. Coordinates/gradients are XYZ;
-arrays are ZYX. Defaults are CPU, unit spacing, `lam=3`, `rtol=1e-5`,
-`maxiter=4000` and no reference penalty. Arguments are explicit; the solver reads
-no configuration files. Fixed nodes take exact values, and without effective
-anchors node zero fixes the gauge. Invalid inputs raise `ValueError`;
-nonconvergence is reported in the receipt and must block acceptance of that solve.
-`paris_data.save_field` preserves the solver receipt's declared float32/float64
-precision and rejects mismatched arrays or lossy casts that would inherit its
-convergence claim. Legacy receipts without `dtype` keep float32 export only when
-the conversion is lossless; revalidate any intentional precision reduction.
+It accepts NumPy arrays or PyTorch tensors and returns a field plus a convergence
+receipt. Arrays are ZYX; coordinates and gradients are XYZ. See the function
+docstring for solver options.
 
-## Optional performance backend (unreleased)
+## Larger fields and meshes
 
-The feature branch adds reusable performance primitives and a block execution
-backend. Existing dense APIs and dataset CLI defaults remain unchanged. These
-interfaces require explicit geometry, observations and resource budgets; they do
-not infer a scroll's calibration, orientation, source data or GPU assignment.
+The library also provides [blockwise solves](src/block_solver.py),
+[resumable field storage](src/field_store.py),
+[fibre constraints](src/constraint_templates.py) and
+[tiled mesh extraction](src/surface_mesh.py).
 
-### Prepared workflows moved to winding-field-cli
-
-Install the CLI alongside this library for `winding-field prepared build|resume`,
-supervised workers and runnable block/surface examples. The
-[prepared workflow guide](https://github.com/LimeGS/winding-field-cli/blob/feat/core-cli-separation/docs/PREPARED.md)
-contains recipes, resource controls, exit statuses and migration instructions.
-Python imports are now `winding_field.field_workflow`,
-`winding_field.surface_workflow` and `winding_field.surface_render`.
-Existing implementation-bound runs require their original packages or a new
-output; moving a workflow does not authorize rewriting its saved identity.
-
-### Interfaces
-
-| Module / interface | Contract |
-|---|---|
-| [`solve_field`](src/field_solver.py) | New keyword-only `dtype="float64"` and `return_tensor=True` support precise solves and device-resident results. Default remains NumPy float32. Float64 continuous operators use CSR; default float32 uses the existing COO path. |
-| `PreparedField()` | Pass as `prepared=` for repeated solves of one block with static observations/rows. Fixed values and row targets refresh each call. Owned snapshots detect changed inputs, including writable NumPy aliases. Discrete pairs and reference penalties are not supported in this optional path. |
-| [`QuadraticConstraints.with_targets`](src/field_constraints.py) | Owns new finite targets, shares/seals existing CSR, weights, groups and diagonal. Structural arrays must not be mutated after sharing. |
-| [`StencilConstraints`](src/constraint_templates.py) | `.pairs(...)` and `.consensus(...)` compile physical stencils; `.restrict(lo, hi, read_nodes)` batches current exterior reads. `.save(path)` / `.load(path)` persist exact non-pickled rows. Supply complete consensus groups and globally chosen weights; the cache never stores dynamic exterior targets. |
-| [`BlockStore`](src/field_store.py) | Single writer, grouped reads, bounded parallel reader batches/LRU, SHA-256 payload checks, atomic core + progress publication, explicit observation masks and exact cursor restoration. |
-| [`density_normals`](src/field_observations.py) | Torch CPU/CUDA preparation from uint8 ZYX presence, halo40 by default. Returns density per **input voxel**, unsigned XYZ directors and support. Local directors can be zero inside smoothed density support; callers supply physical scaling and sign/orientation. |
-| [`CertifiedPresence`](src/field_sources.py) | Reads pinned Zarr-v2 uint8 chunks under a complete-coverage manifest. Missing listed chunks and unexpected files are errors; only certified absent chunks are observed zero. Compressed sources need the `data` extra. |
-| `NpyObservations` | Picklable, hash-bound target/weights/observed memmaps; copies only requested crops and emits bounds-specific source receipts. Inputs must remain immutable. |
-| `NpyFixedValues` | Pinned fixed-value NPY memmap, owned half-open ZYX crops, retained float32/float64 precision; finite values are fixed and NaN means free. |
-| [`solve_blocks`](src/block_solver.py) | Explicit order/core/halo, fresh shared-field internal faces and exterior constraints, one writer, local numerical gates, cumulative sweep statistics and durable stop/resume. Accepts observation/fixed-value loaders and admission/stop callbacks. |
-| [`ObservationPrefetch`](src/field_prefetch.py) | At most one immutable observation request, bounded serialized frames, full-frame timeouts, initial primary/secondary parity in the runner and owned-child cleanup. Off by default; CPU unless an explicit GPU lease is supplied. |
-| [`GpuLease`, `check_resources`, `run_supervised`](src/field_runtime.py) | Explicit UUID/lock/deadline and effective-memory admission. Supervision binds source hashes and argv, preserves STOP, retries only same-child resource failures, and stops on numerical/integrity failures. |
-
-See the module docstrings for exact signatures and source-manifest fields.
-Large fibre archives can provide `constraints(lo, hi, read_nodes)` to select
-complete groups per block and return local `QuadraticConstraints`. Bind that
-provider and its geometry in the run's `identity`; exterior targets must use the
-current node reader on every call. `StencilConstraints` owns its compiled input
-arrays and bounds cache retention, not the size of the supplied fibre archive.
-`CertifiedPresence` coverage boxes are `[[loZ,loY,loX],[hiZ,hiY,hiX]]`, half-open
-and chunk-aligned (the final upper edge may meet the volume boundary). It accepts
-the declared numeric grid, not a dataset-specific completion label.
-Supported compressors are Blosc, zlib, gzip, bzip2, LZ4, Zstandard and LZMA, plus
-uncompressed bytes. Object codecs such as pickle are rejected before decoding.
-
-**Budgets and recovery:** cache retention defaults to zero and readers to one.
-Input snapshots, temporary arrays, live diagonals, solver workspace and a second
-observation process need additional RAM/VRAM admission; a cache limit is not a
-process memory cap. `BlockStore.max_bytes` bounds peak logical directory bytes,
-including old/new payloads, metadata and orphan generations; `reserve_bytes`
-protects measured free space but cannot reserve it against other jobs. Failed
-publication requires closing/reopening the store. Orphans are retained for
-inspection. POSIX locking, same-filesystem rename and fsync semantics are required.
-Multiple cores require a positive halo so that internal fixed faces do not freeze
-owned unknowns; a single-core solve can use halo zero.
-
-Checkpoints use **quantized float32 deltas plus a float64 offset**, not lossless
-float64 storage. A local solver receipt is labeled `pre_encoding_local_solve`;
-quantization and decoded fixed-value errors are recorded separately. Neither
-stored-field residual nor global/physical convergence is inferred. Such a
-checkpoint cannot be passed to an evaluator requiring convergence merely because
-its local solves passed.
-
-For supervision, workers write `STATUS.json`: exit75 with
-`RESOURCE_UNAVAILABLE` permits retry; exit0 with `CHECKPOINTED_STOP` or
-`SWEEP_BUDGET_REACHED` terminates normally. Unknown exits and stale receipts fail.
-The supervisor creates `.supervisor.lock` before an initial worker; a new store
-accepts that marker alone, never other pre-existing output. Checkpoint envelopes
-are bounded to 64 MiB; process-status JSON to 1 MiB. GPU/device deadlines are checked
-before work; a numerical solve is not a hard real-time interruption point.
-Forced shutdown signals only the owned worker's verified private process group,
-including its prefetch descendants; the leader is not reaped before escalation,
-preventing process-group-ID reuse during cleanup.
-Prefetch uses trusted pickled loaders over an inherited socketpair, never a
-network service. Explicit backend unavailability falls back to the primary;
-source/data/parity failures remain errors.
-For GPU prefetch, device admission and the lifetime lease are established before
-unpickling or initializing the observation loader.
-
-## Agnostic tiled mesh library (unreleased)
-
-`surface_sources.FieldSource` provides bounded, validated float64/bool crops from
-explicitly pinned NPY or chunked fields. `surface_mesh.extract_mesh` and
-`import_mesh` publish immutable indexed bundles and OBJ exports; `MeshReader`
-streams world-space triangles. All components, declared physical geometry and
-strict support are retained. SQLite transactions bind source progress and
-geometry; completed resume validates rather than replacing committed products.
-
-The float32 Marching-Cubes kernel and adaptive precision retries are explicit in
-the identity. Rounded crossings use smaller internal tiles and axis reflections;
-edge coordinates are reconstructed from original float64 values without proximity
-welding. Unrepresentable sign underflow fails explicitly. These are geometric
-diagnostics, not physical-sheet validation.
-
-Prepared JSON recipes, PNG rendering, the synthetic block/surface examples and
-complete-cycle performance probe now live in
-[winding-field-cli](https://github.com/LimeGS/winding-field-cli/tree/feat/core-cli-separation).
+For ready-to-run recipes, checkpoint resume and rendering, see the
+[CLI workflow guide](https://github.com/LimeGS/winding-field-cli/blob/main/docs/PREPARED.md).
 
 ## Generate and evaluate
 
@@ -390,7 +280,7 @@ statement coverage**, on macOS with Python 3.11.13 / NumPy 2.2.6. Refresh it aft
 a measured change; it is not a live coverage feed. The separated core wheel also
 passed all 1227 tests outside the checkout. Workflow/render tests now run in the
 CLI repository; see its
-[separation verification](https://github.com/LimeGS/winding-field-cli/blob/feat/core-cli-separation/docs/verification/core-cli-separation.md).
+[separation verification](https://github.com/LimeGS/winding-field-cli/blob/main/docs/verification/core-cli-separation.md).
 
 ## Data and contribution
 

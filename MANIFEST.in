@@ -1,1 +1,5 @@
 include tests/prefetch_fixtures.py
+include tests/conftest.py
+recursive-include benchmarks *.py *.md
+recursive-include tools *.py
+recursive-include examples *.py *.json

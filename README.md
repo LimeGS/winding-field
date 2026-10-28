@@ -1,7 +1,7 @@
 # Winding fields and reproducible evaluation
 
 [![Audit](https://github.com/LimeGS/winding-field/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/LimeGS/winding-field/actions/workflows/ci.yml)
-[![Coverage (local): 92.35%](https://img.shields.io/badge/coverage%20%28local%29-92.35%25-brightgreen)](#checks)
+[![Coverage (local): 93.22%](https://img.shields.io/badge/coverage%20%28local%29-93.22%25-brightgreen)](#checks)
 [![Code license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 Experimental software for constructing continuous winding-coordinate fields over
@@ -134,9 +134,10 @@ source .venv/bin/activate
 python -m pip install -e ".[test,dev]"
 ```
 
-Optional extras: `surface` for mesh tools, `data` for Zarr, `plot` for Matplotlib,
-or `all` for all runtime/test features. For the CT-to-atlas command-line pipeline,
-see [winding-field-cli](https://github.com/LimeGS/winding-field-cli#quick-start).
+Optional extras: `data` for Zarr, `test` for the numerical test suite, `dev` for
+development checks, or `all` for data and tests. Surface extraction, export,
+flattening and visualization belong to
+[winding-field-cli](https://github.com/LimeGS/winding-field-cli#quick-start).
 
 ## Minimal example
 
@@ -156,14 +157,13 @@ It accepts NumPy arrays or PyTorch tensors and returns a field plus a convergenc
 receipt. Arrays are ZYX; coordinates and gradients are XYZ. See the function
 docstring for solver options.
 
-## Larger fields and meshes
+## Larger fields
 
 The library also provides [blockwise solves](src/block_solver.py),
 [resumable field storage](src/field_store.py),
-[fibre constraints](src/constraint_templates.py) and
-[tiled mesh extraction](src/surface_mesh.py).
+[fibre constraints](src/constraint_templates.py).
 
-For ready-to-run recipes, checkpoint resume and rendering, see the
+For ready-to-run recipes, checkpoint resume, mesh extraction and rendering, see the
 [CLI workflow guide](https://github.com/LimeGS/winding-field-cli/blob/main/docs/PREPARED.md).
 
 ## Generate and evaluate
@@ -205,14 +205,13 @@ python examples/benchmark_demo.py --output /tmp/winding-benchmark-demo
 ```
 
 Choose a new output directory each time. This creates a tiny synthetic case,
-an analytic candidate and CT-like layer images, then runs the real evaluator.
+an analytic candidate, then runs the real evaluator.
 No private data, model weights, GPU or network access is needed.
 
 Expected final checks: **6/6 fibre pairs covered, 3/3 synthetic separation pairs
 correct, and 0/3 for both collapse controls**. Open
-`/tmp/winding-benchmark-demo/evaluation/ct-winding.png` for the overview, or
-`TABLES.md` / `SUMMARY.json` alongside it for the scores. All demo tables and
-images are labeled synthetic. These numbers illustrate the interface, not real
+`/tmp/winding-benchmark-demo/evaluation/TABLES.md` or `SUMMARY.json` for the scores.
+All demo tables are labeled synthetic. These numbers illustrate the interface, not real
 scroll performance.
 
 ### Evaluate supplied observations or predictions
@@ -224,7 +223,7 @@ observations + constraints → producer → field.npy + metadata + optional supp
                                           ↓
                               frozen case + evaluator
                                           ↓
-                         metrics, controls, CT pictures, hashes
+                              metrics, controls, hashes
 ```
 
 - [`tools/run_coherence.py`](tools/run_coherence.py) runs the current coherence
@@ -238,10 +237,10 @@ python benchmarks/winding/evaluate.py \
   --output "$NEW_RUN"
 ```
 
-Use `--check-only` with a separate new output directory for preflight. A case can
-also request matched CT/winding pictures. See the
-[benchmark guide](benchmarks/winding/README.md) for the case, candidate and visual
-contracts. New cases declare the frame, physical units and native-to-world
+Use `--check-only` with a separate new output directory for preflight. Optional
+matched CT/winding pictures are rendered separately by `winding-field ct-visuals`
+in the CLI repository. See the [benchmark guide](benchmarks/winding/README.md)
+for the case and candidate contracts. New cases declare the frame, physical units and native-to-world
 transform explicitly. Historical cases lacking that information require an
 explicit `--config` coordinate context, leaving their original files unchanged.
 All/reserved populations, unavailable denominators and separation/collapse
@@ -250,12 +249,10 @@ controls remain explicit; missing human references are reported as not evaluated
 ## Layout
 
 - `src/`: solver, constraints, physical grids, bounded storage/block execution,
-  observation preparation, geometric extraction, references,
+  observation preparation, references,
   topology, data adapters and evaluation helpers.
-- `benchmarks/winding/`: artifact evaluator, metrics, independent interpolation,
-  CT renderer and tests.
-- `tools/`: research coherence runners, error auditing and surface
-  export/probe/atlas tools.
+- `benchmarks/winding/`: artifact evaluator, metrics, independent interpolation and tests.
+- `tools/`: field-construction research runners and numerical error auditing.
 - `tests/`: synthetic unit, integration and regression tests.
 - `examples/`: offline construction/evaluation demos and editable dataset
   configurations. Prepared workflow examples live in winding-field-cli.
@@ -275,12 +272,13 @@ annotated functions and a typed solver caller; unannotated research-function
 bodies and array shapes/ranges still rely on runtime checks and tests.
 
 The Audit badge reports the latest GitHub Actions push on `main`. The coverage
-badge is a local snapshot from October 27, 2026: **1227 tests passed, 92.35%
-statement coverage**, on macOS with Python 3.11.13 / NumPy 2.2.6. Refresh it after
-a measured change; it is not a live coverage feed. The separated core wheel also
-passed all 1227 tests outside the checkout. Workflow/render tests now run in the
-CLI repository; see its
-[separation verification](https://github.com/LimeGS/winding-field-cli/blob/main/docs/verification/core-cli-separation.md).
+badge is a local snapshot from October 28, 2026: **976 tests passed, one optional
+codec test skipped, 93.22% statement coverage**, on macOS with Python 3.11.13 /
+NumPy 2.4.6. Refresh it after a measured change; it is not a live coverage feed.
+With the optional codec installed, the core wheel passed **977 tests** outside
+the checkout, with no CLI or image libraries installed. Surface/export/render
+tests now run in the CLI repository; see its
+[migration verification](https://github.com/LimeGS/winding-field-cli/blob/main/docs/verification/cli-surface-tools.md).
 
 ## Data and contribution
 

@@ -11,10 +11,10 @@ The evaluator needs Python 3.11/3.12, NumPy, SciPy and tifffile. For an evaluati
 only environment, `python -m pip install numpy scipy tifffile` is sufficient;
 installing the winding library and its Torch dependency is unnecessary.
 
-For a complete first run with pictures, install Matplotlib too and run:
+For a complete numerical first run:
 
 ```bash
-python -m pip install numpy scipy tifffile matplotlib
+python -m pip install numpy scipy tifffile
 python examples/benchmark_demo.py --output /tmp/winding-benchmark-demo
 ```
 
@@ -22,7 +22,7 @@ This creates all case inputs, a synthetic candidate and analytic separation
 checks. Its v2 case declares a synthetic frame and physical transform; it contains
 no real scan data or human annotations. The evaluator's `human` result key holds those synthetic
 separation checks in this demo. The generated `inputs/case.json` is a complete
-example of the case contract, and `evaluation/` contains scores and pictures.
+example of the case contract, and `evaluation/` contains scores and input/output hashes.
 
 Set `CASE`, `FIELD`, `METADATA` and `NEW_RUN` to your local case descriptor,
 candidate NPY, candidate sidecar and a **new** output directory:
@@ -119,65 +119,23 @@ of producers. Numerical success never certifies physical sheet identity.
 
 ## Optional CT/winding pictures
 
-A case may add this block (paths resolve relative to the case JSON):
+CT rendering lives in [winding-field-cli](https://github.com/LimeGS/winding-field-cli/blob/main/docs/SURFACE_TOOLS.md).
+The core evaluator ignores the optional `visualization` block, including during
+`--check-only`; unavailable CT archives do not prevent numerical scoring.
 
-```json
-{
-  "visualization": {
-    "schema": "ct-winding-overlays-v2",
-    "archive_manifest": {
-      "path": "ct-archive/MANIFEST.json",
-      "sha256": "<SHA-256 of the frozen archive manifest>"
-    },
-    "reference_key": "coarse",
-    "reference_label": "Reference field"
-  }
-}
+With the CLI and its `plot` extra installed, render the same saved candidate to
+a separate new output directory:
+
+```bash
+winding-field ct-visuals --case "$CASE" --field "$FIELD" \
+  --metadata "$METADATA" --output "$NEW_VIEWS"
 ```
 
-Install Matplotlib (`python -m pip install matplotlib`, or the library's `plot`
-extra). The normal evaluation command then also writes:
+The CLI guide documents the unchanged frozen CT archive contract, support masks,
+visual preflight and image manifests. Numerical scores remain in the benchmark
+output; images and their receipts belong to the CLI output.
 
-- `ct-winding.png`: matched XY/XZ/YZ overview.
-- `ct-winding-XY.png`, `ct-winding-XZ.png`, `ct-winding-YZ.png`: individual views.
-- `ct-winding-samples.npz`: original CT, freshly sampled candidate winding values,
-  valid masks and optional frozen reference samples, keyed by plane name.
-- `VISUALS.json`: image provenance, coordinates, display settings and coverage.
-
-These files are included in the run manifest and linked from `SUMMARY.json`.
-`--check-only` verifies the visual inputs/dependency without generating images.
-Omit `reference_key` for two columns (CT + candidate). With it, the middle column
-uses the frozen reference samples and the final column uses the **current field**.
-
-V2 consumes a hash-bound `RECEIPT.json` and ordered `XY-samples.npz`,
-`XZ-samples.npz`, `YZ-samples.npz`. Each NPZ supplies finite numeric `ct`, including
-uint8/uint16 or floating-point arrays. A selected reference key additionally
-needs matching values and a `<key>_valid` mask.
-
-The receipt declares matching `frame`, `step`, `voxel_um`, world `origin_xyz`,
-integer pixel counts `size_xyz`, positive world `spacing_xyz`, `ct_window`,
-consecutive integer `contour_levels`, `field_sha256`, `input_ct` and `ct_url`.
-Each plane declares its `name`, `fixed_axis_xyz`, `fixed_position_world` and
-`ct_pixels`. Positions must identify actual slices of that grid. Physical pixel
-sizes and plot axes follow the declared XYZ spacing, not a named scan or mip.
-All identities/geometries are checked before scoring. CT is read locally from
-the archive; evaluation does not download or infer it.
-
-Legacy `ct-winding-overlays-v1` archives with `fixed_position_l2` remain readable.
-When they omit spacing, their declared mip/native-scale relationship must imply
-unit world sampling. Nonunit sampling needs explicit `spacing_xyz`; the reader
-does not guess a conversion from a scan name.
-
-Views use the inherited gauge and fixed `phi / step` levels; there is no alignment
-or contrast/range fitting per candidate. Unsupported samples stay missing.
-Fully unsupported or out-of-range views are labeled, with counts in `VISUALS.json`.
-A supported view without integer-level crossings can have no contour lines;
-inspect its stored value range and coverage. Visual
-sampling uses physical support without the numerical table's outer-node margin.
-The pictures are visual QC evidence, not a certificate of physical sheet identity.
-Real CT archives and generated CT images remain outside this public checkout.
-Synthetic CT archives set `synthetic: true` in their receipt so their panels and
-figure title are explicitly labeled synthetic rather than original scan data.
+## Numerical comparison
 
 The independent NumPy sampler checks coverage and raw values against SciPy. The
 comparison permits `2e-5` absolute error plus half an output-dtype ULP for SciPy's
@@ -190,7 +148,6 @@ that hides this trade-off.
 
 - `metrics.py`: deterministic pair sampling, support-aware evaluation and summaries.
 - `interpolation.py`: independent NumPy interpolation verification.
-- `ct_visuals.py`: frozen CT views and candidate contour rendering.
 - `test_*.py`: synthetic regressions for the public evaluator.
 
 The evaluator reuses solver-free helpers in `src/` (`common`, `patch_check`,

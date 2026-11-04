@@ -63,6 +63,18 @@ def test_hundred_thousand_samples_without_dense_enumeration(monkeypatch):
     assert len(i) == 8 and np.all(i < j)
 
 
+def test_empty_and_overflow_population_before_allocation():
+    i, j = pipeline._sample_arclength_pairs(np.empty(0), 0)
+    assert i.dtype == j.dtype == np.int64 and not len(i)
+
+    class TooLarge:
+        def __len__(self):
+            return 2**33
+
+    with pytest.raises(OverflowError, match="int64"):
+        pipeline._sample_arclength_pairs(TooLarge(), 0)
+
+
 def test_compile_exact_integration_with_multirun_and_backtracking(monkeypatch):
     fibres = [
         dict(

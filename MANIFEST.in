@@ -1,1 +1,2 @@
 include tests/prefetch_fixtures.py
+recursive-include benchmarks/performance *.py *.md

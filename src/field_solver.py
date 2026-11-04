@@ -1,6 +1,7 @@
 """Matrix-free weighted gradient/fibre least squares on a nonperiodic ZYX grid."""
 
 import math
+import sys
 import time
 from functools import partial
 from typing import Any, Literal, overload
@@ -108,6 +109,34 @@ class PreparedField:
 
     def __init__(self) -> None:
         self.signature: tuple[Any, ...] | None = None
+
+    @property
+    def retained_bytes(self) -> int:
+        """Conservative CPU + device storage, including full backing allocations.
+
+        Shared buffers may be counted twice. This bounds retained workspace data,
+        not allocator reservation or transient solve/assembly memory.
+        """
+
+        def size(value):
+            overhead = sys.getsizeof(value)
+            if isinstance(value, torch.Tensor):
+                if value.layout == torch.sparse_coo:
+                    return overhead + size(value._indices()) + size(value._values())
+                if value.layout == torch.sparse_csr:
+                    return overhead + size(value.crow_indices()) + size(value.col_indices()) + size(value.values())
+                return overhead + value.untyped_storage().nbytes()
+            if isinstance(value, np.ndarray):
+                return overhead + (size(value.base) if value.base is not None else value.nbytes)
+            if isinstance(value, dict):
+                return overhead + sum(size(k) + size(v) for k, v in value.items())
+            if isinstance(value, (tuple, list)):
+                return overhead + sum(map(size, value))
+            if hasattr(value, "__dict__"):
+                return overhead + size(vars(value))
+            return overhead
+
+        return int(size(self))
 
     def bind(self, target, weights, spacing, constraints):
         arrays = () if constraints is None else constraints._structural_arrays()

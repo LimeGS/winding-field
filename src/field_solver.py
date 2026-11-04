@@ -400,8 +400,10 @@ def solve_field(
     rz = float(torch.dot(r.view(-1), z.view(-1)))
     iterations = 0
     reason = "maxiter"
+    norm = None
     for _ in range(maxiter):
-        norm = _norm(r)
+        if norm is None:
+            norm = _norm(r)
         if not math.isfinite(norm):
             reason = "nonfinite_residual"
             break
@@ -420,9 +422,11 @@ def solve_field(
         r.add_(ap, alpha=-alpha)
         iterations += 1
         # Recurrence residuals drift in float32: verify, and restart if needed.
-        restart = _norm(r) <= rtol * scale
+        norm = _norm(r)
+        restart = norm <= rtol * scale
         if restart:
             r = b - matvec(x)
+            norm = None
         z = r * inverse
         next_rz = float(torch.dot(r.view(-1), z.view(-1)))
         if restart:

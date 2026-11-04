@@ -18,7 +18,7 @@ the throughput harness and its test. Changes are integrated in this order:
   ranks using subtraction-preserving vectorized binary search and int64 prefixes.
   Test dense-oracle exact parity, boundary floats, multiple runs and 100k stress;
   measure 800/2000/4000 samples. Leave whole_reference unchanged.
-- [ ] P2 `field_solver`: retain residual norm between iterations, invalidate
+- [x] P2 `field_solver`: retain residual norm between iterations, invalidate
   on true-residual restart. Test iteration/failure parity and norm call counts.
 - [ ] P3 `block_solver`, `field_solver`: explicit `prepared_cache_bytes=0`,
   stable admission, conservative retained-storage accounting and live rebind.
@@ -86,3 +86,18 @@ Initial five-repeat selector microbenchmarks (CPU; median / IQR milliseconds):
 
 These are selector-only exploratory timings, not pipeline speedups. The final
 harness records full source/environment/input metadata and raw repeated samples.
+
+## P2: residual-norm reuse
+
+Only the redundant reduction is removed. A restart invalidates the cached norm;
+the refresh still occurs at the next loop entry, preserving maxiter/failure order.
+The final independent true-residual reduction and float64 norm accumulation stay.
+RED: three work-count tests failed (12 rather than 8/9 norm evaluations). GREEN:
+115 solver/constraint/performance tests passed, including 0/1 iterations, a forced
+restart, both dtypes and an independently assembled final residual.
+
+Exploratory seeded 16³ float64 CPU solve, one thread, rtol=1e-8, five warm
+repetitions: baseline median 13.115 ms (IQR 0.850), candidate 12.696 ms
+(IQR 0.115). Both take 159 iterations, residual 9.543514691238635e-9 and exactly
+equal fields. This small timing difference alone is not a pipeline speedup;
+the deterministic reduction-count test establishes the avoided work.

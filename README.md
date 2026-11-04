@@ -263,6 +263,14 @@ controls remain explicit; missing human references are reported as not evaluated
 
 ## Checks
 
+For opt-in throughput measurements (distinct from the scientific quality
+benchmark), see [result-preserving performance](docs/PERFORMANCE_V2.md).
+`solve_blocks(..., prepared_cache_bytes=0)` keeps the historical default: no
+prepared workspace retention between visits. A positive byte budget admits a
+stable subset of workspaces; observation receipts, static snapshots and live
+boundary/constraint targets are still validated on every visit. The budget is
+operational and may change on resume; it is separate from `BlockStore` cache.
+
 ```bash
 python -m pytest -q --cov=src --cov-report=term-missing
 ruff format --check .

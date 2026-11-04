@@ -81,6 +81,31 @@ def match_trace(constraints, target_trace):
     )
 
 
+def _sample_arclength_pairs(s, fid):
+    """Sample at most eight row-major eligible pairs using O(m) auxiliary space."""
+    m = len(s)
+    if m * (m - 1) // 2 > np.iinfo(np.int64).max:
+        raise OverflowError("pair population exceeds int64")
+    if m < 2:
+        return np.empty(0, np.int64), np.empty(0, np.int64)
+    rows = np.arange(m - 1, dtype=np.int64)
+    low, high = rows + 1, np.full(m - 1, m, np.int64)
+    tau = min(0.3, s[-1])
+    # Search the original subtraction predicate: adding tau changes boundary rounding.
+    while np.any(low < high):
+        active = low < high
+        mid = low + (high - low) // 2
+        eligible = (mid < m) & (s[np.minimum(mid, m - 1)] - s[rows] >= tau)
+        high = np.where(active & eligible, mid, high)
+        low = np.where(active & ~eligible, mid + 1, low)
+    ends = np.cumsum(m - low, dtype=np.int64)
+    n = int(ends[-1])
+    ranks = np.sort(np.random.default_rng(int(fid)).choice(n, 8, replace=False)) if n > 8 else np.arange(n)
+    i = np.searchsorted(ends, ranks, side="right")
+    before = np.where(i > 0, ends[np.maximum(i - 1, 0)], 0)
+    return i, low[i] + ranks - before
+
+
 def compile_fibres(
     fibres, origin, spacing, shape, *, voxel_mm, pitch_mm=0.15, support=None, chart_volume=None, pair_weight=0.1
 ):
@@ -126,13 +151,10 @@ def compile_fibres(
                 segments += 1
                 used = True
                 s = arclength(points, voxel_mm)
-                i, j = np.triu_indices(len(points), 1)
-                eligible = np.flatnonzero(s[j] - s[i] >= min(0.3, s[-1]))
-                if len(eligible):
-                    if len(eligible) > 8:
-                        eligible = np.sort(np.random.default_rng(int(fid)).choice(eligible, 8, replace=False))
-                    a.append(points[i[eligible]])
-                    b.append(points[j[eligible]])
+                i, j = _sample_arclength_pairs(s, fid)
+                if len(i):
+                    a.append(points[i])
+                    b.append(points[j])
         if used:
             kept.append(int(fid))
     if not samples or not a:

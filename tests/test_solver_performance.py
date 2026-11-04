@@ -177,3 +177,44 @@ def test_default_solver_preserves_legacy_operator_device_only_protocol():
     field, receipt = solver.solve_field(target, np.ones((1, 1, 3)), constraints=rows, rtol=1e-6)
     assert receipt["converged"]
     np.testing.assert_allclose(field.ravel(), [0.0, 1 / 7, 2 / 7], atol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("maxiter", [0, 1, 5])
+def test_pcg_norm_reuse_and_independent_final_residual(monkeypatch, dtype, maxiter):
+    target, weights = observations(getattr(torch, dtype))
+    calls = []
+    original = solver._norm
+
+    def counted(value):
+        calls.append(value.clone())
+        return original(value)
+
+    monkeypatch.setattr(solver, "_norm", counted)
+    field, info = solver.solve_field(target, weights, dtype=dtype, maxiter=maxiter, rtol=1e-12)
+    assert info["iterations"] == maxiter
+    assert len(calls) == (2 if maxiter == 0 else maxiter + 3)
+    operator = solver._FieldOperator(weights, None, 0)
+    rhs = operator.rhs(target, [1, 1, 1])
+    rhs[0, 0, 0] = 0
+    residual = rhs - operator.matvec(torch.from_numpy(field))
+    residual[0, 0, 0] = 0
+    np.testing.assert_array_equal(calls[-1], residual)
+    assert info["relative_residual"] == original(residual) / original(rhs)
+
+
+def test_restart_invalidates_cached_norm(monkeypatch):
+    target, weights = observations(torch.float64)
+    original = solver._norm
+    calls = 0
+
+    def premature_recurrence(value):
+        nonlocal calls
+        calls += 1
+        # Force a recurrence-only convergence indication after the first update.
+        return 0.0 if calls == 3 else original(value)
+
+    monkeypatch.setattr(solver, "_norm", premature_recurrence)
+    _, info = solver.solve_field(target, weights, dtype="float64", maxiter=5, rtol=1e-12)
+    assert info["iterations"] == 5 and not info["converged"]
+    assert calls == 9  # RHS, initial, five updates, one restart refresh, final.

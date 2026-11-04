@@ -142,3 +142,92 @@ def test_concentric_curved_layers_preserve_radial_separation():
     separation = field[1, 8, 11] - field[1, 8, 13]
     assert 1.6 < separation < 2.4
     assert abs(field[1, 11, 12] - field[1, 8, 13]) < 0.8  # Same radius5, different angle.
+
+
+@pytest.mark.parametrize("budget", [0, 1, 120_000, 150_000, 1_000_000])
+def test_partial_stencil_admission_is_stable_and_exact(budget, monkeypatch):
+    m = impl()
+    n, seeds = plane_case()
+    expected, reference = m.solve_arrival(n, [1] * 3, seeds, chunk=40, maxiter=4, max_cache_bytes=0)
+    calls = 0
+    original = m.point_stencils
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(m, "point_stencils", counted)
+    actual, info = m.solve_arrival(n, [1] * 3, seeds, chunk=40, maxiter=4, max_cache_bytes=budget)
+    np.testing.assert_array_equal(actual, expected)
+    for key in (
+        "converged",
+        "iterations",
+        "bellman_update_residual",
+        "known_nodes",
+        "unreachable_nodes",
+        "unknown_nodes",
+        "chart_offsets",
+        "transitions",
+    ):
+        assert info[key] == reference[key]
+    # Each node retains 32 rays * (8 int32 + 8 float32 + bool + 2 float64) + int64 id.
+    block_bytes = [40 * 2600, 40 * 2600, 25 * 2600]
+    retained = []
+    used = 0
+    for size in block_bytes:
+        if used + size <= budget:
+            retained.append(size)
+            used += size
+    count = len(retained)
+    builds = 3 + (3 - count) * (info["iterations"] - 1)
+    assert info["stencil_cache_bytes"] == used <= budget
+    assert info["stencil_cache_blocks"] == count
+    assert info["stencil_cache_hits"] == count * (info["iterations"] - 1)
+    assert info["stencil_rebuilds"] == builds
+    assert calls == builds * 32 * 5  # no speculative prepass before the first iteration
+    assert info["stencil_cache_mode"] == ("none" if count == 0 else "full" if count == 3 else "partial")
+
+
+def test_small_last_stencil_block_is_admitted_after_a_larger_miss():
+    m = impl()
+    n, seeds = plane_case()
+    _, info = m.solve_arrival(n, [1] * 3, seeds, chunk=40, maxiter=3, max_cache_bytes=70_000)
+    assert info["stencil_cache_blocks"] == 1
+    assert info["stencil_cache_bytes"] == 25 * 2600
+    assert info["stencil_cache_hits"] == 2
+
+
+@pytest.mark.parametrize("kind", ["wall", "cut", "offset", "oblique", "opposite"])
+def test_partial_cache_preserves_support_chart_and_director_contracts(kind):
+    m = impl()
+    n, seeds = plane_case()
+    kwargs = dict(chunk=40, maxiter=100)
+    if kind == "wall":
+        support = np.ones(seeds.shape, bool)
+        support[:, :, 3] = False
+        kwargs["support"] = support
+    elif kind in ("cut", "offset"):
+        charts = np.zeros(seeds.shape, int)
+        charts[:, :, 3:] = 1
+        kwargs["charts"] = charts
+        if kind == "offset":
+            kwargs["transitions"] = [(0, 1, 1)]
+    elif kind == "oblique":
+        n[:] = [0.3, 0.4, np.sqrt(0.75)]
+    else:
+        n *= -1
+    expected, reference = m.solve_arrival(n, [1, 1.3, 0.8], seeds, max_cache_bytes=0, **kwargs)
+    for budget in (70_000, 1_000_000):
+        actual, info = m.solve_arrival(n, [1, 1.3, 0.8], seeds, max_cache_bytes=budget, **kwargs)
+        np.testing.assert_array_equal(actual, expected)
+        for name in (
+            "iterations",
+            "converged",
+            "bellman_update_residual",
+            "known_nodes",
+            "unknown_nodes",
+            "unreachable_nodes",
+            "chart_offsets",
+        ):
+            assert info[name] == reference[name]

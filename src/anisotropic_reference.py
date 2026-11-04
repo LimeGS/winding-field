@@ -150,24 +150,27 @@ def solve_arrival(
             stencils.append((nodes.astype(np.int32), coeff.astype(np.float32), good, costs, 1 - self_coeff))
         return block, stencils
 
-    blocks = []
+    blocks = {}
     cache_bytes = 0
-    for start in range(0, len(ids), chunk):
-        block, stencils = make_block(start)
-        size = block.nbytes + sum(a.nbytes for row in stencils for a in row)
-        if cache_bytes + size > max_cache_bytes:
-            blocks = None
-            cache_bytes = 0
-            break
-        blocks.append((block, stencils))
-        cache_bytes += size
+    cache_hits = rebuilds = 0
+    total_blocks = (len(ids) + chunk - 1) // chunk
     stable = False
     residual = None
     for iteration in range(maxiter):
         old = field
         updated = field.copy()
-        stream = blocks if blocks is not None else (make_block(start) for start in range(0, len(ids), chunk))
-        for block, stencils in stream:
+        for start in range(0, len(ids), chunk):
+            if start in blocks:
+                block, stencils = blocks[start]
+                cache_hits += 1
+            else:
+                block, stencils = make_block(start)
+                rebuilds += 1
+                if iteration == 0:
+                    size = block.nbytes + sum(a.nbytes for row in stencils for a in row)
+                    if cache_bytes + size <= max_cache_bytes:
+                        blocks[start] = block, stencils
+                        cache_bytes += size
             best = old[block].copy()
             for nodes, coeff, good, costs, denominator in stencils:
                 values = old[nodes]
@@ -203,7 +206,11 @@ def solve_arrival(
         transitions=[list(v) for v in transitions],
         elapsed_s=time.time() - started,
         stencil_cache_bytes=cache_bytes,
-        stencils_rebuilt_per_iteration=blocks is None,
+        stencils_rebuilt_per_iteration=len(blocks) < total_blocks,
+        stencil_cache_mode="none" if not blocks else "full" if len(blocks) == total_blocks else "partial",
+        stencil_cache_blocks=len(blocks),
+        stencil_cache_hits=cache_hits,
+        stencil_rebuilds=rebuilds,
         discretization="metric-integrated positive trilinear rays plus grid axes, self-coefficient eliminated",
         limitation="Finite-stencil reference and explicit chart hypotheses, not topology or lamina certification.",
     )

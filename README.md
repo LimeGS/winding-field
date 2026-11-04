@@ -1,7 +1,7 @@
 # Winding fields and reproducible evaluation
 
 [![Audit](https://github.com/LimeGS/winding-field/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/LimeGS/winding-field/actions/workflows/ci.yml)
-[![Coverage (local): 92.35%](https://img.shields.io/badge/coverage%20%28local%29-92.35%25-brightgreen)](#checks)
+[![Coverage (local): 92.54%](https://img.shields.io/badge/coverage%20%28local%29-92.54%25-brightgreen)](#checks)
 [![Code license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 Experimental software for constructing continuous winding-coordinate fields over
@@ -263,6 +263,14 @@ controls remain explicit; missing human references are reported as not evaluated
 
 ## Checks
 
+For opt-in throughput measurements (distinct from the scientific quality
+benchmark), see [result-preserving performance](docs/PERFORMANCE_V2.md).
+`solve_blocks(..., prepared_cache_bytes=0)` keeps the historical default: no
+prepared workspace retention between visits. A positive byte budget admits a
+stable subset of workspaces; observation receipts, static snapshots and live
+boundary/constraint targets are still validated on every visit. The budget is
+operational and may change on resume; it is separate from `BlockStore` cache.
+
 ```bash
 python -m pytest -q --cov=src --cov-report=term-missing
 ruff format --check .
@@ -275,10 +283,10 @@ annotated functions and a typed solver caller; unannotated research-function
 bodies and array shapes/ranges still rely on runtime checks and tests.
 
 The Audit badge reports the latest GitHub Actions push on `main`. The coverage
-badge is a local snapshot from October 27, 2026: **1227 tests passed, 92.35%
+badge is a local snapshot from November 4, 2026: **1297 tests passed, 92.54%
 statement coverage**, on macOS with Python 3.11.13 / NumPy 2.2.6. Refresh it after
-a measured change; it is not a live coverage feed. The separated core wheel also
-passed all 1227 tests outside the checkout. Workflow/render tests now run in the
+a measured change; it is not a live coverage feed. The October 27 separated core
+wheel passed its then-current 1227 tests outside the checkout. Workflow/render tests now run in the
 CLI repository; see its
 [separation verification](https://github.com/LimeGS/winding-field-cli/blob/main/docs/verification/core-cli-separation.md).
 

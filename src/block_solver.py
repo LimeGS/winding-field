@@ -19,7 +19,7 @@ from constraint_templates import StencilConstraints
 from field_constraints import QuadraticConstraints
 from field_prefetch import ObservationPrefetch
 from field_runtime import ResourceUnavailable, check_resources
-from field_solver import solve_field
+from field_solver import PreparedField, solve_field
 from field_store import BlockStore, atomic_json
 
 
@@ -111,6 +111,7 @@ def solve_blocks(
     dtype: Literal["float32", "float64"] = "float64",
     device: str = "cpu",
     cache_bytes: int = 0,
+    prepared_cache_bytes: int = 0,
     read_workers: int = 1,
     max_bytes: int | None = None,
     reserve_bytes: int = 0,
@@ -141,8 +142,32 @@ def solve_blocks(
     Large fibre archives can supply ``constraints(lo, hi, read_nodes)`` selecting
     complete groups per block. Pin that provider/geometry in ``identity``; it must
     return local QuadraticConstraints and read current exterior values each time.
+
+    ``prepared_cache_bytes`` independently budgets static solver workspaces (CPU
+    plus device storage). Zero disables retention; first-fit admission keeps a
+    stable subset across sweeps. Callable constraints bypass this cache. Live
+    observations/receipts, exterior targets and fixed values are checked each
+    visit. Workspaces are released on exit and never checkpointed; this budget
+    may change on resume. It is not a peak-memory or allocator-reservation bound.
+    A hit avoids gradient-operator/diagonal construction, constraint-operator
+    construction/device transfer and gradient-RHS assembly. Restriction still
+    runs every visit under StencilConstraints' independent template-cache policy;
+    local rows/diagonals may be rebuilt, and live constraint RHS and fixed-node
+    elimination always run anew. No restriction rows/templates are retained here.
     """
+    prepared_cache: dict[tuple[int, ...], PreparedField] = {}
+    prepared = None
+    prepared_stats = dict(budget=0, retained_bytes=0, entries=0, peak_bytes=0, peak_entries=0, hits=0, builds=0)
+
+    def release_prepared():
+        nonlocal prepared
+        prepared_cache.clear()
+        prepared = None
+        prepared_stats.update(retained_bytes=0, entries=0)
+
     try:
+        prepared_cache_bytes = _integer(prepared_cache_bytes)
+        prepared_stats["budget"] = prepared_cache_bytes
         shape = tuple(_integer(n, 2) for n in shape)
         if len(shape) != 3 or math.prod(shape) > np.iinfo(np.intp).max:
             raise ValueError("invalid ZYX run shape")
@@ -245,6 +270,8 @@ def solve_blocks(
                 raise ValueError("invalid persisted source receipts")
 
             def emit(status, **extra):
+                if status != "RUNNING":
+                    release_prepared()
                 result = dict(
                     status=status,
                     pid=os.getpid(),
@@ -259,6 +286,7 @@ def solve_blocks(
                     stored_local_residual=None,
                     stored_bytes=stored_bytes,
                     cache_stats=dict(store.stats),
+                    prepared_cache_stats=dict(prepared_stats),
                     prefetched_blocks=prefetched,
                     prefetch_parity=parity,
                     elapsed_s=time.perf_counter() - started,
@@ -359,6 +387,16 @@ def solve_blocks(
                             return emit("CHECKPOINTED_STOP")
                         admitted()
                         emit("RUNNING", phase="solving", active_sweep=sweep, active_block=block)
+                        prepared_key = tuple(map(int, (*lo, *hi)))
+                        prepared = prepared_cache.get(prepared_key)
+                        if prepared is not None:
+                            prepared_stats["hits"] += 1
+                        else:
+                            prepared_stats["builds"] += 1
+                            if prepared_cache_bytes and (
+                                constraints is None or isinstance(constraints, StencilConstraints)
+                            ):
+                                prepared = PreparedField()
                         result, solver = solve_field(
                             target,
                             weights,
@@ -371,7 +409,17 @@ def solve_blocks(
                             rtol=rtol,
                             maxiter=maxiter,
                             return_tensor=True,
+                            prepared=prepared,
                         )
+                        if prepared is not None and prepared_key not in prepared_cache:
+                            retained = prepared.retained_bytes + 4096  # Bounds key and cache-container overhead.
+                            if retained <= prepared_cache_bytes - prepared_stats["retained_bytes"]:
+                                prepared_cache[prepared_key] = prepared
+                                prepared_stats["retained_bytes"] += retained
+                                prepared_stats["entries"] = len(prepared_cache)
+                                prepared_stats["peak_bytes"] = prepared_stats["retained_bytes"]
+                                prepared_stats["peak_entries"] = len(prepared_cache)
+                        prepared = None
                         if not solver["converged"]:
                             raise RuntimeError("conditional block did not converge")
                         owned = tuple(slice(int(a), int(b)) for a, b in zip(low - lo, high - lo))
@@ -423,5 +471,6 @@ def solve_blocks(
                 emit("RESOURCE_UNAVAILABLE" if isinstance(error, ResourceUnavailable) else "FAILED", error=str(error))
                 raise
     finally:
+        release_prepared()
         if prefetch is not None:
             prefetch.close()

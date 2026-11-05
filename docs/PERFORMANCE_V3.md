@@ -231,12 +231,30 @@ Validation executed locally:
   harness checks also passed after tightening provenance/metadata assertions.
 - Core Ruff format/lint and mypy passed; wheel and sdist built. Packaging and
   paired CLI integration are checked with the matching `1.3.0.dev2` package.
+  Both installed wheel and rebuilt-sdist minimal examples passed, as did wheel
+  inventory checks and the offline demo (6/6 fibre pairs, 3/3 separation, 0/3
+  collapse controls).
+- Installed CLI full suite: **1396 passed, 10 skipped in 425.79 s**, without
+  exclusions and with `-o pythonpath=`. Installed core and CLI module paths were
+  asserted inside the test environment, not the source checkout. This additional
+  functional environment uses NumPy 2.4.6, SciPy 1.17.1 and Torch 2.15.0; it is
+  **not** the performance-table environment. Skips are external real/control
+  fixtures or Linux/CUDA-specific checks; names are saved in `cli-skipped.txt`.
+- Final matching-wheel `pip check` passed. After updating packaged core provenance,
+  **89 dependency/field/workflow/example tests passed**. Installed examples
+  demonstrated STOP/resume, cold preparation on resume, exact synthetic field
+  error below 1.6e-13, effective threads=1, and zero retained workspaces on exit.
+  Supervised prepared build and resume also passed from outside the checkout.
 - Storage review found and fixed full-chunk Fortran flattening; regressions fail
   before the fix and pass after it. Block review removed an extra pre-lease
   manifest read rather than weakening locked identity validation.
-- CLI baseline has 89 existing lint findings and seven unformatted files; exact
-  diagnostic comparison found no additions. Those unrelated failures are retained
-  and are not described as a clean lint/format gate.
+- CLI-wide Ruff reports 1641 findings and 130 files needing format under the
+  available user Ruff configuration (the CLI has no project Ruff configuration).
+  The seven touched Python files account for 89 findings and seven format failures;
+  exact baseline diagnostic comparison found no additions in those files. Other
+  Python files are unchanged. These gates are **not clean**; unrelated cleanup
+  was not folded into this performance change. Scoped mypy passes for the four
+  changed production modules.
 
 No CUDA/MPS execution, real-scroll run, remote CI, push, merge or publication is
 part of this local delivery. The non-CPU consensus path remains compatible; CPU

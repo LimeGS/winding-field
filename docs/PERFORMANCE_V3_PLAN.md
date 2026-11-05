@@ -15,7 +15,7 @@ Original CLI dirty checkout, core stash and Lean branch/cache are preserved.
 - [x] CLI worker: isolated CLI config/forwarding/docs/integration tests.
 - [x] Integrator: block_solver nonadmission/STATUS/anchor telemetry and tests.
 - [x] Integrator: balanced baseline/A/spectral/combined and template/I/O benchmarks.
-- [ ] Independent review, complete repository gates, docs and local commits.
+- [x] Independent review, complete repository gates, docs and local commits.
 
 Workers own disjoint files and do not commit or benchmark concurrently. Parent
 owns benchmarks/performance and this ledger. Tests may run during implementation;
@@ -50,5 +50,8 @@ Dense cross-block group indexing loses (~39%) and remains optional/off by defaul
 Core coverage: 1442 passed, 92.78%; final focused v3 gate: 147 passed.
 Core format/lint/mypy pass. Wheel/sdist inventory and installed minimal examples
 pass; offline benchmark demo passes. Matching core/CLI dev2 wheels installed and
-`pip check` passes. CLI installed full-suite gate is tracked in the final guide.
-CLI retains exactly its baseline 89 lint findings and seven unformatted files.
+`pip check` passes. CLI installed full suite: 1396 passed / 10 skipped; final
+packaged-provenance integration gate: 89 passed. Details are in the final guide.
+CLI touched files retain their baseline 89 lint findings and seven format failures;
+the full-tree checks report 1641 lint findings / 130 unformatted files under the
+available user configuration. No unrelated source files were reformatted.

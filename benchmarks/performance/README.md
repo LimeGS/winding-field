@@ -46,3 +46,10 @@ The harness disables CUDA for children and does not measure concurrent prefetch.
 Do not sum overlapping stages or extrapolate these cases to full-scroll results.
 See [the implementation report](../../docs/PERFORMANCE_V2.md) for measured results,
 counterexamples, cache limits and unchanged numerical/artifact contracts.
+# Solver v3 balanced benchmark
+
+For consensus indices, spectral PCG, templates/gathers and durable I/O, use
+`v3.py` and [the v3 guide](../../docs/PERFORMANCE_V3.md). It freezes both sources
+and the executed harness, balances variants, excludes validation/hashing from
+timed regions, and records separate diagnostics. Earlier v2 evidence below uses
+the original harness and must not be pooled with these samples.

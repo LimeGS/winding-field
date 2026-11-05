@@ -220,11 +220,26 @@ class _QuadraticOperator:
         self.use = self.groups >= 0
         self.sum = tensor(c.group_sum)
         self.diagonal = tensor(c.diagonal)
+        self.active_rows = None
+        if self.w.device.type == "cpu":
+            self.active_rows = torch.nonzero(self.use, as_tuple=True)[0]
+            self.active_groups = self.groups.index_select(0, self.active_rows)
+            self.active_weights = self.w.index_select(0, self.active_rows)
+            self.denominator = self.sum.clamp_min(torch.finfo(self.w.dtype).tiny)
 
     def center_weight(self, r):
         v = self.w * r
         if len(self.sum):
             total = torch.zeros_like(self.sum)
+            if self.active_rows is not None:
+                active = v.index_select(0, self.active_rows)
+                total.index_add_(0, self.active_groups, active)
+                mean = total / self.denominator
+                # v owns its storage; preserve the legacy multiply/subtract order.
+                v.index_copy_(
+                    0, self.active_rows, active - self.active_weights * mean.index_select(0, self.active_groups)
+                )
+                return v
             total.index_add_(0, self.groups[self.use], v[self.use])
             mean = total / self.sum.clamp_min(torch.finfo(self.w.dtype).tiny)
             v = v.clone()

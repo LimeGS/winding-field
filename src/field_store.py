@@ -32,6 +32,7 @@ from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from copy import deepcopy
+from dataclasses import dataclass
 from numbers import Integral
 from pathlib import Path
 from threading import Lock, RLock
@@ -43,6 +44,27 @@ from numpy.typing import ArrayLike, NDArray
 
 _Key = tuple[int, int, int]
 _Chunk = tuple[NDArray[np.float32], float, NDArray[np.uint8]]
+
+
+@dataclass(frozen=True)
+class NodeReadPlan:
+    """Immutable chunk-local gather geometry, with no field values or generations.
+
+    Created by ``BlockStore.prepare_nodes``; reusable with the same grid/chunk
+    geometry. ``nbytes`` conservatively includes array owners and metadata.
+    """
+
+    shape: _Key
+    chunk: int
+    result_shape: tuple[int, ...]
+    keys: tuple[_Key, ...]
+    starts: NDArray[np.int64]
+    order: NDArray[np.int64]
+    local: NDArray[np.int64]
+
+    @property
+    def nbytes(self) -> int:
+        return self.starts.nbytes + self.order.nbytes + self.local.nbytes + 1024 + 256 * len(self.keys)
 
 
 class StorageBudgetError(RuntimeError):
@@ -116,8 +138,11 @@ def atomic_json(path: str | os.PathLike[str], value: Any) -> None:
     replace may mean publication happened: callers must stop and inspect/reopen.
     Failed temporaries are left for inspection, never silently pruned.
     """
-    path = Path(path)
-    raw = _json_bytes(value)
+    _atomic_json_bytes(Path(path), _json_bytes(value))
+
+
+def _atomic_json_bytes(path: Path, raw: bytes) -> None:
+    """Publish bytes already serialized and validated by ``_json_bytes``."""
     if path.is_symlink():
         raise ValueError("JSON target cannot be a symlink")
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.pending")
@@ -372,9 +397,16 @@ class BlockStore:
                 self.stats["hits"] += 1
                 return self._cache[name]
         value = _decode(self._payload(record), self._shape(key))
-        charge = self._charge(value)
         with self._cache_lock:
             self.stats["loads"] += 1
+        self._retain(name, value)
+        return value
+
+    def _retain(self, name: str, value: _Chunk) -> None:
+        charge = self._charge(value)
+        with self._cache_lock:
+            if name in self._cache:
+                return
             if charge <= self.max_cache_bytes:
                 while self._cache_nbytes + charge > self.max_cache_bytes:
                     _, retired = self._cache.popitem(last=False)
@@ -383,7 +415,6 @@ class BlockStore:
                 self._cache[name] = value
                 self._cache_nbytes += charge
                 self.stats["peak_cache_bytes"] = max(self.stats["peak_cache_bytes"], self._cache_nbytes)
-        return value
 
     def _chunks(self, keys: Iterable[_Key]) -> Iterator[tuple[_Key, _Chunk | None]]:
         if self.workers == 1:
@@ -441,6 +472,10 @@ class BlockStore:
 
     def nodes(self, flat: ArrayLike) -> NDArray[np.float64]:
         """Read flat ZYX integer indices, preserving duplicates and input shape."""
+        return self.read_nodes_plan(self.prepare_nodes(flat))
+
+    def prepare_nodes(self, flat: ArrayLike) -> NodeReadPlan:
+        """Validate and snapshot node geometry once; the caller owns plan memory."""
         with self._operation:
             self._ensure_open()
             if not isinstance(flat, np.ndarray):
@@ -451,19 +486,31 @@ class BlockStore:
                 indices = indices.astype(np.int64)
             if indices.dtype.kind not in "iu" or (indices < 0).any() or (indices >= math.prod(self.shape)).any():
                 raise ValueError("node indices must be integers inside field")
-            result = np.zeros(indices.shape, np.float64)
-            if not indices.size:
-                return result
             coords = np.array(np.unravel_index(indices.astype(np.intp).ravel(), self.shape)).T
             grid_shape = tuple((n + self.chunk - 1) // self.chunk for n in self.shape)
             labels = np.ravel_multi_index(tuple((coords // self.chunk).T), grid_shape)
             order = np.argsort(labels, kind="stable")
-            groups = np.split(order, np.flatnonzero(np.diff(labels[order])) + 1)
-            keys = (_triple(np.unravel_index(labels[group[0]], grid_shape)) for group in groups)
-            for group, (_, value) in zip(groups, self._chunks(keys)):
+            starts = np.r_[0, np.flatnonzero(np.diff(labels[order])) + 1, len(order)]
+            if not indices.size:
+                starts = np.array([0], np.int64)
+            keys = tuple(_triple(np.unravel_index(labels[order[a]], grid_shape)) for a in starts[:-1])
+            local = np.empty(len(order), np.int64)
+            for key, a, b in zip(keys, starts[:-1], starts[1:]):
+                local[a:b] = np.ravel_multi_index(tuple((coords[order[a:b]] % self.chunk).T), self._shape(key))
+            arrays = tuple(np.frombuffer(a.astype(np.int64).tobytes(), dtype=np.int64) for a in (starts, order, local))
+            return NodeReadPlan(self.shape, self.chunk, indices.shape, keys, *arrays)
+
+    def read_nodes_plan(self, plan: NodeReadPlan) -> NDArray[np.float64]:
+        """Gather current generations using a plan returned by ``prepare_nodes``."""
+        with self._operation:
+            self._ensure_open()
+            if not isinstance(plan, NodeReadPlan) or plan.shape != self.shape or plan.chunk != self.chunk:
+                raise ValueError("node plan geometry differs")
+            result = np.zeros(plan.result_shape, np.float64)
+            for a, b, (_, value) in zip(plan.starts[:-1], plan.starts[1:], self._chunks(plan.keys)):
                 if value is not None:
                     delta, offset, _ = value
-                    result.ravel()[group] = delta[tuple((coords[group] % self.chunk).T)].astype(np.float64) + offset
+                    result.ravel()[plan.order[a:b]] = delta.flat[plan.local[a:b]].astype(np.float64) + offset
             return result
 
     def _admit(self, additional: int) -> None:
@@ -485,8 +532,9 @@ class BlockStore:
         return _json_load(_json_bytes(progress))
 
     def _publish(self, manifest: dict[str, Any], payload: tuple[str, bytes] | None = None) -> None:
-        self._admit(len(_json_bytes(manifest)) + (len(payload[1]) if payload else 0))
+        manifest_bytes = _json_bytes(manifest)
         try:
+            self._admit(len(manifest_bytes) + (len(payload[1]) if payload else 0))
             if payload is not None:
                 name, raw = payload
                 destination = self.root / name
@@ -496,9 +544,12 @@ class BlockStore:
                 _write_file(temporary, raw)
                 os.replace(temporary, destination)
                 _sync_directory(self.root)
-            atomic_json(self.root / "CHECKPOINT.json", manifest)
+            _atomic_json_bytes(self.root / "CHECKPOINT.json", manifest_bytes)
         except BaseException:
             self._poisoned = True
+            with self._cache_lock:
+                self._cache.clear()
+                self._cache_nbytes = 0
             raise
         self._manifest = manifest
 
@@ -536,6 +587,7 @@ class BlockStore:
             label = "-".join(map(str, key))
             old = next_manifest["chunks"].pop(label, None)
             payload = None
+            decoded = None
             error = 0.0
             if array.any() or observed is not None:
                 with np.errstate(over="ignore", invalid="ignore"):
@@ -548,7 +600,7 @@ class BlockStore:
                 stream = io.BytesIO()
                 np.savez_compressed(stream, delta=delta, offset=offset, observed=mask)
                 raw = stream.getvalue()
-                _decode(raw, shape)
+                decoded = _decode(raw, shape)
                 name = f"{label}.g{uuid.uuid4().hex}.npz"
                 next_manifest["chunks"][label] = dict(
                     path=name, sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw), quantization_max=error
@@ -559,6 +611,9 @@ class BlockStore:
                     self._payload(old)
                 except BaseException:
                     self._poisoned = True
+                    with self._cache_lock:
+                        self._cache.clear()
+                        self._cache_nbytes = 0
                     raise
             self._publish(next_manifest, payload)
             if old is not None:
@@ -573,6 +628,8 @@ class BlockStore:
                 except BaseException:
                     self._poisoned = True
                     raise
+            if payload is not None and decoded is not None:
+                self._retain(payload[0], decoded)
             # shortcut: interrupted/unreferenced generations require verified manual cleanup.
             return dict(quantization_max=error, stored_bytes=sum(v["bytes"] for v in self._manifest["chunks"].values()))
 

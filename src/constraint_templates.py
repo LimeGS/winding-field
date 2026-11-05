@@ -13,6 +13,7 @@ from numpy.typing import ArrayLike, NDArray
 from scipy.sparse import coo_matrix, csr_matrix
 
 from field_constraints import QuadraticConstraints
+from field_store import BlockStore
 from physical_grid import point_stencils
 
 
@@ -51,6 +52,7 @@ class _Template:
         self.matrix = csr_matrix((c.matrix.data, self.columns[c.matrix.indices], c.matrix.indptr), shape=matrix.shape)
         self.nodes, self.coeff, self.slots, self.width = outside_nodes, outside_coeff, outside_slots, width
         self.live = None
+        self.gather_plan = None
         arrays = (
             self.columns,
             outside_nodes,
@@ -72,7 +74,16 @@ class _Template:
     def restrict(self, read_nodes):
         terms = np.zeros((self.matrix.shape[0], self.width), np.float64)
         if self.nodes.size:
-            values = _real(read_nodes(self.nodes))
+            store = getattr(read_nodes, "__self__", None)
+            if (
+                self.gather_plan is not None
+                and getattr(read_nodes, "__func__", None) is BlockStore.nodes
+                and store.shape == self.gather_plan.shape
+                and store.chunk == self.gather_plan.chunk
+            ):
+                values = _real(store.read_nodes_plan(self.gather_plan))
+            else:
+                values = _real(read_nodes(self.nodes))
             if values.shape != self.nodes.shape:
                 raise ValueError("exterior node reader returned a different shape")
             terms.ravel()[self.slots] = values * self.coeff
@@ -89,7 +100,7 @@ class _Template:
 
 
 class StencilConstraints:
-    """Immutable fixed-width rows with a single-caller byte-bounded template LRU.
+    """Immutable fixed-width rows with a single-caller byte-bounded template cache.
 
     Nodes are flat global ZYX indices. Coefficients retain their original slot
     order (8 for samples, 16 for pairs). Nonnegative group labels eliminate one
@@ -100,6 +111,12 @@ class StencilConstraints:
     strongly retained dense tile diagonal. Input snapshots, returned constraints
     and build/RHS temporaries are additional memory. No full-grid array is built.
     Construct a new object when geometry, rows, weights or support changes.
+
+    ``template_cache_policy='stable'`` admits first-fit without eviction; the
+    default ``'lru'`` evicts least-recently-used entries. ``spatial_index_bytes``
+    independently bounds static original-slot postings (zero disables them).
+    Index admission is conservative: construction workspace must fit too;
+    insufficient budgets use the original scan. Neither option changes identity.
     """
 
     def __init__(
@@ -112,6 +129,8 @@ class StencilConstraints:
         targets: ArrayLike = 0.0,
         groups: ArrayLike | None = None,
         cache_bytes: int = 0,
+        spatial_index_bytes: int = 0,
+        template_cache_policy: str = "lru",
     ):
         shape = _integers(shape_zyx)
         if shape.shape != (3,) or (shape < 1).any() or math.prod(map(int, shape)) > np.iinfo(np.intp).max:
@@ -133,6 +152,10 @@ class StencilConstraints:
             raise ValueError("invalid stencil weights/groups")
         if type(cache_bytes) is not int or cache_bytes < 0:
             raise ValueError("nonnegative integer cache budget required")
+        if type(spatial_index_bytes) is not int or spatial_index_bytes < 0:
+            raise ValueError("nonnegative integer spatial index budget required")
+        if template_cache_policy not in ("lru", "stable"):
+            raise ValueError("template_cache_policy must be 'lru' or 'stable'")
         self.shape = tuple(map(int, shape))
         self._nodes, self._coeff, self._weights, self._targets, self._groups = map(
             _owned, (nodes, coefficients, weights, targets, groups)
@@ -143,6 +166,17 @@ class StencilConstraints:
             identity.update(array.tobytes())
         self.digest = identity.hexdigest()
         self.max_cache_bytes = cache_bytes
+        self.template_cache_policy = template_cache_policy
+        self.max_spatial_index_bytes = spatial_index_bytes
+        self.spatial_index_nbytes = 0
+        self._postings = None
+        # Bound construction scratch before allocating any slot-sized index arrays.
+        if spatial_index_bytes >= 4096 + self._nodes.size * 64:
+            slots = np.flatnonzero(self._coeff)
+            values = self._nodes.ravel()[slots]
+            order = np.argsort(values, kind="stable")
+            self._postings = (_owned(values[order]), _owned(slots[order] // self._nodes.shape[1]))
+            self.spatial_index_nbytes = 4096 + sum(a.nbytes for a in self._postings)
         self.stats = dict(bytes=0, hits=0, misses=0, evictions=0)
         self._entries: OrderedDict[tuple[tuple[int, ...], tuple[int, ...]], tuple[_Template | None, int]] = (
             OrderedDict()
@@ -173,7 +207,14 @@ class StencilConstraints:
             raise
 
     @classmethod
-    def load(cls, path: str | Path | BinaryIO, *, cache_bytes: int = 0) -> "StencilConstraints":
+    def load(
+        cls,
+        path: str | Path | BinaryIO,
+        *,
+        cache_bytes: int = 0,
+        spatial_index_bytes: int = 0,
+        template_cache_policy: str = "lru",
+    ) -> "StencilConstraints":
         """Load exactly the six numeric NPZ row members, without pickle.
 
         Arrays are validated/snapshotted by the constructor. All rows, including
@@ -199,6 +240,8 @@ class StencilConstraints:
                 targets=arrays["targets"],
                 groups=arrays["groups"],
                 cache_bytes=cache_bytes,
+                spatial_index_bytes=spatial_index_bytes,
+                template_cache_policy=template_cache_policy,
             )
 
     @classmethod
@@ -213,6 +256,8 @@ class StencilConstraints:
         weight: ArrayLike = 1.0,
         targets: ArrayLike = 0.0,
         cache_bytes: int = 0,
+        spatial_index_bytes: int = 0,
+        template_cache_policy: str = "lru",
     ) -> "StencilConstraints":
         if np.asarray(a_xyz).shape != np.asarray(b_xyz).shape:
             raise ValueError("pair endpoints differ")
@@ -227,6 +272,8 @@ class StencilConstraints:
             weights=weight,
             targets=targets,
             cache_bytes=cache_bytes,
+            spatial_index_bytes=spatial_index_bytes,
+            template_cache_policy=template_cache_policy,
         )
 
     @classmethod
@@ -241,6 +288,8 @@ class StencilConstraints:
         *,
         weight: ArrayLike = 1.0,
         cache_bytes: int = 0,
+        spatial_index_bytes: int = 0,
+        template_cache_policy: str = "lru",
     ) -> "StencilConstraints":
         nodes, coefficients, valid = point_stencils(points_xyz, origin_xyz, spacing_xyz, shape_zyx)
         if not valid.all():
@@ -252,18 +301,41 @@ class StencilConstraints:
             weights=_real(length_weights) * _real(weight),
             groups=groups,
             cache_bytes=cache_bytes,
+            spatial_index_bytes=spatial_index_bytes,
+            template_cache_policy=template_cache_policy,
         )
 
     def _build(self, lo, hi):
-        coords = np.array(np.unravel_index(self._nodes.ravel(), self.shape)).T.reshape(*self._nodes.shape, 3)
-        inside = ((coords >= lo) & (coords < hi)).all(-1) & (self._coeff != 0)
+        if self._postings is None:
+            candidates = None
+            candidate_nodes, candidate_coeff = self._nodes, self._coeff
+        else:
+            values, postings = self._postings
+            # A lexicographic ZYX interval is a superset; exact slot filtering follows.
+            first = np.ravel_multi_index(lo, self.shape)
+            last = np.ravel_multi_index(hi - 1, self.shape)
+            a = np.searchsorted(values, first, side="left")
+            b = np.searchsorted(values, last, side="right")
+            candidates = np.unique(postings[a:b])
+            candidate_nodes, candidate_coeff = self._nodes[candidates], self._coeff[candidates]
+        coords = np.array(np.unravel_index(candidate_nodes.ravel(), self.shape)).T.reshape(*candidate_nodes.shape, 3)
+        inside = ((coords >= lo) & (coords < hi)).all(-1) & (candidate_coeff != 0)
         touched = inside.any(1)
         if not touched.any():
             return None
         groups = self._groups
-        selected_groups = groups[touched & (groups >= 0)]
-        rows = np.flatnonzero(touched | ((groups >= 0) & np.isin(groups, selected_groups)))
-        inside, coords = inside[rows], coords[rows]
+        touched_rows = np.flatnonzero(touched) if candidates is None else candidates[touched]
+        selected_groups = groups[touched_rows]
+        selected_groups = selected_groups[selected_groups >= 0]
+        if candidates is None:
+            rows = np.flatnonzero(touched | ((groups >= 0) & np.isin(groups, selected_groups)))
+            inside, coords = inside[rows], coords[rows]
+        else:
+            rows = np.union1d(touched_rows, np.flatnonzero((groups >= 0) & np.isin(groups, selected_groups)))
+            coords = np.array(np.unravel_index(self._nodes[rows].ravel(), self.shape)).T.reshape(
+                len(rows), self._nodes.shape[1], 3
+            )
+            inside = ((coords >= lo) & (coords < hi)).all(-1) & (self._coeff[rows] != 0)
         coefficients, nodes = self._coeff[rows], self._nodes[rows]
         row_ids = np.broadcast_to(np.arange(len(rows))[:, None], inside.shape)
         columns = np.ravel_multi_index((coords[inside] - lo).T, hi - lo)
@@ -303,8 +375,17 @@ class StencilConstraints:
         else:
             self.stats["misses"] += 1
             template = self._build(low, high)
+            if (
+                template is not None
+                and template.nodes.size
+                and getattr(read_nodes, "__func__", None) is BlockStore.nodes
+            ):
+                template.gather_plan = getattr(read_nodes, "__self__").prepare_nodes(template.nodes)
+                template.nbytes += template.gather_plan.nbytes
             size = 4096 if template is None else template.nbytes
-            if size <= self.max_cache_bytes:
+            if size <= self.max_cache_bytes and (
+                self.template_cache_policy == "lru" or self.stats["bytes"] + size <= self.max_cache_bytes
+            ):
                 while self.stats["bytes"] + size > self.max_cache_bytes:
                     _, (_, retired) = self._entries.popitem(last=False)
                     self.stats["bytes"] -= retired

@@ -286,6 +286,15 @@ class StencilConstraints:
     def restrict(
         self, lo: Sequence[int], hi: Sequence[int], read_nodes: Callable[[NDArray[np.int64]], ArrayLike]
     ) -> QuadraticConstraints | None:
+        template = self.prepare(lo, hi)
+        return None if template is None else template.restrict(read_nodes)
+
+    def prepare(self, lo: Sequence[int], hi: Sequence[int]) -> _Template | None:
+        """Return static restriction geometry with nbytes and restrict(read_nodes).
+
+        External providers may retain this object under their own byte budget.
+        It owns its static arrays; every restrict call reads current exterior values.
+        """
         low, high = _integers(lo), _integers(hi)
         if (
             low.shape != (3,)
@@ -311,4 +320,4 @@ class StencilConstraints:
                     self.stats["evictions"] += 1
                 self._entries[key] = template, size
                 self.stats["bytes"] += size
-        return None if template is None else template.restrict(read_nodes)
+        return template

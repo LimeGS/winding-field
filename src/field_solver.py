@@ -1,6 +1,7 @@
 """Matrix-free weighted gradient/fibre least squares on a nonperiodic ZYX grid."""
 
 import math
+import sys
 import time
 from functools import partial
 from typing import Any, Literal, overload
@@ -34,10 +35,16 @@ class _FieldOperator:
             for endpoint in self.pairs:
                 self.diagonal.view(-1).index_add_(0, endpoint, counts)
 
-    def matvec(self, field):
-        out = torch.zeros_like(field)
+    def matvec(self, field, *, out=None, scratch=None):
+        # Optional buffers belong to this single solve, never to its input/output.
+        out = torch.zeros_like(field) if out is None else out.zero_()
         for lo, hi, weight in self.edges:
-            flux = (field[hi] - field[lo]) * weight
+            if scratch is None:
+                flux = (field[hi] - field[lo]) * weight
+            else:
+                flux = scratch[lo]
+                torch.sub(field[hi], field[lo], out=flux)
+                flux.mul_(weight)
             out[lo] -= flux
             out[hi] += flux
         if self.pairs is not None:
@@ -109,6 +116,30 @@ class PreparedField:
     def __init__(self) -> None:
         self.signature: tuple[Any, ...] | None = None
 
+    @property
+    def retained_bytes(self) -> int:
+        """Conservative retained CPU/device backing storage, not peak allocation."""
+
+        def size(value):
+            overhead = sys.getsizeof(value)
+            if isinstance(value, torch.Tensor):
+                if value.layout == torch.sparse_coo:
+                    return overhead + size(value._indices()) + size(value._values())
+                if value.layout == torch.sparse_csr:
+                    return overhead + size(value.crow_indices()) + size(value.col_indices()) + size(value.values())
+                return overhead + value.untyped_storage().nbytes()
+            if isinstance(value, np.ndarray):
+                return overhead + (size(value.base) if value.base is not None else value.nbytes)
+            if isinstance(value, dict):
+                return overhead + sum(size(k) + size(v) for k, v in value.items())
+            if isinstance(value, (tuple, list)):
+                return overhead + sum(map(size, value))
+            if hasattr(value, "__dict__"):
+                return overhead + size(vars(value))
+            return overhead
+
+        return int(size(self))
+
     def bind(self, target, weights, spacing, constraints):
         arrays = () if constraints is None else constraints._structural_arrays()
         rows = None if constraints is None else constraints.matrix.shape
@@ -119,6 +150,7 @@ class PreparedField:
             self.operator = _FieldOperator(self.weights, None, 0)
             self.extra = _constraint_operator(constraints, weights.device, weights.dtype)
             self.gradient_rhs = self.operator.rhs(self.target, spacing)
+            self.work = tuple(torch.empty_like(weights) for _ in range(5))
             self.signature = signature
         elif (
             self.signature != signature
@@ -378,15 +410,17 @@ def solve_field(
     inverse = diagonal.reciprocal()
     del target, weight, ref, diagonal
 
-    def matvec(p):
-        out = operator.matvec(p)
+    ap, scratch, r, z, p = tuple(torch.empty_like(x) for _ in range(5)) if prepared is None else prepared.work
+
+    def matvec(value):
+        out = operator.matvec(value, out=ap, scratch=scratch)
         if extra is not None:
-            out += extra.matvec(p)
+            out += extra.matvec(value)
         if has_reference:
             if nodal:
-                out.addcmul_(p, rw)
+                out.addcmul_(value, rw)
             else:
-                out.add_(p, alpha=rw)
+                out.add_(value, alpha=rw)
         out[mask] = 0
         return out
 
@@ -394,20 +428,22 @@ def solve_field(
     if not math.isfinite(scale):
         raise ValueError("assembled RHS norm is not finite")
     scale = scale or 1.0
-    r = b - matvec(x)
-    z = r * inverse
-    p = z.clone()
+    torch.sub(b, matvec(x), out=r)
+    torch.mul(r, inverse, out=z)
+    p.copy_(z)
     rz = float(torch.dot(r.view(-1), z.view(-1)))
     iterations = 0
     reason = "maxiter"
+    norm = None
     for _ in range(maxiter):
-        norm = _norm(r)
+        if norm is None:
+            norm = _norm(r)
         if not math.isfinite(norm):
             reason = "nonfinite_residual"
             break
         if norm <= rtol * scale:
             break
-        ap = matvec(p)
+        matvec(p)
         curvature = float(torch.dot(p.view(-1), ap.view(-1)))
         if not math.isfinite(curvature) or not math.isfinite(rz):
             reason = "nonfinite_curvature"
@@ -420,17 +456,20 @@ def solve_field(
         r.add_(ap, alpha=-alpha)
         iterations += 1
         # Recurrence residuals drift in float32: verify, and restart if needed.
-        restart = _norm(r) <= rtol * scale
+        norm = _norm(r)
+        restart = norm <= rtol * scale
         if restart:
-            r = b - matvec(x)
-        z = r * inverse
+            torch.sub(b, matvec(x), out=r)
+            norm = None
+        torch.mul(r, inverse, out=z)
         next_rz = float(torch.dot(r.view(-1), z.view(-1)))
         if restart:
-            p = z.clone()
+            p.copy_(z)
         else:
             p.mul_(next_rz / rz).add_(z)
         rz = next_rz
-    residual = _norm(b - matvec(x)) / scale
+    torch.sub(b, matvec(x), out=r)
+    residual = _norm(r) / scale
     converged = math.isfinite(residual) and residual <= rtol
     if not math.isfinite(residual):
         residual, reason = None, "nonfinite_residual"

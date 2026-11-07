@@ -138,7 +138,8 @@ def test_prepared_buffers_do_not_alias_returned_fields(dtype):
     np.testing.assert_array_equal(first, saved)
     np.testing.assert_array_equal(second, plain)
     assert pointers == [v.data_ptr() for v in prepared.work]
-    assert retained == prepared.retained_bytes
+    # CPython shared-key dictionaries can shrink when the plain operator is created.
+    assert prepared.retained_bytes <= retained
 
 
 @pytest.mark.parametrize("versioned", [False, True])

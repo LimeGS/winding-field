@@ -86,7 +86,7 @@ jobs:
           python -m pip install dist/*.whl
           python -I -c "import field_solver, block_solver, physical_grid, whole_reference"
           python -I examples/minimal_field.py
-          python -m pip uninstall --yes winding-field-experiments
+          python -m pip uninstall --yes winding-field
           python -m pip install dist/*.tar.gz
           python -I -c "import field_solver, block_solver, physical_grid, whole_reference"
           python -I examples/minimal_field.py

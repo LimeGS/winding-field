@@ -14,6 +14,13 @@ This repository contains the current implementation, reusable evaluation tools,
 synthetic examples and regression tests. Research logs, run outputs, experiment
 reports and prior release snapshots are maintained separately.
 
+The Python distribution is named **`winding-field`** (formerly
+`winding-field-experiments`). Python module names and solver behavior are unchanged.
+Use a fresh environment when migrating: the old and new distributions own the same
+module files and must not be installed together. Keep the original environment for
+saved runs whose runtime identity is pinned. The separate `winding-field-cli`
+package provides the `winding-field` command.
+
 [![Six Paris4 winding levels: geometry, CT-textured surfaces and available continuous flattened CT diagnostics](assets/paris4-six-surfaces.png)](assets/paris4-six-surfaces.png)
 
 *Paris4 six-surface diagnostics. The continuous flattened surface at W = −120

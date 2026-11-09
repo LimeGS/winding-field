@@ -229,19 +229,6 @@ def load_inputs(args):
         receipt=receipt,
         transform=transform,
     )
-    if "visualization" in case:
-        import ct_visuals
-
-        visual = ct_visuals.prepare(case["visualization"], args.case.parent, case["frame"], step, voxel_um=unit)
-        inputs.update(visual["inputs"])
-        receipt["source_sha256"].update(
-            {
-                str(path): bench.sha256(path)
-                for path in (Path(ct_visuals.__file__), Path(ct_visuals.point_stencils.__code__.co_filename))
-            }
-        )
-        receipt["environment"]["matplotlib"] = visual["matplotlib_version"]
-        result["visualization"] = visual
     return result
 
 
@@ -368,12 +355,6 @@ def main(argv=None):
         bench.write_json(args.output / "PREFLIGHT.json", inputs["receipt"])
         if not args.check_only:
             result = evaluate(inputs, args.output)
-            if "visualization" in inputs:
-                import ct_visuals
-
-                result["visualization"] = ct_visuals.render(
-                    inputs["visualization"], inputs["field"], inputs["meta"], inputs["support"], args.output
-                )
             for entry in inputs["receipt"]["inputs"].values():
                 if bench.sha256(entry["path"]) != entry["sha256"]:
                     raise ValueError("input changed during evaluation: " + entry["path"])

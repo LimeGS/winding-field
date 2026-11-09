@@ -71,16 +71,25 @@ def test_cpu_metadata_explicitly_limits_cuda_claims():
     assert "cuda_runtime" in info
 
 
-def test_offrange_mesh_workload_uses_supported_public_inputs(tmp_path):
+def test_mesh_workload_explains_migration_for_field_only_core(tmp_path):
     spec = importlib.util.spec_from_file_location("performance_cases", HARNESS.with_name("cases.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    config, inputs, operation, _ = module.make_case("mesh-offrange", tmp_path, 73, 0)
-    assert inputs["values"].shape == (64, 64, 64)
-    assert len(config["levels"]) == 32
-    result = operation()
-    assert result["status"] == "MESH_READY"
-    assert all(level["faces"] == 0 for level in result["levels"])
+    with pytest.raises(ValueError, match="historical.*core|winding-field-cli"):
+        module.make_case("mesh-offrange", tmp_path, 73, 0)
+
+
+def test_core_metadata_needs_no_image_dependencies(monkeypatch):
+    api = harness()
+    version = api.importlib.metadata.version
+
+    def core_only(name):
+        if name == "scikit-image":
+            raise api.importlib.metadata.PackageNotFoundError(name)
+        return version(name)
+
+    monkeypatch.setattr(api.importlib.metadata, "version", core_only)
+    assert api.environment()["versions"]["skimage"] == "not installed"
 
 
 def test_isolated_cpu_worker_repeats_inputs_and_reports_metadata(tmp_path):
@@ -100,7 +109,6 @@ def test_isolated_cpu_worker_repeats_inputs_and_reports_metadata(tmp_path):
                 str(output),
                 "--cases",
                 "pcg",
-                *(["mesh", "mesh-offrange"] if i == 0 else []),
                 "--repetitions",
                 "2",
             ],

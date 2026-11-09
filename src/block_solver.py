@@ -143,19 +143,15 @@ def solve_blocks(
     complete groups per block. Pin that provider/geometry in ``identity``; it must
     return local QuadraticConstraints and read current exterior values each time.
 
-    ``prepared_cache_bytes`` independently budgets static solver workspaces (CPU
-    plus device storage). Zero disables retention; first-fit admission keeps a
-    stable subset across sweeps. Callable constraints bypass this cache. Live
-    observations/receipts, exterior targets and fixed values are checked each
-    visit. Workspaces are released on exit and never checkpointed; this budget
-    may change on resume. It is not a peak-memory or allocator-reservation bound.
-    A hit avoids gradient-operator/diagonal construction, constraint-operator
-    construction/device transfer and gradient-RHS assembly. Restriction still
-    runs every visit under StencilConstraints' independent template-cache policy;
-    local rows/diagonals may be rebuilt, and live constraint RHS and fixed-node
-    elimination always run anew. No restriction rows/templates are retained here.
+    Optional prepared_cache_bytes bounds retained CPU/device workspaces, not peak
+    memory or allocator reservation. Stable first-fit admission avoids thrashing.
+    Callables opt in with prepared_key(lo, hi) returning an immutable string token
+    for the static observations/row structure; return None to bypass. Change the
+    token when those inputs change. A retained token still checks structural and
+    observation equality; targets and fixed values are refreshed every visit.
+    Cache state is released on exit, never checkpointed, and may change on resume.
     """
-    prepared_cache: dict[tuple[int, ...], PreparedField] = {}
+    prepared_cache: dict[tuple, PreparedField] = {}
     prepared = None
     prepared_stats = dict(budget=0, retained_bytes=0, entries=0, peak_bytes=0, peak_entries=0, hits=0, builds=0)
 
@@ -387,15 +383,19 @@ def solve_blocks(
                             return emit("CHECKPOINTED_STOP")
                         admitted()
                         emit("RUNNING", phase="solving", active_sweep=sweep, active_block=block)
-                        prepared_key = tuple(map(int, (*lo, *hi)))
+                        token = "static" if constraints is None or isinstance(constraints, StencilConstraints) else None
+                        key_provider = getattr(constraints, "prepared_key", None)
+                        if prepared_cache_bytes and callable(key_provider):
+                            token = key_provider(lo, hi)
+                            if token is not None and (not isinstance(token, str) or len(token) > 256):
+                                raise ValueError("prepared_key must return a string of at most 256 characters or None")
+                        prepared_key = (*map(int, (*lo, *hi)), token)
                         prepared = prepared_cache.get(prepared_key)
                         if prepared is not None:
                             prepared_stats["hits"] += 1
                         else:
                             prepared_stats["builds"] += 1
-                            if prepared_cache_bytes and (
-                                constraints is None or isinstance(constraints, StencilConstraints)
-                            ):
+                            if prepared_cache_bytes and token is not None:
                                 prepared = PreparedField()
                         result, solver = solve_field(
                             target,

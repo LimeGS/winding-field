@@ -105,37 +105,6 @@ def build_case(folder):
         folder / "controls.json", dict(methods={"synthetic_reference": dict(rows=controls)}, synthetic=True)
     )
 
-    # Smooth bright bands illustrate the analytic layers; these are not scan data.
-    intensities = (20 + 210 * (0.5 + 0.5 * np.cos(2 * np.pi * z / 8)) ** 8).astype(np.uint8)
-    ct = np.broadcast_to(intensities, shape)
-    visual = folder / "ct"
-    visual.mkdir()
-    planes = []
-    for name, axis in (("XY", 2), ("XZ", 1), ("YZ", 0)):
-        index = shape[2 - axis] // 2
-        pixels = np.take(ct, index, axis=2 - axis)
-        np.savez_compressed(visual / (name + "-samples.npz"), ct=pixels)
-        planes.append(dict(name=name, fixed_axis_xyz=axis, fixed_position_world=index, ct_pixels=pixels.size))
-    metrics.write_json(
-        visual / "RECEIPT.json",
-        dict(
-            frame=FRAME,
-            step=step,
-            synthetic=True,
-            voxel_um=9.6,
-            spacing_xyz=[1, 1, 1],
-            origin_xyz=[0, 0, 0],
-            size_xyz=list(shape[::-1]),
-            ct_window=[0, 255],
-            contour_levels=[0, 1, 2, 3, 4],
-            field_sha256={},
-            planes=planes,
-            ct_url="synthetic://analytic-parallel-layers",
-            input_ct={},
-        ),
-    )
-    metrics.write_json(visual / "MANIFEST.json", {p.name: metrics.sha256(p) for p in sorted(visual.iterdir())})
-
     files = {
         "selection": selected_path,
         "plan": folder / "plan.json",
@@ -159,10 +128,6 @@ def build_case(folder):
         requires_support=False,
         synthetic=True,
         artifacts={name: dict(path=path.name, sha256=metrics.sha256(path)) for name, path in files.items()},
-        visualization=dict(
-            schema="ct-winding-overlays-v2",
-            archive_manifest=dict(path="ct/MANIFEST.json", sha256=metrics.sha256(visual / "MANIFEST.json")),
-        ),
     )
     metrics.write_json(folder / "case.json", case)
 
@@ -215,7 +180,7 @@ def main(argv=None):
         ),
     )
     print("Synthetic demo: 6/6 fibre pairs covered; separation 3/3; collapse controls 0/3.")
-    print("Overview:", args.output / "evaluation/ct-winding.png")
+    print("Scores:", args.output / "evaluation/TABLES.md")
     return 0
 
 

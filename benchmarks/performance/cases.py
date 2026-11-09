@@ -1,6 +1,7 @@
 """Small deterministic workloads through existing public entrypoints."""
 
 import hashlib
+import importlib.util
 import inspect
 import json
 import sys
@@ -297,6 +298,8 @@ def make_case(name: str, output: Path, seed: int, prepared_cache_bytes: int):
         return config, dict(target=target, weights=weights, observed=observed, **inputs), operation, instrument
 
     if name in ("mesh", "mesh-offrange", "mesh-large"):
+        if importlib.util.find_spec("surface_mesh") is None:
+            raise ValueError("mesh cases require a historical surface-enabled core; mesh extraction moved to winding-field-cli")
         import skimage.measure
 
         import surface_mesh

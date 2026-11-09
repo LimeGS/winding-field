@@ -76,6 +76,12 @@ def source_identity(root: Path, commit: str | None = None) -> dict:
 def environment() -> dict:
     import torch
 
+    def version(dist):
+        try:
+            return importlib.metadata.version(dist)
+        except importlib.metadata.PackageNotFoundError:
+            return "not installed"
+
     cpu = platform.processor()
     if sys.platform == "darwin":
         cpu = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"]).decode().strip()
@@ -95,7 +101,7 @@ def environment() -> dict:
         versions={
             "python": platform.python_version(),
             **{
-                name: importlib.metadata.version(dist)
+                name: version(dist)
                 for name, dist in [
                     ("numpy", "numpy"),
                     ("scipy", "scipy"),
@@ -255,7 +261,8 @@ def main() -> None:
     parser.add_argument("--source", required=True, help="checkout or frozen root containing src/")
     parser.add_argument("--output", required=True, help="new external evidence directory; never overwritten")
     parser.add_argument("--commit", help="commit identity for frozen src snapshot")
-    parser.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES))
+    parser.add_argument("--cases", nargs="+", choices=CASES, default=[c for c in CASES if not c.startswith("mesh")],
+                        help="core cases by default; mesh cases require historical surface-enabled --source")
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20261104)
     parser.add_argument(

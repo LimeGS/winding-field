@@ -193,27 +193,10 @@ optional human controls and explicit native-to-world geometry. Construction and
 scoring remain separate. A missing split or annotation is not an independent
 holdout and is not replaced with fabricated references.
 
-`tools/surface_probe.py --config ...` reads declared CT/prior grids and freezes
-its seed before rendering. It accepts an optional human `--patch` for evaluation.
-`context.surface` may specify `seed_margin`, `ct_padding_samples`, `pitch_world`,
-`depth_offsets_world`, `mesh_step` and `ct_window`. CT may be uint8, uint16 or
-another finite numeric volume; its source spacing is applied explicitly.
-
-`surface_atlas.py` consumes the probe's `inputs.json`; without `--patch` it reuses
-that frozen prior seed. Supplying `--patch` selects the existing human-seeded
-development mode. Raster pitch and offsets come from the frozen inputs. Missing
-human references are not evaluated; missing tile ownership has no seam claim.
-
-Human patch frame and physical units must agree with the field. For legacy
-TIFXYZ metadata missing either declaration, explicitly supply the missing
-`--patch-frame` and/or `--patch-voxel-um` values to the probe/atlas. Conflicting
-file declarations are rejected, and the original patch is not rewritten.
-
-Artifact-only export/geometry tools read the supplied field/CT metadata. They
-check matching declared frames and physical units, not one named scan. TIFXYZ
-reserves negative coordinates as invalid sentinels; its exporter therefore
-requires nonnegative valid XYZ even though the field and benchmark support
-translated world frames. No implicit conversion is performed to hide that limit.
+Surface probe/export/atlas tools now live exclusively in winding-field-cli.
+They consume this same dataset configuration; `context.surface` remains opaque
+to the core. See the [CLI surface tool guide](https://github.com/LimeGS/winding-field-cli/blob/main/docs/SURFACE_TOOLS.md)
+for configured CT/prior sampling, frozen seeds, TIFXYZ geometry and optional patch evaluation.
 
 ## Migrating older commands
 

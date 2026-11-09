@@ -269,6 +269,11 @@ controls remain explicit; missing human references are reported as not evaluated
 
 For opt-in throughput measurements (distinct from the scientific quality
 benchmark), see [result-preserving performance](docs/PERFORMANCE_V2.md).
+
+For optional CPU float64 spectral PCG, prepared consensus indices, bounded
+template/gather caches and durable I/O measurements, see
+[solver performance v3](docs/PERFORMANCE_V3.md), including unsupported geometries
+and the spatial-index regime that became slower.
 `solve_blocks(..., prepared_cache_bytes=0)` keeps the historical default: no
 prepared workspace retention between visits. A positive byte budget admits a
 stable subset of workspaces; observation receipts, static snapshots and live

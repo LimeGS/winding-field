@@ -42,6 +42,16 @@ def _numpy(value):
     return value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
 
 
+def _decoded_anchor_error(core, fixed):
+    anchor = np.isfinite(fixed)
+    if not anchor.any():
+        return 0.0
+    values = core.astype(np.float64, copy=False)
+    offset = values.mean()  # The codec centers the whole core, including nonanchors.
+    restored = (values[anchor] - offset).astype(np.float32).astype(np.float64) + offset
+    return float(np.max(abs(restored - fixed[anchor]), initial=0))
+
+
 def _observations(value, shape):
     if not isinstance(value, (list, tuple)) or len(value) != 4:
         raise ValueError("observation loader must return target, weights, observed, receipts")
@@ -109,9 +119,11 @@ def solve_blocks(
     rtol: float = 1e-5,
     maxiter: int = 4000,
     dtype: Literal["float32", "float64"] = "float64",
+    preconditioner: Literal["jacobi"] = "jacobi",
     device: str = "cpu",
     cache_bytes: int = 0,
     prepared_cache_bytes: int = 0,
+    status_policy: Literal["all", "checkpoints"] = "all",
     read_workers: int = 1,
     max_bytes: int | None = None,
     reserve_bytes: int = 0,
@@ -150,18 +162,48 @@ def solve_blocks(
     token when those inputs change. A retained token still checks structural and
     observation equality; targets and fixed values are refreshed every visit.
     Cache state is released on exit, never checkpointed, and may change on resume.
+    Nonadmission decisions cost 4096 bytes each from the same budget when room
+    remains. Remembered keys solve cold without new snapshots; forgetting a
+    decision affects performance only, since no numerical operator is retained.
+    ``status_policy='checkpoints'`` publishes the first RUNNING, every committed
+    checkpoint and every terminal status, suppressing later observation/solve
+    notices. This advisory policy may change on resume. Only the Jacobi
+    preconditioner supports the partial fixed-face masks used by block solves.
+    Jacobi is an implicit invariant of the v1 run identity; other policies are
+    rejected before opening the store. The solver receipt records it explicitly.
     """
     prepared_cache: dict[tuple, PreparedField] = {}
+    denied_keys: set[tuple] = set()
     prepared = None
-    prepared_stats = dict(budget=0, retained_bytes=0, entries=0, peak_bytes=0, peak_entries=0, hits=0, builds=0)
+    prepared_stats = dict(
+        budget=0,
+        retained_bytes=0,
+        entries=0,
+        peak_bytes=0,
+        peak_entries=0,
+        hits=0,
+        builds=0,
+        skipped_snapshots=0,
+        denied_entries=0,
+        denied_bytes=0,
+        peak_denied_entries=0,
+        peak_denied_bytes=0,
+    )
 
     def release_prepared():
         nonlocal prepared
         prepared_cache.clear()
+        denied_keys.clear()
         prepared = None
-        prepared_stats.update(retained_bytes=0, entries=0)
+        prepared_stats.update(retained_bytes=0, entries=0, denied_entries=0, denied_bytes=0)
 
     try:
+        if preconditioner != "jacobi":
+            raise ValueError(
+                "block solves require preconditioner='jacobi'; spectral partial block masks are unsupported"
+            )
+        if status_policy not in ("all", "checkpoints"):
+            raise ValueError("status_policy must be all or checkpoints")
         prepared_cache_bytes = _integer(prepared_cache_bytes)
         prepared_stats["budget"] = prepared_cache_bytes
         shape = tuple(_integer(n, 2) for n in shape)
@@ -265,7 +307,17 @@ def solve_blocks(
             ):
                 raise ValueError("invalid persisted source receipts")
 
+            running_published = False
+
             def emit(status, **extra):
+                nonlocal running_published
+                if (
+                    status == "RUNNING"
+                    and running_published
+                    and status_policy == "checkpoints"
+                    and extra.get("phase") in ("observations", "solving")
+                ):
+                    return None
                 if status != "RUNNING":
                     release_prepared()
                 result = dict(
@@ -289,6 +341,8 @@ def solve_blocks(
                     **extra,
                 )
                 atomic_json(root / "STATUS.json", result)
+                if status == "RUNNING":
+                    running_published = True
                 return result
 
             def stopped():
@@ -396,7 +450,10 @@ def solve_blocks(
                         else:
                             prepared_stats["builds"] += 1
                             if prepared_cache_bytes and token is not None:
-                                prepared = PreparedField()
+                                if prepared_key in denied_keys:
+                                    prepared_stats["skipped_snapshots"] += 1
+                                else:
+                                    prepared = PreparedField()
                         result, solver = solve_field(
                             target,
                             weights,
@@ -406,6 +463,7 @@ def solve_blocks(
                             initial=current,
                             device=device,
                             dtype=dtype,
+                            preconditioner=preconditioner,
                             rtol=rtol,
                             maxiter=maxiter,
                             return_tensor=True,
@@ -419,6 +477,14 @@ def solve_blocks(
                                 prepared_stats["entries"] = len(prepared_cache)
                                 prepared_stats["peak_bytes"] = prepared_stats["retained_bytes"]
                                 prepared_stats["peak_entries"] = len(prepared_cache)
+                            elif 4096 <= prepared_cache_bytes - prepared_stats["retained_bytes"]:
+                                denied_keys.add(prepared_key)
+                                prepared_stats["denied_entries"] = len(denied_keys)
+                                prepared_stats["denied_bytes"] += 4096
+                                prepared_stats["retained_bytes"] += 4096
+                                prepared_stats["peak_denied_entries"] = len(denied_keys)
+                                prepared_stats["peak_denied_bytes"] = prepared_stats["denied_bytes"]
+                                prepared_stats["peak_bytes"] = prepared_stats["retained_bytes"]
                         prepared = None
                         if not solver["converged"]:
                             raise RuntimeError("conditional block did not converge")
@@ -430,11 +496,7 @@ def solve_blocks(
                         if block + 1 == len(ordered):
                             next_completed.append(dict(sweep=sweep, cores=len(ordered), max_core_update=maximum))
                         # Report precision loss separately from the pre-encoding local gate.
-                        encoded_values = core.astype(np.float64, copy=False)
-                        offset = encoded_values.mean()
-                        restored = (encoded_values - offset).astype(np.float32).astype(np.float64) + offset
-                        anchor = np.isfinite(fixed_values[owned])
-                        fixed_error = float(np.max(abs(restored[anchor] - fixed_values[owned][anchor]), initial=0))
+                        fixed_error = _decoded_anchor_error(core, fixed_values[owned])
                         pending = dict(
                             sweep=sweep,
                             next_block=block + 1,
@@ -463,8 +525,6 @@ def solve_blocks(
                             result,
                             core,
                             fixed_values,
-                            restored,
-                            encoded_values,
                         )
                 return emit("SWEEP_BUDGET_REACHED")
             except Exception as error:

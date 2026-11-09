@@ -9,6 +9,80 @@ from typing import Any, Literal, overload
 import numpy as np
 import torch
 from numpy.typing import ArrayLike, NDArray
+from scipy.fft import dctn, dstn, idctn, idstn
+
+
+class _SpectralPreconditioner:
+    """Inverse constant-weight index-space Laplacian on supported free nodes."""
+
+    def __init__(self, weights: torch.Tensor, mask: torch.Tensor) -> None:
+        if weights.device.type != "cpu" or weights.dtype != torch.float64:
+            raise ValueError("spectral preconditioning requires CPU float64")
+        self.mask = mask.numpy().copy()
+        self.shape = tuple(weights.shape)
+        self.anchor = 0
+        faces = np.ones(self.shape, dtype=bool)
+        faces[1:-1, 1:-1, 1:-1] = False
+        if self.mask.all():
+            self.kind = "all_fixed"
+        elif self.mask.sum() == 1:
+            self.kind = "point"
+            self.anchor = int(np.flatnonzero(self.mask)[0])
+        elif np.array_equal(self.mask, faces):
+            self.kind = "faces"
+        else:
+            raise ValueError("spectral preconditioning requires one fixed node, exactly six full faces, or all fixed")
+        with np.errstate(over="ignore", invalid="ignore"):
+            self.alpha = float(np.mean(weights.numpy(), dtype=np.float64))
+        if not math.isfinite(self.alpha) or self.alpha <= 0:
+            raise ValueError("spectral mean weight must be positive and finite")
+        shape = self.shape if self.kind == "point" else tuple(max(0, n - 2) for n in self.shape)
+        self.inverse: NDArray[np.float64]
+        if self.kind == "all_fixed":
+            self.inverse = np.empty(0, dtype=np.float64)
+            return
+        eigenvalues = np.zeros(shape, dtype=np.float64)
+        for axis, n in enumerate(shape):
+            k = np.arange(n) if self.kind == "point" else np.arange(1, n + 1)
+            length = n if self.kind == "point" else n + 1
+            view = [1, 1, 1]
+            view[axis] = n
+            eigenvalues += (4 * np.sin(np.pi * k / (2 * length)) ** 2).reshape(view)
+        with np.errstate(over="ignore", under="ignore", divide="ignore", invalid="ignore"):
+            denominator = self.alpha * eigenvalues
+            nonzero = np.ones(shape, dtype=bool)
+            if self.kind == "point":
+                nonzero[0, 0, 0] = False
+            self.inverse = np.zeros(shape, dtype=np.float64)
+            np.divide(1, denominator, out=self.inverse, where=nonzero)
+        if (
+            not np.isfinite(denominator).all()
+            or (denominator[nonzero] <= 0).any()
+            or not np.isfinite(self.inverse).all()
+            or (self.inverse[nonzero] <= 0).any()
+        ):
+            raise ValueError("spectral denominator and inverse must be positive and finite")
+
+    def apply(self, residual: torch.Tensor) -> torch.Tensor:
+        r = residual.numpy()
+        if self.kind == "point":
+            q = r.copy()
+            q[self.mask] = 0
+            q.flat[self.anchor] = -np.sum(q, dtype=np.float64)
+            y = idctn(dctn(q, type=2, norm="ortho", workers=1) * self.inverse, type=2, norm="ortho", workers=1)
+            out = y - y.flat[self.anchor]
+            out[self.mask] = 0
+        else:
+            out = np.zeros(self.shape, dtype=np.float64)
+            if self.kind == "faces":
+                interior = (slice(1, -1),) * 3
+                out[interior] = idstn(
+                    dstn(r[interior], type=1, norm="ortho", workers=1) * self.inverse,
+                    type=1,
+                    norm="ortho",
+                    workers=1,
+                )
+        return torch.from_numpy(out)
 
 
 class _FieldOperator:
@@ -115,6 +189,8 @@ class PreparedField:
 
     def __init__(self) -> None:
         self.signature: tuple[Any, ...] | None = None
+        self.preconditioner_policy: str | None = None
+        self.spectral: _SpectralPreconditioner | None = None
 
     @property
     def retained_bytes(self) -> int:
@@ -170,6 +246,19 @@ class PreparedField:
             ).clone()
         return self.operator, self.extra, self.gradient_rhs.clone()
 
+    def bind_preconditioner(
+        self, policy: str, weights: torch.Tensor, mask: torch.Tensor
+    ) -> _SpectralPreconditioner | None:
+        if self.preconditioner_policy is not None and self.preconditioner_policy != policy:
+            raise ValueError("prepared preconditioner policy changed; create a new workspace")
+        if policy == "spectral":
+            if self.spectral is None:
+                self.spectral = _SpectralPreconditioner(weights, mask)
+            elif not np.array_equal(self.spectral.mask, mask.numpy()):
+                raise ValueError("prepared spectral fixed mask changed; create a new workspace")
+        self.preconditioner_policy = policy
+        return self.spectral
+
 
 @overload
 def solve_field(
@@ -190,6 +279,7 @@ def solve_field(
     dtype: Literal["float32"] = "float32",
     prepared: PreparedField | None = None,
     return_tensor: Literal[False] = False,
+    preconditioner: Literal["jacobi", "spectral"] = "jacobi",
 ) -> tuple[NDArray[np.float32], dict[str, Any]]: ...
 
 
@@ -212,6 +302,7 @@ def solve_field(
     dtype: Literal["float64"],
     prepared: PreparedField | None = None,
     return_tensor: Literal[False] = False,
+    preconditioner: Literal["jacobi", "spectral"] = "jacobi",
 ) -> tuple[NDArray[np.float64], dict[str, Any]]: ...
 
 
@@ -234,6 +325,7 @@ def solve_field(
     dtype: Literal["float32", "float64"] = "float32",
     prepared: PreparedField | None = None,
     return_tensor: Literal[True],
+    preconditioner: Literal["jacobi", "spectral"] = "jacobi",
 ) -> tuple[torch.Tensor, dict[str, Any]]: ...
 
 
@@ -256,6 +348,7 @@ def solve_field(
     dtype: Literal["float32", "float64"] = "float32",
     prepared: PreparedField | None = None,
     return_tensor: bool = False,
+    preconditioner: Literal["jacobi", "spectral"] = "jacobi",
 ) -> tuple[NDArray[np.float32] | NDArray[np.float64] | torch.Tensor, dict[str, Any]]: ...
 
 
@@ -278,6 +371,7 @@ def solve_field(
     dtype: Literal["float32", "float64"] = "float32",
     prepared: PreparedField | None = None,
     return_tensor: bool = False,
+    preconditioner: Literal["jacobi", "spectral"] = "jacobi",
 ) -> tuple[NDArray[np.float32] | NDArray[np.float64] | torch.Tensor, dict[str, Any]]:
     """Return a ZYX field and a JSON-compatible solver receipt (float32 by default).
 
@@ -296,7 +390,7 @@ def solve_field(
     Array inputs accept NumPy arrays, nested sequences or PyTorch tensors;
     shapes, real values and finite ranges are validated at runtime.
 
-    PCG uses exact fixed-node elimination and a cached Jacobi diagonal. Residuals
+    PCG uses exact fixed-node elimination and, by default, a cached Jacobi diagonal. Residuals
     are measured on free equations against the reduced RHS (absolute residual
     if that RHS is zero), and recomputed before reporting convergence. Numerical
     breakdown or exhaustion returns converged=False with a reason; callers MUST
@@ -309,10 +403,21 @@ def solve_field(
     reuses one block's static gradient and continuous-row operators; discrete
     pairs and reference penalties are unsupported in that optional path. Current
     fixed values and constraint targets are assembled anew on every call.
+
+    preconditioner='spectral' explicitly selects a CPU float64 constant-weight
+    index-space Laplacian inverse: DCT-II for one effective fixed node (including
+    the automatic zero gauge), DST-I for exactly the six full boundary faces,
+    or a zero correction for all-fixed grids. Other masks are rejected. Its
+    weight is the float64 nodal mean; it changes neither the system nor spacing.
+    Prepared reuse requires the same policy and full effective spectral mask.
     """
     start = time.perf_counter()
     if dtype not in ("float32", "float64"):
         raise ValueError("dtype must be float32 or float64")
+    if preconditioner not in ("jacobi", "spectral"):
+        raise ValueError("preconditioner must be jacobi or spectral")
+    if preconditioner == "spectral" and (dtype != "float64" or torch.device(device).type != "cpu"):
+        raise ValueError("spectral preconditioning requires CPU float64")
     if type(return_tensor) is not bool:
         raise ValueError("return_tensor must be boolean")
     scalar = torch.float64 if dtype == "float64" else torch.float32
@@ -412,6 +517,11 @@ def solve_field(
     if not torch.isfinite(b).all() or not torch.isfinite(diagonal).all() or (diagonal <= 0).any():
         raise ValueError("assembled system is not finite with a positive free diagonal")
     inverse = diagonal.reciprocal()
+    spectral = None
+    if prepared is not None:
+        spectral = prepared.bind_preconditioner(preconditioner, weight, mask)
+    elif preconditioner == "spectral":
+        spectral = _SpectralPreconditioner(weight, mask)
     del target, weight, ref, diagonal
 
     ap, scratch, r, z, p = tuple(torch.empty_like(x) for _ in range(5)) if prepared is None else prepared.work
@@ -433,7 +543,10 @@ def solve_field(
         raise ValueError("assembled RHS norm is not finite")
     scale = scale or 1.0
     torch.sub(b, matvec(x), out=r)
-    torch.mul(r, inverse, out=z)
+    if spectral is None:
+        torch.mul(r, inverse, out=z)
+    else:
+        z.copy_(spectral.apply(r))
     p.copy_(z)
     rz = float(torch.dot(r.view(-1), z.view(-1)))
     iterations = 0
@@ -465,7 +578,10 @@ def solve_field(
         if restart:
             torch.sub(b, matvec(x), out=r)
             norm = None
-        torch.mul(r, inverse, out=z)
+        if spectral is None:
+            torch.mul(r, inverse, out=z)
+        else:
+            z.copy_(spectral.apply(r))
         next_rz = float(torch.dot(r.view(-1), z.view(-1)))
         if restart:
             p.copy_(z)
@@ -487,5 +603,9 @@ def solve_field(
         gauge=gauge,
         reason="converged" if converged else reason,
         dtype=dtype,
+        preconditioner=preconditioner,
+        preconditioner_metadata=(
+            dict(kind="jacobi") if spectral is None else dict(kind=spectral.kind, alpha=spectral.alpha)
+        ),
     )
     return field, info

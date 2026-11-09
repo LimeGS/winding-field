@@ -261,8 +261,13 @@ def main() -> None:
     parser.add_argument("--source", required=True, help="checkout or frozen root containing src/")
     parser.add_argument("--output", required=True, help="new external evidence directory; never overwritten")
     parser.add_argument("--commit", help="commit identity for frozen src snapshot")
-    parser.add_argument("--cases", nargs="+", choices=CASES, default=[c for c in CASES if not c.startswith("mesh")],
-                        help="core cases by default; mesh cases require historical surface-enabled --source")
+    parser.add_argument(
+        "--cases",
+        nargs="+",
+        choices=CASES,
+        default=[c for c in CASES if not c.startswith("mesh")],
+        help="core cases by default; mesh cases require historical surface-enabled --source",
+    )
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20261104)
     parser.add_argument(

@@ -31,6 +31,13 @@ Templates own their static arrays and hold only a weak reference to returned row
 current exterior values are read on each restriction. Reconstruct the stencil or
 provider when static geometry/rows change.
 
+`prepare(..., read_nodes=store.nodes)` also prepares a location-only gather plan
+within the template byte budget; `restrict(lo, hi, store.nodes)` does this
+automatically. Neither route retains exterior field values. The v3 denied-key
+budget and status policies apply to opted-in callable providers as well as static
+stencils. Spectral PCG remains standalone-only for supported CPU float64 masks;
+block solves still require Jacobi.
+
 The CLI owns the opt-in cross-version phase/throughput harness and integration
 documentation. Caching is not a universal speedup; measure cold setup, warm reuse,
 full checkpoint execution and numerical parity on the intended device.

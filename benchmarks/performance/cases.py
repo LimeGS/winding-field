@@ -299,9 +299,10 @@ def make_case(name: str, output: Path, seed: int, prepared_cache_bytes: int):
 
     if name in ("mesh", "mesh-offrange", "mesh-large"):
         if importlib.util.find_spec("surface_mesh") is None:
-            raise ValueError("mesh cases require a historical surface-enabled core; mesh extraction moved to winding-field-cli")
+            raise ValueError(
+                "mesh cases require a historical surface-enabled core; mesh extraction moved to winding-field-cli"
+            )
         import skimage.measure
-
         import surface_mesh
         from surface_sources import FieldSource
 

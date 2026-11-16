@@ -32,7 +32,10 @@ def point_stencils(xyz, origin_xyz, spacing_xyz, shape_zyx, support=None):
     if support is not None and (support.shape != tuple(shape) or support.dtype.kind != "b"):
         raise ValueError("support must be a matching boolean array")
     grid = (xyz - origin) / h
-    valid = np.isfinite(grid).all(1) & (grid >= 0).all(1) & (grid <= shape[::-1] - 1).all(1)
+    last = shape[::-1] - 1
+    valid = np.isfinite(grid).all(1) & (xyz >= origin).all(1) & (xyz <= origin + last * h).all(1)
+    # Validate physical bounds first: division can round an exact boundary past the last node.
+    grid = np.clip(grid, 0, last)
     base = np.zeros_like(grid, dtype=np.int64)
     base[valid] = np.minimum(np.floor(grid[valid]).astype(int), shape[::-1] - 2)
     fraction = np.where(valid[:, None], grid - base, 0)

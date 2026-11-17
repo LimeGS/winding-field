@@ -532,11 +532,13 @@ class BlockStore:
         return _json_load(_json_bytes(progress))
 
     def _publish(
-        self, manifest: dict[str, Any], payload: tuple[str, bytes] | None = None,
+        self,
+        manifest: dict[str, Any],
+        payload: tuple[str, bytes] | None = None,
         prepare: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any] | None:
         manifest_bytes = _json_bytes(manifest)
-        diagnostics = None
+        diagnostics: dict[str, Any] | None = None
         try:
             self._admit(len(manifest_bytes) + (len(payload[1]) if payload else 0))
             if prepare is not None:
@@ -639,8 +641,11 @@ class BlockStore:
                         self._cache.clear()
                         self._cache_nbytes = 0
                     raise
-            diagnostics = (self._publish(next_manifest, payload) if prepare is None
-                           else self._publish(next_manifest, payload, prepare=prepare))
+            diagnostics = (
+                self._publish(next_manifest, payload)
+                if prepare is None
+                else self._publish(next_manifest, payload, prepare=prepare)
+            )
             if old is not None:
                 with self._cache_lock:
                     retired = self._cache.pop(old["path"], None)
@@ -656,7 +661,9 @@ class BlockStore:
             if payload is not None and decoded is not None:
                 self._retain(payload[0], decoded)
             # shortcut: interrupted/unreferenced generations require verified manual cleanup.
-            result = dict(quantization_max=error, stored_bytes=sum(v["bytes"] for v in self._manifest["chunks"].values()))
+            result = dict(
+                quantization_max=error, stored_bytes=sum(v["bytes"] for v in self._manifest["chunks"].values())
+            )
             if diagnostics is not None:
                 result.update(diagnostics)
             return result

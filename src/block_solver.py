@@ -420,8 +420,17 @@ def solve_blocks(
                     running_published = True
                 return result
 
+            boundary_s = 0.0
+
             def stopped():
-                return (root / "STOP").exists() or (stop is not None and bool(stop()))
+                nonlocal boundary_s
+                if not observer_requested:
+                    return (root / "STOP").exists() or (stop is not None and bool(stop()))
+                before_boundary = time.perf_counter()
+                try:
+                    return (root / "STOP").exists() or (stop is not None and bool(stop()))
+                finally:
+                    boundary_s += time.perf_counter() - before_boundary
 
             def admitted():
                 check_resources(root, reserve_bytes=reserve_bytes)
@@ -434,6 +443,7 @@ def solve_blocks(
                 return low, high, np.maximum(low - halo, 0), np.minimum(high + halo, shape)
 
             segment_started = time.perf_counter()
+            segment_boundary_start = boundary_s
             segment_prefix = advice_state["work_s"] if advice_state is not None else 0.0
 
             def completed_advice():
@@ -446,7 +456,8 @@ def solve_blocks(
                     metrics = deepcopy(advice_state)
                     count = metrics["observed_count"]
                     metrics["observed_rms_update"] = math.sqrt(metrics["observed_sum_sq"] / count) if count else None
-                    metrics["active_wall_s"] = segment_prefix + time.perf_counter() - segment_started
+                    metrics["active_wall_s"] = segment_prefix + time.perf_counter() - segment_started - (boundary_s - segment_boundary_start)
+                    metrics["timing_scope"] = "active sweep including commits/observer; stop callbacks excluded"
                     event["metrics"] = metrics
                     observer.complete(event)  # Void: never a stop/sweep/publication decision.
                 except AdvisoryIntegrityError:
@@ -457,7 +468,7 @@ def solve_blocks(
                     advice_state = None
                     return
                 advice_state["control_s"] += time.perf_counter() - started_observer
-                advice_state["active_wall_s"] = segment_prefix + time.perf_counter() - segment_started
+                advice_state["active_wall_s"] = segment_prefix + time.perf_counter() - segment_started - (boundary_s - segment_boundary_start)
 
             try:
                 if stopped():
@@ -471,8 +482,10 @@ def solve_blocks(
                     if observer is not None and (advice_state is None or advice_state["sweep"] != sweep):
                         advice_state = _new_advice(sweep, 0, scientific_sha)
                         segment_started, segment_prefix = time.perf_counter(), 0.0
+                        segment_boundary_start = boundary_s
                     for block in range(first_block if sweep == first_sweep else 0, len(ordered)):
                         block_started = time.perf_counter() if observer is not None else None
+                        block_boundary_start = boundary_s
                         if stopped():
                             return emit("CHECKPOINTED_STOP")
                         admitted()
@@ -622,7 +635,7 @@ def solve_blocks(
                                         advice_state["candidates"] + [candidate], key=lambda value: value["rank"])[:32]
                                 advice_state["next_block"] = block + 1
                                 advice_state["control_s"] += time.perf_counter() - telemetry_started
-                                advice_state["work_s"] += time.perf_counter() - block_started
+                                advice_state["work_s"] += time.perf_counter() - block_started - (boundary_s - block_boundary_start)
                             except Exception as error:
                                 observer_error(error)
                                 advice_state = None

@@ -214,3 +214,34 @@ def test_sweep_clock_does_not_count_existing_boundary_verifications(tmp_path,mon
     solve_blocks(tmp_path/'field',**options(),observer=journal,stop=existing_boundary)
     assert [r['metrics']['active_wall_s'] for r in journal.closures]==[2.,2.]
     assert [r['metrics']['work_s'] for r in journal.closures]==[2.,2.]
+
+
+@pytest.mark.parametrize('enabled',[False,True])
+def test_update_reduction_arrays_are_released_before_checkpoint_encoding(tmp_path,monkeypatch,enabled):
+    import weakref
+    import block_solver
+    temporaries=[];selected=[]
+    class Delta(np.ndarray):
+        def __getitem__(self,key):
+            value=super().__getitem__(key)
+            if isinstance(key,np.ndarray) and key.dtype==bool and isinstance(value,np.ndarray):
+                selected.append(weakref.ref(value))
+            return value
+    class Core(np.ndarray):
+        def __sub__(self,other):
+            value=np.ndarray.__sub__(self,other).view(Delta)
+            temporaries.append(weakref.ref(value))
+            return value
+    original_numpy=block_solver._numpy;commit=BlockStore.commit
+    def tracked(value):
+        result=original_numpy(value)
+        return result.view(Core) if result.dtype==np.float64 else result
+    def checked(store,*args,**kwargs):
+        assert temporaries and all(ref() is None for ref in temporaries)
+        assert all(ref() is None for ref in selected)
+        return commit(store,*args,**kwargs)
+    monkeypatch.setattr(block_solver,'_numpy',tracked)
+    monkeypatch.setattr(block_solver,'solve_field',known_updates)
+    monkeypatch.setattr(BlockStore,'commit',checked)
+    solve_blocks(tmp_path/'field',**options(),
+                 **(dict(observer=Journal(tmp_path/'journal.json')) if enabled else {}))

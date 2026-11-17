@@ -471,10 +471,11 @@ def solve_blocks(
                 advice_state["active_wall_s"] = segment_prefix + time.perf_counter() - segment_started - (boundary_s - segment_boundary_start)
 
             try:
+                if first_block == len(ordered):
+                    completed_advice()
                 if stopped():
                     return emit("CHECKPOINTED_STOP")
                 if first_block == len(ordered):
-                    completed_advice()
                     first_sweep, first_block, maximum = first_sweep + 1, 0, 0.0
                 for sweep in range(first_sweep, sweeps + 1):
                     if sweep != first_sweep:
@@ -611,10 +612,13 @@ def solve_blocks(
                         core = _numpy(result[owned])
                         delta = core - current[owned]
                         change = float(np.max(abs(delta)))
+                        if observer is None:
+                            del delta
                         maximum = max(maximum, change)
                         owned_observed = _numpy(observed[owned])
                         if observer is not None:
                             telemetry_started = time.perf_counter()
+                            selected = None
                             try:
                                 selected = delta[owned_observed]
                                 square_sum = float(np.sum(selected * selected, dtype=np.float64))
@@ -640,6 +644,8 @@ def solve_blocks(
                                 observer_error(error)
                                 advice_state = None
                                 observer = None
+                            finally:
+                                del selected, delta
                         next_completed = list(completed)
                         if block + 1 == len(ordered):
                             next_completed.append(dict(sweep=sweep, cores=len(ordered), max_core_update=maximum))
@@ -686,7 +692,6 @@ def solve_blocks(
                             result,
                             core,
                             fixed_values,
-                            delta,
                             owned_observed,
                         )
                 return emit("SWEEP_BUDGET_REACHED")

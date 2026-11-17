@@ -30,10 +30,18 @@ class AdvisoryIntegrityError(RuntimeError):
 
 def _new_advice(sweep, block, scientific_sha):
     return dict(
-        schema="field-observer-v1", scientific_sha256=scientific_sha,
-        measurement_scope="pre_encoding_owned_observed", sweep=sweep, next_block=block,
-        observed_max_update=None, observed_sum_sq=0.0, observed_count=0,
-        complete=block == 0, candidates=[], work_s=0.0, control_s=0.0,
+        schema="field-observer-v1",
+        scientific_sha256=scientific_sha,
+        measurement_scope="pre_encoding_owned_observed",
+        sweep=sweep,
+        next_block=block,
+        observed_max_update=None,
+        observed_sum_sq=0.0,
+        observed_count=0,
+        complete=block == 0,
+        candidates=[],
+        work_s=0.0,
+        control_s=0.0,
         timing_complete=block == 0,
     )
 
@@ -42,12 +50,17 @@ def _restore_advice(saved, sweep, block, scientific_sha):
     if saved is None:
         return _new_advice(sweep, block, scientific_sha)
     saved = deepcopy(saved)
-    if (saved.get("schema") != "field-observer-v1"
-            or saved.get("scientific_sha256") != scientific_sha
-            or saved.get("sweep") != sweep or saved.get("next_block") != block
-            or type(saved.get("observed_count")) is not int or saved["observed_count"] < 0
-            or type(saved.get("complete")) is not bool
-            or not isinstance(saved.get("candidates"), list) or len(saved["candidates"]) > 32):
+    if (
+        saved.get("schema") != "field-observer-v1"
+        or saved.get("scientific_sha256") != scientific_sha
+        or saved.get("sweep") != sweep
+        or saved.get("next_block") != block
+        or type(saved.get("observed_count")) is not int
+        or saved["observed_count"] < 0
+        or type(saved.get("complete")) is not bool
+        or not isinstance(saved.get("candidates"), list)
+        or len(saved["candidates"]) > 32
+    ):
         raise ValueError("incompatible advisory accumulator")
     for key in ("observed_sum_sq", "work_s", "control_s"):
         if type(saved.get(key)) not in (int, float) or not math.isfinite(saved[key]) or saved[key] < 0:
@@ -209,10 +222,12 @@ def solve_blocks(
     Jacobi is an implicit invariant of the v1 run identity; other policies are
     rejected before opening the store. The solver receipt records it explicitly.
     """
-    if observer is not None and not all(callable(getattr(observer, name, None)) for name in ("restore", "prepare", "complete")):
+    if observer is not None and not all(
+        callable(getattr(observer, name, None)) for name in ("restore", "prepare", "complete")
+    ):
         raise ValueError("observer requires restore/prepare/complete")
     observer_requested = observer is not None
-    observer_errors = []
+    observer_errors: list[str] = []
     advice_state = None
     prepared_cache: dict[tuple, PreparedField] = {}
     denied_keys: set[tuple] = set()
@@ -350,8 +365,9 @@ def solve_blocks(
                 raise ValueError("invalid persisted source receipts")
 
             scientific_problem = {k: v for k, v in problem.items() if k != "sweeps"}
-            scientific_sha = hashlib.sha256(json.dumps(
-                scientific_problem, sort_keys=True, allow_nan=False).encode()).hexdigest()
+            scientific_sha = hashlib.sha256(
+                json.dumps(scientific_problem, sort_keys=True, allow_nan=False).encode()
+            ).hexdigest()
 
             def snapshot():
                 path = root / "CHECKPOINT.json"
@@ -359,9 +375,12 @@ def solve_blocks(
                     raw = path.read_bytes()
                 except OSError as error:
                     raise AdvisoryIntegrityError("cannot read scientific checkpoint") from error
-                return dict(checkpoint_path=str(path.resolve()),
-                            checkpoint_sha256=hashlib.sha256(raw).hexdigest(),
-                            scientific_sha256=scientific_sha, manifest=store.manifest)
+                return dict(
+                    checkpoint_path=str(path.resolve()),
+                    checkpoint_sha256=hashlib.sha256(raw).hexdigest(),
+                    scientific_sha256=scientific_sha,
+                    manifest=store.manifest,
+                )
 
             def observer_error(error):
                 message = f"{type(error).__name__}: {error}"
@@ -372,8 +391,9 @@ def solve_blocks(
             if observer is not None:
                 try:
                     initial_snapshot = snapshot()
-                    advice_state = _restore_advice(observer.restore(initial_snapshot),
-                                                   first_sweep, first_block, scientific_sha)
+                    advice_state = _restore_advice(
+                        observer.restore(initial_snapshot), first_sweep, first_block, scientific_sha
+                    )
                 except AdvisoryIntegrityError:
                     raise
                 except Exception as error:
@@ -456,7 +476,9 @@ def solve_blocks(
                     metrics = deepcopy(advice_state)
                     count = metrics["observed_count"]
                     metrics["observed_rms_update"] = math.sqrt(metrics["observed_sum_sq"] / count) if count else None
-                    metrics["active_wall_s"] = segment_prefix + time.perf_counter() - segment_started - (boundary_s - segment_boundary_start)
+                    metrics["active_wall_s"] = (
+                        segment_prefix + time.perf_counter() - segment_started - (boundary_s - segment_boundary_start)
+                    )
                     metrics["timing_scope"] = "active sweep including commits/observer; stop callbacks excluded"
                     event["metrics"] = metrics
                     observer.complete(event)  # Void: never a stop/sweep/publication decision.
@@ -468,7 +490,9 @@ def solve_blocks(
                     advice_state = None
                     return
                 advice_state["control_s"] += time.perf_counter() - started_observer
-                advice_state["active_wall_s"] = segment_prefix + time.perf_counter() - segment_started - (boundary_s - segment_boundary_start)
+                advice_state["active_wall_s"] = (
+                    segment_prefix + time.perf_counter() - segment_started - (boundary_s - segment_boundary_start)
+                )
 
             try:
                 if first_block == len(ordered):
@@ -620,6 +644,7 @@ def solve_blocks(
                             telemetry_started = time.perf_counter()
                             selected = None
                             try:
+                                assert advice_state is not None and block_started is not None
                                 selected = delta[owned_observed]
                                 square_sum = float(np.sum(selected * selected, dtype=np.float64))
                                 cumulative = advice_state["observed_sum_sq"] + square_sum
@@ -630,16 +655,20 @@ def solve_blocks(
                                 if selected.size:
                                     local_max = float(np.max(abs(selected)))
                                     advice_state["observed_max_update"] = max(
-                                        advice_state["observed_max_update"] or 0.0, local_max)
+                                        advice_state["observed_max_update"] or 0.0, local_max
+                                    )
                                     # One representative per block, bounded deterministic rank.
                                     ij = np.asarray(np.unravel_index(int(owned_observed.argmax()), core.shape)) + low
                                     rank = hashlib.sha256(key.astype("<i8").tobytes()).hexdigest()
                                     candidate = dict(node=int(np.ravel_multi_index(tuple(ij), shape)), rank=rank)
                                     advice_state["candidates"] = sorted(
-                                        advice_state["candidates"] + [candidate], key=lambda value: value["rank"])[:32]
+                                        advice_state["candidates"] + [candidate], key=lambda value: value["rank"]
+                                    )[:32]
                                 advice_state["next_block"] = block + 1
                                 advice_state["control_s"] += time.perf_counter() - telemetry_started
-                                advice_state["work_s"] += time.perf_counter() - block_started - (boundary_s - block_boundary_start)
+                                advice_state["work_s"] += (
+                                    time.perf_counter() - block_started - (boundary_s - block_boundary_start)
+                                )
                             except Exception as error:
                                 observer_error(error)
                                 advice_state = None
@@ -667,12 +696,14 @@ def solve_blocks(
                         if observer is None:
                             commit = store.commit(key, core, pending, owned_observed)
                         else:
+
                             def prepare(event):
                                 observed_at = time.perf_counter()
                                 try:
                                     observer.prepare(event, deepcopy(advice_state))
                                 finally:
                                     advice_state["control_s"] += time.perf_counter() - observed_at
+
                             commit = store.commit(key, core, pending, owned_observed, prepare=prepare)
                             if commit["prepare_error"]:
                                 observer_error(RuntimeError(commit["prepare_error"]))

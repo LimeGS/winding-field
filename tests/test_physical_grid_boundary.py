@@ -65,11 +65,11 @@ def test_nonfinite_boundary_points_remain_invalid(value):
 def test_imported_stride_172_8um_pair_retains_exact_final_node():
     from field_constraints import pair_constraints
 
-    origin = np.array([137.8, 254., 364.8])
+    origin = np.array([137.8, 254.0, 364.8])
     spacing = np.full(3, 172.8)
-    end = np.array([[656.2, 599.6, 1056.]])
+    end = np.array([[656.2, 599.6, 1056.0]])
     assert ((end - origin) / spacing)[0, 0] > 3
-    rows = pair_constraints([[397., 599.6, 1056.]], end, origin, spacing, (6, 6, 4))
+    rows = pair_constraints([[397.0, 599.6, 1056.0]], end, origin, spacing, (6, 6, 4))
     # X ramp: 1.5 at the first endpoint, exactly 3 at the final node.
     ramp = np.indices((6, 6, 4))[2].ravel()
     np.testing.assert_allclose(rows.matrix @ ramp, [-1.5], atol=1e-14, rtol=0)

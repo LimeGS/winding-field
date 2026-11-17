@@ -198,3 +198,19 @@ def test_closure_diagnostic_copy_failure_is_isolated(tmp_path,monkeypatch):
     with pytest.warns(RuntimeWarning,match='advice'):
         result=solve_blocks(tmp_path/'field',**options(),observer=Journal(tmp_path/'journal.json'))
     assert result['status']=='SWEEP_BUDGET_REACHED'
+
+
+def test_sweep_clock_does_not_count_existing_boundary_verifications(tmp_path,monkeypatch):
+    clock=[0.]
+    monkeypatch.setattr('block_solver.time.perf_counter',lambda:clock[0])
+    def solve(*args,**kwargs):
+        clock[0]+=1.
+        return known_updates(*args,**kwargs)
+    def existing_boundary():
+        clock[0]+=100.
+        return False
+    monkeypatch.setattr('block_solver.solve_field',solve)
+    journal=Journal(tmp_path/'journal.json')
+    solve_blocks(tmp_path/'field',**options(),observer=journal,stop=existing_boundary)
+    assert [r['metrics']['active_wall_s'] for r in journal.closures]==[2.,2.]
+    assert [r['metrics']['work_s'] for r in journal.closures]==[2.,2.]

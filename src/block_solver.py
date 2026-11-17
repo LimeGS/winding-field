@@ -6,6 +6,7 @@ import math
 import os
 import re
 import time
+import warnings
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from pathlib import Path
@@ -21,6 +22,41 @@ from field_prefetch import ObservationPrefetch
 from field_runtime import ResourceUnavailable, check_resources
 from field_solver import PreparedField, solve_field
 from field_store import BlockStore, atomic_json
+
+
+class AdvisoryIntegrityError(RuntimeError):
+    """An observer's verified scientific reader found real corruption."""
+
+
+def _new_advice(sweep, block, scientific_sha):
+    return dict(
+        schema="field-observer-v1", scientific_sha256=scientific_sha,
+        measurement_scope="pre_encoding_owned_observed", sweep=sweep, next_block=block,
+        observed_max_update=None, observed_sum_sq=0.0, observed_count=0,
+        complete=block == 0, candidates=[], work_s=0.0, control_s=0.0,
+        timing_complete=block == 0,
+    )
+
+
+def _restore_advice(saved, sweep, block, scientific_sha):
+    if saved is None:
+        return _new_advice(sweep, block, scientific_sha)
+    saved = deepcopy(saved)
+    if (saved.get("schema") != "field-observer-v1"
+            or saved.get("scientific_sha256") != scientific_sha
+            or saved.get("sweep") != sweep or saved.get("next_block") != block
+            or type(saved.get("observed_count")) is not int or saved["observed_count"] < 0
+            or type(saved.get("complete")) is not bool
+            or not isinstance(saved.get("candidates"), list) or len(saved["candidates"]) > 32):
+        raise ValueError("incompatible advisory accumulator")
+    for key in ("observed_sum_sq", "work_s", "control_s"):
+        if type(saved.get(key)) not in (int, float) or not math.isfinite(saved[key]) or saved[key] < 0:
+            raise ValueError("invalid advisory accumulator")
+    maximum = saved.get("observed_max_update")
+    if maximum is not None and (type(maximum) not in (int, float) or not math.isfinite(maximum) or maximum < 0):
+        raise ValueError("invalid advisory maximum")
+    saved["timing_complete"] = False  # The unrecorded last-commit tail cannot be invented after a restart.
+    return saved
 
 
 def _integer(value, minimum=0):
@@ -131,6 +167,7 @@ def solve_blocks(
     stop: Callable[[], bool] | None = None,
     admit: Callable[[], Any] | None = None,
     prefetch: ObservationPrefetch | None = None,
+    observer: Any = None,
 ) -> dict[str, Any]:
     """Solve each explicit owned core, persisting its exact next-block cursor.
 
@@ -172,6 +209,11 @@ def solve_blocks(
     Jacobi is an implicit invariant of the v1 run identity; other policies are
     rejected before opening the store. The solver receipt records it explicitly.
     """
+    if observer is not None and not all(callable(getattr(observer, name, None)) for name in ("restore", "prepare", "complete")):
+        raise ValueError("observer requires restore/prepare/complete")
+    observer_requested = observer is not None
+    observer_errors = []
+    advice_state = None
     prepared_cache: dict[tuple, PreparedField] = {}
     denied_keys: set[tuple] = set()
     prepared = None
@@ -307,6 +349,37 @@ def solve_blocks(
             ):
                 raise ValueError("invalid persisted source receipts")
 
+            scientific_problem = {k: v for k, v in problem.items() if k != "sweeps"}
+            scientific_sha = hashlib.sha256(json.dumps(
+                scientific_problem, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+            def snapshot():
+                path = root / "CHECKPOINT.json"
+                try:
+                    raw = path.read_bytes()
+                except OSError as error:
+                    raise AdvisoryIntegrityError("cannot read scientific checkpoint") from error
+                return dict(checkpoint_path=str(path.resolve()),
+                            checkpoint_sha256=hashlib.sha256(raw).hexdigest(),
+                            scientific_sha256=scientific_sha, manifest=store.manifest)
+
+            def observer_error(error):
+                message = f"{type(error).__name__}: {error}"
+                if len(observer_errors) < 16:
+                    observer_errors.append(message)
+                    warnings.warn("field advice unavailable: " + message, RuntimeWarning, stacklevel=2)
+
+            if observer is not None:
+                try:
+                    initial_snapshot = snapshot()
+                    advice_state = _restore_advice(observer.restore(initial_snapshot),
+                                                   first_sweep, first_block, scientific_sha)
+                except AdvisoryIntegrityError:
+                    raise
+                except Exception as error:
+                    observer_error(error)
+                    observer = None
+
             running_published = False
 
             def emit(status, **extra):
@@ -341,12 +414,23 @@ def solve_blocks(
                     **extra,
                 )
                 atomic_json(root / "STATUS.json", result)
+                if observer_requested and status != "RUNNING":
+                    result.update(advisory=advice_state, advisory_errors=observer_errors)
                 if status == "RUNNING":
                     running_published = True
                 return result
 
+            boundary_s = 0.0
+
             def stopped():
-                return (root / "STOP").exists() or (stop is not None and bool(stop()))
+                nonlocal boundary_s
+                if not observer_requested:
+                    return (root / "STOP").exists() or (stop is not None and bool(stop()))
+                before_boundary = time.perf_counter()
+                try:
+                    return (root / "STOP").exists() or (stop is not None and bool(stop()))
+                finally:
+                    boundary_s += time.perf_counter() - before_boundary
 
             def admitted():
                 check_resources(root, reserve_bytes=reserve_bytes)
@@ -358,7 +442,37 @@ def solve_blocks(
                 high = np.minimum(low + chunk, shape)
                 return low, high, np.maximum(low - halo, 0), np.minimum(high + halo, shape)
 
+            segment_started = time.perf_counter()
+            segment_boundary_start = boundary_s
+            segment_prefix = advice_state["work_s"] if advice_state is not None else 0.0
+
+            def completed_advice():
+                nonlocal observer, advice_state
+                if observer is None or advice_state is None:
+                    return
+                started_observer = time.perf_counter()
+                try:
+                    event = snapshot()
+                    metrics = deepcopy(advice_state)
+                    count = metrics["observed_count"]
+                    metrics["observed_rms_update"] = math.sqrt(metrics["observed_sum_sq"] / count) if count else None
+                    metrics["active_wall_s"] = segment_prefix + time.perf_counter() - segment_started - (boundary_s - segment_boundary_start)
+                    metrics["timing_scope"] = "active sweep including commits/observer; stop callbacks excluded"
+                    event["metrics"] = metrics
+                    observer.complete(event)  # Void: never a stop/sweep/publication decision.
+                except AdvisoryIntegrityError:
+                    raise
+                except Exception as error:
+                    observer_error(error)
+                    observer = None
+                    advice_state = None
+                    return
+                advice_state["control_s"] += time.perf_counter() - started_observer
+                advice_state["active_wall_s"] = segment_prefix + time.perf_counter() - segment_started - (boundary_s - segment_boundary_start)
+
             try:
+                if first_block == len(ordered):
+                    completed_advice()
                 if stopped():
                     return emit("CHECKPOINTED_STOP")
                 if first_block == len(ordered):
@@ -366,7 +480,13 @@ def solve_blocks(
                 for sweep in range(first_sweep, sweeps + 1):
                     if sweep != first_sweep:
                         maximum = 0.0
+                    if observer is not None and (advice_state is None or advice_state["sweep"] != sweep):
+                        advice_state = _new_advice(sweep, 0, scientific_sha)
+                        segment_started, segment_prefix = time.perf_counter(), 0.0
+                        segment_boundary_start = boundary_s
                     for block in range(first_block if sweep == first_sweep else 0, len(ordered)):
+                        block_started = time.perf_counter() if observer is not None else None
+                        block_boundary_start = boundary_s
                         if stopped():
                             return emit("CHECKPOINTED_STOP")
                         admitted()
@@ -490,8 +610,42 @@ def solve_blocks(
                             raise RuntimeError("conditional block did not converge")
                         owned = tuple(slice(int(a), int(b)) for a, b in zip(low - lo, high - lo))
                         core = _numpy(result[owned])
-                        change = float(np.max(abs(core - current[owned])))
+                        delta = core - current[owned]
+                        change = float(np.max(abs(delta)))
+                        if observer is None:
+                            del delta
                         maximum = max(maximum, change)
+                        owned_observed = _numpy(observed[owned])
+                        if observer is not None:
+                            telemetry_started = time.perf_counter()
+                            selected = None
+                            try:
+                                selected = delta[owned_observed]
+                                square_sum = float(np.sum(selected * selected, dtype=np.float64))
+                                cumulative = advice_state["observed_sum_sq"] + square_sum
+                                if not math.isfinite(cumulative):
+                                    raise ArithmeticError("nonfinite advisory sum of squares")
+                                advice_state["observed_sum_sq"] = cumulative
+                                advice_state["observed_count"] += int(selected.size)
+                                if selected.size:
+                                    local_max = float(np.max(abs(selected)))
+                                    advice_state["observed_max_update"] = max(
+                                        advice_state["observed_max_update"] or 0.0, local_max)
+                                    # One representative per block, bounded deterministic rank.
+                                    ij = np.asarray(np.unravel_index(int(owned_observed.argmax()), core.shape)) + low
+                                    rank = hashlib.sha256(key.astype("<i8").tobytes()).hexdigest()
+                                    candidate = dict(node=int(np.ravel_multi_index(tuple(ij), shape)), rank=rank)
+                                    advice_state["candidates"] = sorted(
+                                        advice_state["candidates"] + [candidate], key=lambda value: value["rank"])[:32]
+                                advice_state["next_block"] = block + 1
+                                advice_state["control_s"] += time.perf_counter() - telemetry_started
+                                advice_state["work_s"] += time.perf_counter() - block_started - (boundary_s - block_boundary_start)
+                            except Exception as error:
+                                observer_error(error)
+                                advice_state = None
+                                observer = None
+                            finally:
+                                del selected, delta
                         next_completed = list(completed)
                         if block + 1 == len(ordered):
                             next_completed.append(dict(sweep=sweep, cores=len(ordered), max_core_update=maximum))
@@ -510,9 +664,22 @@ def solve_blocks(
                             physical_acceptance=False,
                         )
                         admitted()
-                        commit = store.commit(key, core, pending, _numpy(observed[owned]))
+                        if observer is None:
+                            commit = store.commit(key, core, pending, owned_observed)
+                        else:
+                            def prepare(event):
+                                observed_at = time.perf_counter()
+                                try:
+                                    observer.prepare(event, deepcopy(advice_state))
+                                finally:
+                                    advice_state["control_s"] += time.perf_counter() - observed_at
+                            commit = store.commit(key, core, pending, owned_observed, prepare=prepare)
+                            if commit["prepare_error"]:
+                                observer_error(RuntimeError(commit["prepare_error"]))
                         stored_bytes = commit["stored_bytes"]
                         progress, completed = pending, next_completed
+                        if block + 1 == len(ordered):
+                            completed_advice()
                         emit("RUNNING", phase="checkpointed")
                         del (
                             target,
@@ -525,6 +692,7 @@ def solve_blocks(
                             result,
                             core,
                             fixed_values,
+                            owned_observed,
                         )
                 return emit("SWEEP_BUDGET_REACHED")
             except Exception as error:

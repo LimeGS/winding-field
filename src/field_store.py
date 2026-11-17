@@ -29,7 +29,7 @@ import shutil
 import stat
 import uuid
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import dataclass
@@ -531,10 +531,31 @@ class BlockStore:
             raise ValueError("checkpoint progress must be a JSON object")
         return _json_load(_json_bytes(progress))
 
-    def _publish(self, manifest: dict[str, Any], payload: tuple[str, bytes] | None = None) -> None:
+    def _publish(
+        self, manifest: dict[str, Any], payload: tuple[str, bytes] | None = None,
+        prepare: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any] | None:
         manifest_bytes = _json_bytes(manifest)
+        diagnostics = None
         try:
             self._admit(len(manifest_bytes) + (len(payload[1]) if payload else 0))
+            if prepare is not None:
+                previous = _read_file(self.root / "CHECKPOINT.json")
+                diagnostics = dict(checkpoint_sha256=None, prepare_error=None)
+                try:
+                    descriptor = dict(
+                        checkpoint_path=str((self.root / "CHECKPOINT.json").resolve()),
+                        previous_checkpoint_sha256=hashlib.sha256(previous).hexdigest(),
+                        checkpoint_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+                        manifest=deepcopy(manifest),
+                        scientific_bytes=len(manifest_bytes) + (len(payload[1]) if payload else 0),
+                        reserve_bytes=self.reserve_bytes,
+                    )
+                    diagnostics["checkpoint_sha256"] = descriptor["checkpoint_sha256"]
+                    prepare(descriptor)
+                except Exception as error:
+                    # This observer cannot read/write science; failure never poisons the store.
+                    diagnostics["prepare_error"] = f"{type(error).__name__}: {error}"
             if payload is not None:
                 name, raw = payload
                 destination = self.root / name
@@ -552,6 +573,7 @@ class BlockStore:
                 self._cache_nbytes = 0
             raise
         self._manifest = manifest
+        return diagnostics
 
     def commit(
         self,
@@ -559,6 +581,8 @@ class BlockStore:
         values: ArrayLike,
         progress: dict[str, Any],
         observed: ArrayLike | None = None,
+        *,
+        prepare: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Durably replace one entire owned core and progress in one transaction.
 
@@ -615,7 +639,8 @@ class BlockStore:
                         self._cache.clear()
                         self._cache_nbytes = 0
                     raise
-            self._publish(next_manifest, payload)
+            diagnostics = (self._publish(next_manifest, payload) if prepare is None
+                           else self._publish(next_manifest, payload, prepare=prepare))
             if old is not None:
                 with self._cache_lock:
                     retired = self._cache.pop(old["path"], None)
@@ -631,7 +656,10 @@ class BlockStore:
             if payload is not None and decoded is not None:
                 self._retain(payload[0], decoded)
             # shortcut: interrupted/unreferenced generations require verified manual cleanup.
-            return dict(quantization_max=error, stored_bytes=sum(v["bytes"] for v in self._manifest["chunks"].values()))
+            result = dict(quantization_max=error, stored_bytes=sum(v["bytes"] for v in self._manifest["chunks"].values()))
+            if diagnostics is not None:
+                result.update(diagnostics)
+            return result
 
     def save_progress(self, progress: dict[str, Any]) -> None:
         """Replace all progress atomically; preserve cumulative sweep statistics."""

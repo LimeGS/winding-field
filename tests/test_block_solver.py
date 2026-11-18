@@ -378,3 +378,82 @@ def test_callable_constraints_reject_invalid_local_rows_before_commit(tmp_path):
     with pytest.raises(ValueError, match="constraint"):
         runner()(tmp_path / "run", **options)
     assert state(tmp_path / "run")[0]["progress"]["next_block"] == 0
+
+
+def test_continue_policy_commits_budget_exhausted_blocks_and_counts_them(tmp_path):
+    options = case(tmp_path)
+    options["maxiter"] = 0
+    with pytest.raises(ValueError, match="nonconvergence_policy"):
+        runner()(tmp_path / "invalid", nonconvergence_policy="ignore", **options)
+    assert not (tmp_path / "invalid").exists()
+    result = runner()(tmp_path / "run", nonconvergence_policy="continue", **options)
+    checkpoint, field, observed = state(tmp_path / "run")
+    assert result["status"] == "SWEEP_BUDGET_REACHED" and len(result["completed_sweeps"]) == 2
+    assert result["nonconverged_solves"] == checkpoint["progress"]["nonconverged_solves"] == 4
+    assert result["local_solves_converged"] is False and result["nonconvergence_policy"] == "continue"
+    assert checkpoint["progress"]["solver"]["converged"] is False
+    assert checkpoint["progress"]["solver"]["reason"] == "maxiter"
+    assert np.isfinite(field).all() and observed.all()
+    assert result["global_converged"] is False and result["physical_acceptance"] is False
+
+
+def test_converged_run_reports_zero_nonconverged_solves(tmp_path):
+    result = runner()(tmp_path / "run", nonconvergence_policy="continue", **case(tmp_path))
+    assert result["nonconverged_solves"] == 0 and result["local_solves_converged"] is True
+    assert state(tmp_path / "run")[0]["progress"]["nonconverged_solves"] == 0
+
+
+def test_continue_policy_still_fails_on_numerical_breakdown(tmp_path, monkeypatch):
+    import block_solver
+
+    original = block_solver.solve_field
+
+    def breakdown(*args, **kwargs):
+        field, info = original(*args, **kwargs)
+        return field, dict(info, converged=False, reason="nonpositive_curvature")
+
+    monkeypatch.setattr(block_solver, "solve_field", breakdown)
+    with pytest.raises(RuntimeError, match="converge"):
+        runner()(tmp_path / "run", nonconvergence_policy="continue", **case(tmp_path))
+    assert state(tmp_path / "run")[0]["progress"]["next_block"] == 0
+
+
+def test_nonconverged_count_survives_resume_and_policy_may_change(tmp_path):
+    options = case(tmp_path)
+    options["maxiter"] = 0
+    paused = runner()(
+        tmp_path / "run",
+        nonconvergence_policy="continue",
+        stop=lambda: (
+            (tmp_path / "run/CHECKPOINT.json").exists()
+            and json.loads((tmp_path / "run/CHECKPOINT.json").read_text())["progress"]["next_block"] == 1
+        ),
+        **options,
+    )
+    assert paused["status"] == "CHECKPOINTED_STOP" and paused["nonconverged_solves"] == 1
+    resumed = runner()(tmp_path / "run", nonconvergence_policy="continue", resume=True, **options)
+    assert resumed["nonconverged_solves"] == 4 and resumed["local_solves_converged"] is False
+    options["maxiter"] = 1000
+    with pytest.raises(ValueError):
+        # The numerical problem (maxiter) is part of the identity; only the policy may change.
+        runner()(tmp_path / "run", nonconvergence_policy="fail", resume=True, **options)
+
+
+def test_legacy_progress_without_counter_resumes_as_zero(tmp_path):
+    options = case(tmp_path)
+    paused = runner()(
+        tmp_path / "run",
+        stop=lambda: (
+            (tmp_path / "run/CHECKPOINT.json").exists()
+            and json.loads((tmp_path / "run/CHECKPOINT.json").read_text())["progress"]["next_block"] == 1
+        ),
+        **options,
+    )
+    assert paused["status"] == "CHECKPOINTED_STOP"
+    metadata = json.loads((tmp_path / "run/CHECKPOINT.json").read_text())
+    with BlockStore(tmp_path / "run", metadata["shape"], metadata["chunk"], metadata["identity"], resume=True) as store:
+        progress = dict(store.manifest["progress"])
+        progress.pop("nonconverged_solves")
+        store.save_progress(progress)
+    resumed = runner()(tmp_path / "run", resume=True, **options)
+    assert resumed["nonconverged_solves"] == 0 and resumed["status"] == "SWEEP_BUDGET_REACHED"

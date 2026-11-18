@@ -169,6 +169,7 @@ def solve_blocks(
     maxiter: int = 4000,
     dtype: Literal["float32", "float64"] = "float64",
     preconditioner: Literal["jacobi"] = "jacobi",
+    nonconvergence_policy: Literal["fail", "continue"] = "fail",
     device: str = "cpu",
     cache_bytes: int = 0,
     prepared_cache_bytes: int = 0,
@@ -221,6 +222,13 @@ def solve_blocks(
     preconditioner supports the partial fixed-face masks used by block solves.
     Jacobi is an implicit invariant of the v1 run identity; other policies are
     rejected before opening the store. The solver receipt records it explicitly.
+
+    ``nonconvergence_policy='fail'`` (default) stops at the first local solve that
+    does not reach ``rtol``. ``'continue'`` commits a local solve that only exhausted
+    ``maxiter`` and keeps the sweep budget; numerical breakdowns always fail. The
+    cumulative ``nonconverged_solves`` count is checkpointed with progress and every
+    status reports it with ``local_solves_converged``. The policy is an execution
+    choice, not part of the checkpoint identity, and may change on resume.
     """
     if observer is not None and not all(
         callable(getattr(observer, name, None)) for name in ("restore", "prepare", "complete")
@@ -259,6 +267,8 @@ def solve_blocks(
             raise ValueError(
                 "block solves require preconditioner='jacobi'; spectral partial block masks are unsupported"
             )
+        if nonconvergence_policy not in ("fail", "continue"):
+            raise ValueError("nonconvergence_policy must be fail or continue")
         if status_policy not in ("all", "checkpoints"):
             raise ValueError("status_policy must be all or checkpoints")
         prepared_cache_bytes = _integer(prepared_cache_bytes)
@@ -333,6 +343,9 @@ def solve_blocks(
             if not progress:
                 progress = dict(sweep=1, next_block=0, sweep_max_update=0.0, completed_sweeps=[], source_receipts={})
                 store.save_progress(progress)
+            nonconverged = progress.get("nonconverged_solves", 0)
+            if type(nonconverged) is not int or nonconverged < 0:
+                raise ValueError("invalid persisted nonconverged solve count")
             first_sweep = _integer(progress.get("sweep"), 1)
             first_block = _integer(progress.get("next_block"))
             if first_sweep > sweeps or first_block > len(ordered):
@@ -430,6 +443,9 @@ def solve_blocks(
                     prepared_cache_stats=dict(prepared_stats),
                     prefetched_blocks=prefetched,
                     prefetch_parity=parity,
+                    nonconvergence_policy=nonconvergence_policy,
+                    nonconverged_solves=nonconverged,
+                    local_solves_converged=nonconverged == 0,
                     elapsed_s=time.perf_counter() - started,
                     **extra,
                 )
@@ -630,7 +646,10 @@ def solve_blocks(
                                 prepared_stats["peak_denied_bytes"] = prepared_stats["denied_bytes"]
                                 prepared_stats["peak_bytes"] = prepared_stats["retained_bytes"]
                         prepared = None
-                        if not solver["converged"]:
+                        block_converged = bool(solver["converged"])
+                        if not block_converged and (
+                            nonconvergence_policy != "continue" or solver.get("reason") != "maxiter"
+                        ):
                             raise RuntimeError("conditional block did not converge")
                         owned = tuple(slice(int(a), int(b)) for a, b in zip(low - lo, high - lo))
                         core = _numpy(result[owned])
@@ -686,6 +705,7 @@ def solve_blocks(
                             sweep_max_update=maximum,
                             completed_sweeps=next_completed,
                             source_receipts=seen,
+                            nonconverged_solves=nonconverged + (not block_converged),
                             solver=dict(solver, scope="pre_encoding_local_solve"),
                             core_max_update=change,
                             decoded_fixed_value_error_max=fixed_error,
@@ -709,6 +729,7 @@ def solve_blocks(
                                 observer_error(RuntimeError(commit["prepare_error"]))
                         stored_bytes = commit["stored_bytes"]
                         progress, completed = pending, next_completed
+                        nonconverged = pending["nonconverged_solves"]
                         if block + 1 == len(ordered):
                             completed_advice()
                         emit("RUNNING", phase="checkpointed")

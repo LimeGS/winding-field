@@ -21,13 +21,13 @@ module files and must not be installed together. Keep the original environment f
 saved runs whose runtime identity is pinned. The separate `winding-field-cli`
 package provides the `winding-field` command.
 
-[![Six Paris4 winding levels: geometry, CT-textured surfaces and available continuous flattened CT diagnostics](assets/paris4-six-surfaces.png)](assets/paris4-six-surfaces.png)
+[![Six Paris4 winding levels: geometry, CT-textured surfaces and available continuous flattened CT diagnostics](assets/paris4-six-surfaces-preview.jpg)](assets/paris4-six-surfaces.png)
 
 *Paris4 six-surface diagnostics. The continuous flattened surface at W = −120
 is unavailable; masked and unmapped areas remain blank. Physical sheet identity
 is unverified. [Image attribution and terms](DATA.md#readme-illustrations).*
 
-[![Paris4 CT in XY, XZ and YZ views beside global B2 and fine-candidate winding contours](assets/ct-winding.png)](assets/ct-winding.png)
+[![Paris4 CT in XY, XZ and YZ views beside global B2 and fine-candidate winding contours](assets/ct-winding-preview.jpg)](assets/ct-winding.png)
 
 *Earlier Paris4 CT/winding overlay: CT at 9.6 µm/pixel, the global B2 field at
 307.2 µm and a local fine pilot at 19.2 µm. This illustration is separate from

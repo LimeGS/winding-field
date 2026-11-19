@@ -2,7 +2,9 @@
 
 [![Audit](https://github.com/LimeGS/winding-field/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/LimeGS/winding-field/actions/workflows/ci.yml)
 [![Coverage (local): 92.54%](https://img.shields.io/badge/coverage%20%28local%29-92.54%25-brightgreen)](#checks)
-[![Code license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Python 3.11–3.12](https://img.shields.io/badge/python-3.11%E2%80%933.12-blue)](pyproject.toml)
+[![Release](https://img.shields.io/github/v/release/LimeGS/winding-field?include_prereleases)](https://github.com/LimeGS/winding-field/releases)
 
 Experimental software for constructing continuous winding-coordinate fields over
 predicted scroll surfaces, and evaluating saved fields against a frozen case.
@@ -310,3 +312,18 @@ CT-derived images. The public tests generate synthetic fixtures. Follow
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development and compatibility rules,
 and [SECURITY.md](SECURITY.md) for vulnerability reporting. Maintenance is
 best-effort, with no release cadence or support SLA.
+
+## Related projects
+
+Part of the LimeGS toolchain for the [Vesuvius Challenge](https://scrollprize.org):
+
+- [winding-field-cli](https://github.com/LimeGS/winding-field-cli): end-to-end CLI from CT to fibres, winding field, meshes and flattened charts.
+- [ink-sdk](https://github.com/LimeGS/ink-sdk): standalone ink inference on surface volumes, or on tifxyz meshes plus CT.
+- [helena-framework](https://github.com/LimeGS/helena-framework): reproducible, auditable orchestration of the volume → surface → ink → page pipeline.
+- [herculaneum-legibility-index](https://github.com/LimeGS/herculaneum-legibility-index): legibility triage over the official ink maps.
+- [herculaneum-legibility-v5](https://github.com/LimeGS/herculaneum-legibility-v5): corrected-label retraining of the legibility classifier.
+- [vesuvius-chat](https://github.com/LimeGS/vesuvius-chat): search the Discord research archive from a web chat or an AI agent.
+
+## Citation
+
+If you use this work, please cite it with the metadata in [CITATION.cff](CITATION.cff) (GitHub's **Cite this repository** button reads it).

@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it using the metadata from this file."
+type: software
+title: "winding-field"
+abstract: "Experimental software for constructing continuous winding-coordinate fields over predicted scroll surfaces"
+authors:
+  - name: LimeGS
+repository-code: https://github.com/LimeGS/winding-field
+license: MIT
+version: "1.5.3"
+keywords:
+  - herculaneum-scrolls
+  - python
+  - scientific-computing
+  - vesuvius-challenge
+  - volumetric-imaging

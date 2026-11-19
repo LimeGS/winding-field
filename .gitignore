@@ -47,4 +47,7 @@ de/
 de_ref/
 seg*/
 logs/
-.claude/
+.claude/*
+# Repository skills are shared; local Claude settings stay ignored.
+!.claude/skills/
+.verify/

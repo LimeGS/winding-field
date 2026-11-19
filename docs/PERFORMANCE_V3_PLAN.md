@@ -1,8 +1,8 @@
 # Solver performance v3 execution ledger
 
 Approved scope: A–E from the user specification, 2026-11-04.
-Core baseline: `82e0496b1ebe75f5b48ff92ca426233e35e61fc4`.
-CLI committed baseline: `3f00b767b60c82ed331d66d47339c9252f5127bd`.
+Core baseline: `9a7999f78bbf4e96e22229e09c497db2eb952767`.
+CLI committed baseline: `19b6662302df8ca3b8a6512692cdc9b5923fe864`.
 Both branches: `feat/perf-optimizations-v3`; CLI uses an isolated worktree.
 Original CLI dirty checkout, core stash and Lean branch/cache are preserved.
 

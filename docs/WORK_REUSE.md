@@ -1,8 +1,8 @@
 # Static work and PCG buffers
 
 Version 1.3.0.dev2 incorporates the residual-norm reuse and bounded prepared-block
-cache from upstream 82e0496 while preserving the core/CLI module separation at
-f750fd11. Numerical tolerances, dtypes, iteration/restart gates and the independent
+cache from upstream 9a7999f while preserving the core/CLI module separation at
+aa3e0d24. Numerical tolerances, dtypes, iteration/restart gates and the independent
 final true residual are unchanged. PCG output, residual, preconditioned residual,
 search direction and stencil scratch buffers are reused; arithmetic is not fused.
 Returned fields never alias these work buffers. PreparedField is single-caller.

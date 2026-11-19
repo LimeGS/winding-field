@@ -122,7 +122,7 @@ revision metadata and an executable copy of the harness:
 ```sh
 .venv-perf-v2-cpu/bin/python benchmarks/performance/v3.py \
   --baseline /absolute/path/to/archived-current-baseline \
-  --baseline-commit 82e0496b1ebe75f5b48ff92ca426233e35e61fc4 \
+  --baseline-commit 9a7999f78bbf4e96e22229e09c497db2eb952767 \
   --candidate . --output /absolute/path/to/new-evidence --repetitions 8
 ```
 
@@ -220,7 +220,7 @@ Evidence root relative to this checkout:
 `summary.json`, one raw JSON per case, all measured fields, frozen source variants,
 and the executed harness. The two `harness-smoke*` directories are validation
 smokes and **are not pooled into these tables**. Baseline is the source archive
-of `82e0496`; candidate provenance records its dirty-source hashes, subsequently
+of `9a7999f`; candidate provenance records its dirty-source hashes, subsequently
 committed locally. No measured source changed during the run.
 
 Validation executed locally:

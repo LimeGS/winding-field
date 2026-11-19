@@ -12,12 +12,12 @@ PY=.venv-perf-v2-cpu/bin/python
 E=/absolute/path/to/new-performance-evidence
 mkdir "$E"
 mkdir "$E/baseline"
-git archive aaa1a77a89a76c6f2bd739b956649c4c94d59011 src | tar -x -C "$E/baseline"
+git archive 8cfb1cb86ea95a220e97a6e8b7849899e361f12a src | tar -x -C "$E/baseline"
 "$PY" benchmarks/performance/run.py --source "$E/baseline" \
-  --commit aaa1a77a89a76c6f2bd739b956649c4c94d59011 --output "$E/before"
+  --commit 8cfb1cb86ea95a220e97a6e8b7849899e361f12a --output "$E/before"
 "$PY" benchmarks/performance/run.py --source . --output "$E/after"
 "$PY" benchmarks/performance/run.py --source "$E/baseline" \
-  --commit aaa1a77a89a76c6f2bd739b956649c4c94d59011 --output "$E/original-blocks" \
+  --commit 8cfb1cb86ea95a220e97a6e8b7849899e361f12a --output "$E/original-blocks" \
   --cases blocks-constraints --seed 423
 "$PY" benchmarks/performance/run.py --source . --output "$E/cache-off" \
   --cases blocks-constraints --seed 423

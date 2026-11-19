@@ -3,7 +3,7 @@
 ## Scope and execution ledger
 
 Specification: November 4, 2026 user request, P1–P5. Baseline HEAD is exactly
-`aaa1a77a89a76c6f2bd739b956649c4c94d59011`; no reference adaptation is needed.
+`8cfb1cb86ea95a220e97a6e8b7849899e361f12a`; no reference adaptation is needed.
 Work is on `feat/perfomance-optimizations-v2`. The previous stash is untouched.
 No applicable AGENTS.md exists. CONTRIBUTING.md, pyproject.toml and CI were read.
 
@@ -11,11 +11,11 @@ Local implementation commits, in the requested order:
 
 | Change | Commit | Production files/functions |
 |---|---|---|
-| P1 | `1692ee1` | `coherence_pipeline._sample_arclength_pairs`, `compile_fibres` |
-| P2 | `d3a1bf7` | `field_solver.solve_field` |
-| P3 | `fcee501` | `field_solver.PreparedField.retained_bytes`, `block_solver.solve_blocks` |
-| P4 | `fdbf0b4` | `anisotropic_reference.solve_arrival` |
-| P5 | `93632c3` | `surface_mesh._prepare_tile`, `_tile_mesh_once`, `_tile_mesh`, `extract_mesh` |
+| P1 | `8e01799` | `coherence_pipeline._sample_arclength_pairs`, `compile_fibres` |
+| P2 | `cc5d4c4` | `field_solver.solve_field` |
+| P3 | `ea83755` | `field_solver.PreparedField.retained_bytes`, `block_solver.solve_blocks` |
+| P4 | `cb3df08` | `anisotropic_reference.solve_arrival` |
+| P5 | `6c3200f` | `surface_mesh._prepare_tile`, `_tile_mesh_once`, `_tile_mesh`, `extract_mesh` |
 
 Independent source/test preparation was allowed, but integration commits follow
 P1–P5. Existing `field_constraints`, `constraint_templates`, `field_store`,
@@ -116,7 +116,7 @@ repetitions: baseline median 13.115 ms (IQR 0.850), candidate 12.696 ms
 equal fields. This small timing difference alone is not a pipeline speedup;
 the deterministic reduction-count test establishes the avoided work.
 
-A second direct comparison loaded `aaa1a77:src/field_solver.py` in an independent
+A second direct comparison loaded `8cfb1cb:src/field_solver.py` in an independent
 module in the same interpreter. All 54 combinations of float32/64, maxiter
 0/1/100, and ordinary/zero RHS/nonzero initial/all-fixed/repeated pairs/continuous
 consensus/underflow/overflow/nonfinite residual cases had exactly equal fields
@@ -233,10 +233,10 @@ From the checkout, with new output directories:
 PY=.venv-perf-v2-cpu/bin/python
 E=$WORKSPACE/artifacts/winding-perf-v2-20261104
 "$PY" benchmarks/performance/run.py --source "$E/baseline" \
-  --commit aaa1a77a89a76c6f2bd739b956649c4c94d59011 --output "$E/replay-baseline"
+  --commit 8cfb1cb86ea95a220e97a6e8b7849899e361f12a --output "$E/replay-baseline"
 "$PY" benchmarks/performance/run.py --source . --output "$E/replay-candidate"
 "$PY" benchmarks/performance/run.py --source "$E/baseline" \
-  --commit aaa1a77a89a76c6f2bd739b956649c4c94d59011 --output "$E/replay-original-blocks" \
+  --commit 8cfb1cb86ea95a220e97a6e8b7849899e361f12a --output "$E/replay-original-blocks" \
   --cases blocks-constraints --seed 423
 "$PY" benchmarks/performance/run.py --source . --output "$E/replay-cache-off" \
   --cases blocks-constraints --seed 423
@@ -248,9 +248,9 @@ The guide also shows how to reconstruct the baseline using `git archive` without
 an existing local snapshot. Each run saves source/harness snapshots, exact command,
 input/config hashes, shapes, dtype, numerical settings, budgets, seeds, versions,
 hardware/threads, raw samples, cold and warm-up timings, stage diagnostics and
-memory measurements. The baseline reference is `aaa1a77`; all final candidate
-source snapshots were checked file-by-file against `93632c3`, recorded in
-`candidate-head93632c3-verification.json`. A later harness-only metadata addition
+memory measurements. The baseline reference is `8cfb1cb`; all final candidate
+source snapshots were checked file-by-file against `6c3200f`, recorded in
+`candidate-head6c3200f-verification.json`. A later harness-only metadata addition
 explicitly marks CUDA/driver as untested; original run records are not rewritten.
 
 ### Integrated baseline/candidate measurements

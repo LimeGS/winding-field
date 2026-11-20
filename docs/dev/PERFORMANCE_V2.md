@@ -225,8 +225,8 @@ per tile and verify subdivision gets its own masks.
 
 ### Reproduce throughput
 
-The portable harness is [`benchmarks/performance/run.py`](../benchmarks/performance/run.py),
-with workloads in `cases.py` and a [reproduction guide](../benchmarks/performance/README.md).
+The portable harness is [`benchmarks/performance/run.py`](../../benchmarks/performance/run.py),
+with workloads in `cases.py` and a [reproduction guide](../../benchmarks/performance/README.md).
 From the checkout, with new output directories:
 
 ```sh

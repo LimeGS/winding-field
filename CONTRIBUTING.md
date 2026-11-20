@@ -12,7 +12,7 @@ ruff format --check . && ruff check . && mypy
 python -m pytest -q --cov=src --cov-report=term-missing
 ```
 
-Target interpreters: Python 3.11 and 3.12; see the README for verified platforms.
+Target interpreters: Python 3.11 and 3.12; see the README quick start for supported platforms. Record user-visible changes in [CHANGELOG.md](CHANGELOG.md) under "Unreleased", and run `python tools/verify.py` before opening a pull request.
 Tests must stay CPU-only, synthetic and independent of live services. Install
 `".[all,dev]"` instead when also working with Zarr data. Surface and plotting
 tools are maintained in [winding-field-cli](https://github.com/LimeGS/winding-field-cli).

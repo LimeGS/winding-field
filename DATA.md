@@ -19,7 +19,7 @@ outside the public source tree. They are not installation dependencies.
 
 ## Public AFV sources
 
-The current README measurement uses **Bruniss's AFV v2** Paris4 fibre collection.
+The [results page](docs/RESULTS.md) measurement uses **Bruniss's AFV v2** Paris4 fibre collection.
 Earlier experiments also used **Qual's AFV v1**. Credit for generating and
 sharing these AFVs belongs to **Bruniss (`bruniss`)** and **Qual (`qualzz`)**,
 with data hosting provided by the [Vesuvius Challenge](https://scrollprize.org/data).
@@ -44,7 +44,7 @@ Frozen files used in the current and earlier experiments:
 - **AFV v2:** 11,127,046,144 bytes; HTTP Last-Modified **2026-10-13 03:43:29 UTC**.
   SHA-256: `1898ff5098f03a36e02c76efc5f6b3774b766b154bfc8faadca488459114c941`.
 
-The README table evaluates a saved 19.2 µm fine-band checkpoint using the frozen
+The [results page](docs/RESULTS.md) table evaluates a saved 19.2 µm fine-band checkpoint using the frozen
 v2 pair selection. Its selected and covered populations remain explicit; it is
 a development measurement from a partial checkpoint. Public URLs can be updated,
 so match the recorded hashes to reproduce a measurement. Both collections retain
@@ -62,7 +62,7 @@ for W = −120, −100, −80, −60, −40 and −20. The W = −120 continuous
 surface is unavailable; masked and unmapped areas remain blank. The panel is
 marked **UNACCEPTED**, with physical sheet identity unverified. It credits
 Bruniss for AFV v2 and the Vesuvius Challenge for the Paris4 CT data. Its visual
-diagnostics are separate from the latest-checkpoint fibre table in the README.
+diagnostics are separate from the latest-checkpoint fibre table on the [results page](docs/RESULTS.md).
 
 Image SHA-256: `d7946a44288c0aee055f6d3ad413bd40c7d28de3e41d97e19713df7874636e45`.
 The underlying data terms apply; the MIT code license does not relicense this

@@ -457,3 +457,33 @@ def test_legacy_progress_without_counter_resumes_as_zero(tmp_path):
         store.save_progress(progress)
     resumed = runner()(tmp_path / "run", resume=True, **options)
     assert resumed["nonconverged_solves"] == 0 and resumed["status"] == "SWEEP_BUDGET_REACHED"
+
+
+def test_partial_order_solves_only_owned_chunks_against_fixed_neighbours(tmp_path):
+    options = dict(case(tmp_path), constraints=None, order=[[0, 0, 1]], partial_order=True)
+    truth = 2.0 + np.broadcast_to(np.arange(6) * 0.25, options["shape"])
+
+    def fixed(lo, hi):
+        # Unowned chunk 0-0-0 (x < 4) is held at its known values; owned nodes are free.
+        result = np.full(tuple(np.asarray(hi) - lo), np.nan)
+        x = np.arange(lo[2], hi[2])
+        result[..., x < 4] = truth[lo[0] : hi[0], lo[1] : hi[1], lo[2] : hi[2]][..., x < 4]
+        return result
+
+    result = runner()(tmp_path / "run", fixed=fixed, **options)
+    assert result["status"] == "SWEEP_BUDGET_REACHED"
+    checkpoint, field, observed = state(tmp_path / "run")
+    assert set(checkpoint["chunks"]) == {"0-0-1"}
+    assert checkpoint["identity"]["order_scope"] == "partial"
+    np.testing.assert_allclose(field[..., 4:], truth[..., 4:], atol=2e-7)
+    assert not observed[..., :4].any() and observed[..., 4:].all()
+
+
+def test_partial_order_requires_fixed_values_and_full_order_identity_is_unchanged(tmp_path):
+    options = dict(case(tmp_path), order=[[0, 0, 1]], partial_order=True)
+    with pytest.raises(ValueError, match="fixed provider"):
+        runner()(tmp_path / "partial", **options)
+    with pytest.raises(ValueError, match="each owned chunk"):
+        runner()(tmp_path / "short", **dict(options, partial_order=False))
+    runner()(tmp_path / "full", **case(tmp_path))
+    assert "order_scope" not in json.loads((tmp_path / "full/CHECKPOINT.json").read_text())["identity"]

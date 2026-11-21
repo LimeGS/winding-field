@@ -133,7 +133,7 @@ def _record_sources(seen, receipts):
         seen[name] = digest
 
 
-def _block_order(order, shape, chunk):
+def _block_order(order, shape, chunk, partial=False):
     raw = np.asarray(order, dtype=object)
     if raw.ndim != 2 or raw.shape[1] != 3:
         raise ValueError("order must be Nx3 integer chunk keys")
@@ -143,11 +143,15 @@ def _block_order(order, shape, chunk):
         raise ValueError("order keys exceed integer indexing capacity") from error
     grid_shape = (np.asarray(shape) + chunk - 1) // chunk
     if (
-        len(ordered) != math.prod(map(int, grid_shape))
+        (len(ordered) != math.prod(map(int, grid_shape)) if not partial else not len(ordered))
         or (ordered >= grid_shape).any()
         or len(np.unique(ordered, axis=0)) != len(ordered)
     ):
-        raise ValueError("order must contain each owned chunk exactly once")
+        raise ValueError(
+            "partial order must list distinct in-grid chunks"
+            if partial
+            else "order must contain each owned chunk exactly once"
+        )
     return ordered
 
 
@@ -161,6 +165,7 @@ def solve_blocks(
     origin_xyz: ArrayLike,
     spacing_xyz: ArrayLike,
     order: Sequence[Sequence[int]],
+    partial_order: bool = False,
     constraints: StencilConstraints | Callable[..., QuadraticConstraints | None] | None = None,
     fixed: Callable[..., ArrayLike] | None = None,
     halo: int = 1,
@@ -193,7 +198,10 @@ def solve_blocks(
 
     Internal solve faces read the current shared field; global faces are natural
     except caller-supplied exact fixed values. With no supplied fixed provider,
-    the global first node is the zero gauge. ``order`` lists every chunk once.
+    the global first node is the zero gauge. ``order`` lists every chunk once;
+    with ``partial_order`` it lists only the owned chunks, the others are never
+    solved or stored, and the required ``fixed`` provider must supply the values
+    their nodes take inside an owned block's halo (unset nodes there read as 0).
     Stop/admission are checked at block boundaries and immediately before solve
     and commit. A long solver call is not a hard real-time interruption point.
 
@@ -292,7 +300,9 @@ def solve_blocks(
         for callback in (stop, admit):
             if callback is not None and not callable(callback):
                 raise ValueError("stop/admit must be callable")
-        ordered = _block_order(order, shape, chunk)
+        ordered = _block_order(order, shape, chunk, partial_order)
+        if partial_order and fixed is None:
+            raise ValueError("partial_order requires a fixed provider for unowned halo nodes")
         if halo == 0 and len(ordered) > 1:
             raise ValueError("a positive halo is required between multiple owned cores")
         constraint_identity = None
@@ -314,6 +324,7 @@ def solve_blocks(
             origin_xyz=origin.tolist(),
             spacing_xyz=spacing.tolist(),
             order_sha256=hashlib.sha256(ordered.astype("<i8").tobytes()).hexdigest(),
+            **({"order_scope": "partial"} if partial_order else {}),
             constraints=constraint_identity,
             boundary="caller-fixed" if fixed is not None else "natural-zero-gauge",
             halo=halo,

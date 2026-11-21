@@ -5,6 +5,11 @@ versions follow the GitHub releases.
 
 ## [Unreleased]
 
+### Added
+- `solve_blocks(partial_order=True)`: `order` may list only the owned chunks; the
+  others are never solved or stored, and a required `fixed` provider supplies their
+  values inside owned halos. Full-order identities and checkpoints are unchanged.
+
 ### Documentation
 - README reorganized: what it is, where it fits, quick start, then details.
   Method, results and migration moved to `docs/`; developer notes to `docs/dev/`.

@@ -5,6 +5,8 @@ versions follow the GitHub releases.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-21
+
 ### Added
 - `solve_blocks(partial_order=True)`: `order` may list only the owned chunks; the
   others are never solved or stored, and a required `fixed` provider supplies their
@@ -38,7 +40,8 @@ versions follow the GitHub releases.
 ## [1.5.1] - 2026-11-09
 - Solver performance and CLI-ready numerical core.
 
-[Unreleased]: https://github.com/LimeGS/winding-field/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/LimeGS/winding-field/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/LimeGS/winding-field/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/LimeGS/winding-field/compare/v1.5.3...v1.6.0
 [1.5.3]: https://github.com/LimeGS/winding-field/releases/tag/v1.5.3
 [1.5.2]: https://github.com/LimeGS/winding-field/releases/tag/v1.5.2

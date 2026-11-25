@@ -1,6 +1,7 @@
 """Opt-in, single-writer block solves with durable progress and immutable prefetch."""
 
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -566,14 +567,50 @@ def solve_blocks(
             def file_sha(path):
                 return hashlib.sha256(path.read_bytes()).hexdigest()
 
+            correction = None
+            grid_shape = tuple(int(n) for n in (np.asarray(shape) + chunk - 1) // chunk)
+            visit = np.full(grid_shape, -1, np.int64)
+            visit[tuple(ordered.T)] = np.arange(len(ordered))
+
+            def pending_correction(lo, hi, block):
+                """``P e`` on the crop nodes whose chunk this sweep has not committed yet (else 0)."""
+                out = np.zeros(tuple(map(int, hi - lo)))
+                declared = global_fixed(lo, hi, out.shape)
+                for key in itertools.product(*(range(a // chunk, (b - 1) // chunk + 1) for a, b in zip(lo, hi))):
+                    if visit[key] < block:
+                        continue
+                    a = np.maximum(np.array(key) * chunk, lo)
+                    b = np.minimum((np.array(key) + 1) * chunk, hi)
+                    zyx = np.stack([g.ravel() for g in np.meshgrid(*map(np.arange, a, b), indexing="ij")], 1)
+                    region = tuple(slice(int(x - o), int(y - o)) for x, y, o in zip(a, b, lo))
+                    free = ~np.isfinite(declared[region])
+                    out[region] = (space.rows(zyx, free.ravel()) @ correction).reshape(free.shape)
+                return out
+
+            def corrected_nodes(block):
+                """A node reader that adds the pending correction outside committed chunks."""
+
+                def read(flat):
+                    flat = np.asarray(flat, np.int64)
+                    values = np.array(store.nodes(flat), dtype=np.float64)
+                    zyx = np.stack(np.unravel_index(flat.ravel(), shape), 1)
+                    late = visit[tuple((zyx // chunk).T)] >= block
+                    if late.any():
+                        free = zyx[late].any(1) if fixed is None else np.ones(int(late.sum()), bool)
+                        values.reshape(-1)[late] += space.rows(zyx[late], free) @ correction
+                    return values
+
+                return read
+
             def coarse_phase(sweep):
-                """Run (or resume) the coarse correction that opens ``sweep``; a status ends the run."""
-                nonlocal space, progress, stored_bytes
+                """Prepare the coarse correction of ``sweep``; a returned status ends the run.
+
+                The correction is not written in a separate pass: every block read of the sweep adds
+                ``P e`` to the chunks the sweep has not committed yet, so the sweep's own commits
+                apply it. A resume inside the sweep reloads the saved correction.
+                """
+                nonlocal space, progress, correction
                 state = progress.get("coarse")
-                if isinstance(state, dict) and state.get("sweep") == sweep and state.get("stage") == "done":
-                    return None
-                phase_started = time.perf_counter()
-                carried = 0.0
                 if space is None:
                     space = CoarseSpace(shape, coarse_factor)
                     recorded = progress.get("coarse_operator")
@@ -582,90 +619,69 @@ def solve_blocks(
                             raise ValueError("coarse operator file differs from the checkpoint")
                         space.matrix = sp.load_npz(operator_path).tocsr()
                     space.assembled = recorded is not None
-                if isinstance(state, dict) and state.get("sweep") == sweep and state.get("stage") == "apply":
+                if isinstance(state, dict) and state.get("sweep") == sweep:
                     if not correction_path.is_file() or file_sha(correction_path) != state.get("correction_sha256"):
                         raise ValueError("coarse correction file differs from the checkpoint")
                     correction = np.load(correction_path)
-                    carried = float(state.get("seconds", 0.0))
-                else:
-                    assemble = not space.assembled
-                    rhs = np.zeros(space.size)
-                    norm_sq = norm0_sq = 0.0
-                    for block, key in enumerate(ordered):
-                        if stopped():
-                            return emit("CHECKPOINTED_STOP")
-                        admitted()
-                        coarse_status.update(stage="residual", sweep=sweep, next_block=block)
-                        emit("RUNNING", phase="coarse-residual", active_sweep=sweep, active_block=block)
-                        low, high, lo, hi = bounds(key)
-                        crop_shape = tuple(map(int, hi - lo))
-                        target, weights, _, receipts = _observations(load_observations(lo, hi), crop_shape)
-                        _record_sources(seen, receipts)
-                        target, weights = _numpy(target), _numpy(weights)
-                        declared = global_fixed(lo, hi, crop_shape)
-                        mask = np.isfinite(declared)
-                        values = np.where(mask, declared, store.read(lo, hi))
-                        rows = local_rows(lo, hi)
-                        r, r0 = block_residual(target, weights, spacing, rows, values, mask, device)
-                        owned = tuple(slice(int(a), int(b)) for a, b in zip(low - lo, high - lo))
-                        r_core, r0_core = r[owned], r0[owned]
-                        norm_sq += float(np.sum(r_core * r_core))
-                        norm0_sq += float(np.sum(r0_core * r0_core))
-                        zyx = np.stack([g.ravel() for g in np.meshgrid(*map(np.arange, low, high), indexing="ij")], 1)
-                        rhs += space.rows(zyx, ~mask[owned].ravel()).T @ r_core.ravel()
-                        if assemble:
-                            space.add_block(lo, low, high, weights, ~mask, rows, exterior=exterior_terms(lo, hi, rows))
-                        del target, weights, values, rows, r, r0
-                    if assemble:
-                        sp.save_npz(operator_path, space.matrix, compressed=False)
-                        space.assembled = True
-                        progress = dict(progress, coarse_operator=dict(sha256=file_sha(operator_path)))
-                        store.save_progress(progress)
-                    if space.solve is None:
-                        coarse_status.update(stage="solve")
-                        emit("RUNNING", phase="coarse-solve", active_sweep=sweep)
-                        space.solve, space.info = space.solver(coarse_direct_limit)
-                    if stopped():
-                        return emit("CHECKPOINTED_STOP")
-                    solve_started = time.perf_counter()
-                    correction = space.solve(rhs)
-                    solve_s = time.perf_counter() - solve_started
-                    np.save(correction_path, correction)
-                    norm, norm0 = math.sqrt(norm_sq), math.sqrt(norm0_sq)
-                    state = dict(
-                        sweep=sweep,
-                        stage="apply",
-                        next_block=0,
-                        correction_sha256=file_sha(correction_path),
-                        residual_norm=norm,
-                        relative_residual=norm / norm0 if norm0 else None,
-                        solve_s=solve_s,
-                        seconds=time.perf_counter() - phase_started,
-                    )
-                    progress = dict(progress, coarse=state)
-                    store.save_progress(progress)
-                    carried, phase_started = state["seconds"], time.perf_counter()
-                coarse_status.update(state, **(space.info or {}), factor=coarse_factor)
-                for block in range(int(state["next_block"]), len(ordered)):
+                    coarse_status.update(state, factor=coarse_factor)
+                    return None
+                phase_started = time.perf_counter()
+                assemble = not space.assembled
+                rhs = np.zeros(space.size)
+                norm_sq = norm0_sq = 0.0
+                for block, key in enumerate(ordered):
                     if stopped():
                         return emit("CHECKPOINTED_STOP")
                     admitted()
-                    coarse_status.update(stage="apply", next_block=block)
-                    emit("RUNNING", phase="coarse-apply", active_sweep=sweep, active_block=block)
-                    low, high, lo, hi = bounds(ordered[block])
-                    zyx = np.stack([g.ravel() for g in np.meshgrid(*map(np.arange, low, high), indexing="ij")], 1)
-                    declared = global_fixed(lo, hi, tuple(map(int, hi - lo)))
+                    coarse_status.update(stage="residual", sweep=sweep, next_block=block)
+                    emit("RUNNING", phase="coarse-residual", active_sweep=sweep, active_block=block)
+                    low, high, lo, hi = bounds(key)
+                    crop_shape = tuple(map(int, hi - lo))
+                    target, weights, _, receipts = _observations(load_observations(lo, hi), crop_shape)
+                    _record_sources(seen, receipts)
+                    target, weights = _numpy(target), _numpy(weights)
+                    declared = global_fixed(lo, hi, crop_shape)
+                    mask = np.isfinite(declared)
+                    values = np.where(mask, declared, store.read(lo, hi))
+                    rows = local_rows(lo, hi)
+                    r, r0 = block_residual(target, weights, spacing, rows, values, mask, device)
                     owned = tuple(slice(int(a), int(b)) for a, b in zip(low - lo, high - lo))
-                    free = ~np.isfinite(declared[owned])
-                    core = store.read(low, high) + (space.rows(zyx, free.ravel()) @ correction).reshape(free.shape)
-                    state = dict(state, next_block=block + 1, seconds=carried + time.perf_counter() - phase_started)
-                    if block + 1 == len(ordered):
-                        state["stage"] = "done"
-                    pending = dict(progress, coarse=state)
-                    commit = store.commit(ordered[block], core, pending, store.read_observed(low, high))
-                    stored_bytes = commit["stored_bytes"]
-                    progress = pending
-                coarse_status.update(state)
+                    r_core, r0_core = r[owned], r0[owned]
+                    norm_sq += float(np.sum(r_core * r_core))
+                    norm0_sq += float(np.sum(r0_core * r0_core))
+                    zyx = np.stack([g.ravel() for g in np.meshgrid(*map(np.arange, low, high), indexing="ij")], 1)
+                    rhs += space.rows(zyx, ~mask[owned].ravel()).T @ r_core.ravel()
+                    if assemble:
+                        space.add_block(lo, low, high, weights, ~mask, rows, exterior=exterior_terms(lo, hi, rows))
+                    del target, weights, values, rows, r, r0
+                if assemble:
+                    sp.save_npz(operator_path, space.matrix, compressed=False)
+                    space.assembled = True
+                    progress = dict(progress, coarse_operator=dict(sha256=file_sha(operator_path)))
+                    store.save_progress(progress)
+                if space.solve is None:
+                    coarse_status.update(stage="solve")
+                    emit("RUNNING", phase="coarse-solve", active_sweep=sweep)
+                    space.solve, space.info = space.solver(coarse_direct_limit)
+                if stopped():
+                    return emit("CHECKPOINTED_STOP")
+                solve_started = time.perf_counter()
+                correction = space.solve(rhs)
+                solve_s = time.perf_counter() - solve_started
+                np.save(correction_path, correction)
+                norm, norm0 = math.sqrt(norm_sq), math.sqrt(norm0_sq)
+                state = dict(
+                    sweep=sweep,
+                    stage="apply",
+                    correction_sha256=file_sha(correction_path),
+                    residual_norm=norm,
+                    relative_residual=norm / norm0 if norm0 else None,
+                    solve_s=solve_s,
+                    seconds=time.perf_counter() - phase_started,
+                )
+                progress = dict(progress, coarse=state)
+                store.save_progress(progress)
+                coarse_status.update(state, **(space.info or {}), factor=coarse_factor, next_block=0)
                 return None
 
             segment_started = time.perf_counter()
@@ -714,7 +730,7 @@ def solve_blocks(
                         advice_state = _new_advice(sweep, 0, scientific_sha)
                         segment_started, segment_prefix = time.perf_counter(), 0.0
                         segment_boundary_start = boundary_s
-                    if coarse_factor is not None and (first_block if sweep == first_sweep else 0) == 0:
+                    if coarse_factor is not None:
                         finished = coarse_phase(sweep)
                         if finished is not None:
                             return finished
@@ -756,12 +772,17 @@ def solve_blocks(
                             _, _, next_lo, next_hi = bounds(ordered[block + 1])
                             prefetch.submit(next_lo, next_hi)
                         current = store.read(lo, hi)
+                        reader = store.nodes
+                        if correction is not None:
+                            current += pending_correction(lo, hi, block)
+                            reader = corrected_nodes(block)
+                            coarse_status.update(stage="apply", next_block=block)
                         if constraints is None:
                             rows = None
                         elif isinstance(constraints, StencilConstraints):
-                            rows = constraints.restrict(lo, hi, store.nodes)
+                            rows = constraints.restrict(lo, hi, reader)
                         else:
-                            rows = constraints(lo, hi, store.nodes)
+                            rows = constraints(lo, hi, reader)
                         if rows is not None and not isinstance(rows, QuadraticConstraints):
                             raise ValueError("constraint provider must return local QuadraticConstraints")
                         fixed_values = np.full(crop_shape, np.nan)
@@ -934,6 +955,8 @@ def solve_blocks(
                         nonconverged = pending["nonconverged_solves"]
                         if block + 1 == len(ordered):
                             completed_advice()
+                            if coarse_factor is not None:
+                                coarse_status.update(stage="done", next_block=len(ordered))
                         emit("RUNNING", phase="checkpointed")
                         del (
                             target,

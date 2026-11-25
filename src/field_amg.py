@@ -169,15 +169,19 @@ def _pairwise_aggregates(a: torch.Tensor, theta: float, seed: int, rounds: int =
     device = a.values().device
     rows, cols, vals = _csr_rows(a)
     diagonal = _diagonal(a)
-    off = rows != cols
-    rows, cols, vals = rows[off], cols[off], vals[off]
-    strength = (-vals).clamp(min=0) / torch.sqrt(diagonal[rows] * diagonal[cols])
+    # Off-diagonal negative entries only; every other entry is never strong.
+    keep = (rows != cols) & (vals < 0)
+    rows, cols = rows[keep], cols[keep]
+    strength = vals[keep].neg_().div_(torch.sqrt(diagonal[rows] * diagonal[cols]))
+    del vals, keep, diagonal
     rowmax = torch.zeros(n, dtype=strength.dtype, device=device).scatter_reduce_(0, rows, strength, "amax")
-    keep = (strength > 0) & (strength >= theta * rowmax[rows])
+    keep = strength >= theta * rowmax[rows]
+    del rowmax
     rows, cols, strength = rows[keep], cols[keep], strength[keep]
-    lo, hi = torch.minimum(rows, cols), torch.maximum(rows, cols)
-    jitter = ((lo * 2654435761 + hi * 97531 + seed * 7919) % 1000003).to(strength.dtype) / 1000003.0
-    score = strength * (1.0 + 0.1 * jitter)
+    del keep
+    jitter = torch.minimum(rows, cols).mul_(2654435761).add_(torch.maximum(rows, cols).mul_(97531)).add_(seed * 7919)
+    score = jitter.remainder_(1000003).to(strength.dtype).mul_(0.1 / 1000003.0).add_(1.0).mul_(strength)
+    del jitter
     nodes = torch.arange(n, device=device)
     partner = torch.full((n,), -1, dtype=torch.int64, device=device)
     for _ in range(rounds):

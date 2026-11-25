@@ -552,3 +552,25 @@ def test_invalid_supervisor_configuration_does_not_create_service(r, tmp_path, p
     with pytest.raises(ValueError):
         r.run_supervised(**options)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_query_interval_reuses_inventory_but_not_identity_checks(r, gpu_query, tmp_path, monkeypatch):
+    calls = []
+    query = r.subprocess.check_output
+    monkeypatch.setattr(
+        r.subprocess, "check_output", lambda command, **kw: calls.append(command) or query(command, **kw)
+    )
+    clock = [1000.0]
+    monkeypatch.setattr(r.time, "monotonic", lambda: clock[0])
+    with r.GpuLease(0, "GPU-test", tmp_path / "gpu.lock", query_interval=30) as lease:
+        assert len(calls) == 2
+        lease.recheck()
+        assert len(calls) == 2
+        clock[0] += 31
+        lease.recheck()
+        assert len(calls) == 4
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-other")
+        with pytest.raises(ValueError, match="environment identity"):
+            lease.recheck()
+    with pytest.raises(ValueError, match="query_interval"):
+        r.GpuLease(0, "GPU-test", tmp_path / "gpu.lock", query_interval=-1)

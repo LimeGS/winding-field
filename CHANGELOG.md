@@ -27,6 +27,9 @@ checkpoints are unchanged and resume byte-identically.
   memory available at start and maps it to the block solver's checkpoint mode.
 
 ### Changed
+- AMG Chebyshev smoother: the upper eigenvalue bound is min(scaled row-sum norm,
+  1.3 x a 40-step power estimate). The old estimate could fall up to 23 % short and
+  intermittently break CG; AMG results keep their accuracy.
 - `field_store.py` commits chunks uncompressed; decoded values are unchanged.
 - `NpyObservations` and `NpyFixedValues` share one pinned-NPY open and recheck; their
   errors now read `<label> hash differs`, `<label> is not a memory-mappable NPY array`

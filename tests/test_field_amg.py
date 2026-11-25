@@ -57,12 +57,13 @@ def test_assembled_matrix_matches_matrix_free_operator(groups):
     assert abs(matrix - matrix.T).max() < 1e-12
 
 
-def test_preconditioner_is_symmetric_and_positive():
+@pytest.mark.parametrize("smoother", ["chebyshev", "l1-jacobi"])
+def test_preconditioner_is_symmetric_and_positive(smoother):
     _, weights, pairs = _problem(10)
     mask = np.zeros(weights.shape, bool)
     mask.flat[0] = True
     matrix = field_amg.assemble_free_operator(weights, mask, pairs=pairs, lam=1000.0)
-    amg = field_amg.AMGPreconditioner(matrix, weights.shape, torch.tensor(mask), max_coarse=50)
+    amg = field_amg.AMGPreconditioner(matrix, weights.shape, torch.tensor(mask), max_coarse=50, smoother=smoother)
     rng = np.random.default_rng(4)
     u, v = (torch.tensor(rng.standard_normal(weights.shape)) for _ in range(2))
     u[torch.tensor(mask)] = v[torch.tensor(mask)] = 0
@@ -70,6 +71,9 @@ def test_preconditioner_is_symmetric_and_positive():
     assert float((u * mv).sum()) == pytest.approx(float((v * mu).sum()), rel=1e-9)
     assert float((u * mu).sum()) > 0
     assert amg.metadata()["levels"] >= 2
+    assert amg.metadata()["smoother"] == smoother
+    with pytest.raises(ValueError, match="smoother must be"):
+        field_amg.AMGPreconditioner(matrix, weights.shape, torch.tensor(mask), smoother="sor")
 
 
 @pytest.mark.parametrize("dtype", ["float64", "float32"])

@@ -12,9 +12,9 @@ tensors, so every V-cycle runs on the GPU when the solve does. A prepared hierar
 depends only on the static operator (weights, pairs, constraint rows and fixed mask):
 right-hand sides, constraint targets and fixed values may change between solves.
 
-The preconditioner is a fixed symmetric positive definite linear map (l1-Jacobi pre-
-and post-smoothing, Galerkin coarse operators, exact coarsest solve), so CG keeps its
-guarantees. It changes iteration counts only, never the system that is solved.
+The preconditioner is a fixed symmetric positive definite linear map (Chebyshev-Jacobi or
+l1-Jacobi pre- and post-smoothing, Galerkin coarse operators, exact coarsest solve), so CG
+keeps its guarantees. It changes iteration counts only, never the system that is solved.
 """
 
 from __future__ import annotations
@@ -121,7 +121,9 @@ class AMGPreconditioner:
     """One symmetric V-cycle of a smoothed-aggregation hierarchy, applied on a device.
 
     ``matrix`` is the float64 CSR free-node operator (see :func:`assemble_free_operator`).
-    ``smoothing`` l1-Jacobi sweeps run before and after each coarse correction.
+    Before and after each coarse correction the smoother runs ``smoothing`` steps: a
+    degree-``smoothing`` Chebyshev polynomial in ``D^-1 A`` over ``[lmax / 30, lmax]``
+    (default), or that many l1-Jacobi sweeps.
     """
 
     kind = "amg"
@@ -135,6 +137,7 @@ class AMGPreconditioner:
         device: str | torch.device = "cpu",
         dtype: torch.dtype = torch.float64,
         smoothing: int = 2,
+        smoother: str = "chebyshev",
         max_coarse: int = 1000,
         max_levels: int = 12,
     ) -> None:
@@ -144,6 +147,9 @@ class AMGPreconditioner:
             raise ValueError("preconditioner='amg' requires the optional 'pyamg' package") from exc
         if smoothing < 1 or max_coarse < 1:
             raise ValueError("smoothing and max_coarse must be positive")
+        if smoother not in ("chebyshev", "l1-jacobi"):
+            raise ValueError("smoother must be chebyshev or l1-jacobi")
+        self.smoother = smoother
         self.shape = tuple(shape)
         self.mask = mask
         self.smoothing = int(smoothing)
@@ -156,17 +162,34 @@ class AMGPreconditioner:
             keep=False,
         )
         self.levels: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self.bounds: list[tuple[float, float]] = []
+        rng = np.random.default_rng(0)
         for level in hierarchy.levels[:-1]:
             a = sp.csr_matrix(level.A)
-            l1 = np.asarray(abs(a).sum(axis=1)).ravel()
-            if not np.isfinite(l1).all() or (l1 <= 0).any():
-                raise ValueError("AMG level has a nonpositive l1 row norm")
+            if smoother == "chebyshev":
+                d = a.diagonal()
+                if not np.isfinite(d).all() or (d <= 0).any():
+                    raise ValueError("AMG level has a nonpositive diagonal")
+                scale = 1.0 / d
+                x = rng.random(a.shape[0]) + 0.5
+                lmax = 1.0
+                for _ in range(20):
+                    y = scale * (a @ x)
+                    lmax = float(np.linalg.norm(y) / np.linalg.norm(x))
+                    x = y / np.linalg.norm(y)
+                lmax *= 1.1
+                self.bounds.append((lmax / 30.0, lmax))
+            else:
+                l1 = np.asarray(abs(a).sum(axis=1)).ravel()
+                if not np.isfinite(l1).all() or (l1 <= 0).any():
+                    raise ValueError("AMG level has a nonpositive l1 row norm")
+                scale = 1.0 / l1
             self.levels.append(
                 (
                     _torch_csr(a, device, dtype),
                     _torch_csr(level.P, device, dtype),
                     _torch_csr(sp.csr_matrix(level.P.T), device, dtype),
-                    torch.as_tensor(1.0 / l1, dtype=dtype, device=device),
+                    torch.as_tensor(scale, dtype=dtype, device=device),
                 )
             )
         coarse = np.asarray(hierarchy.levels[-1].A.toarray(), dtype=np.float64)
@@ -179,19 +202,45 @@ class AMGPreconditioner:
             raise ValueError("AMG hierarchy is not finite")
 
     def metadata(self) -> dict[str, Any]:
-        return dict(kind="amg", levels=self.depth, operator_complexity=self.complexity, smoothing=self.smoothing)
+        return dict(
+            kind="amg",
+            levels=self.depth,
+            operator_complexity=self.complexity,
+            smoother=self.smoother,
+            smoothing=self.smoothing,
+        )
+
+    def _smooth(self, k: int, x: torch.Tensor | None, b: torch.Tensor) -> torch.Tensor:
+        a, _, _, scale = self.levels[k]
+        if self.smoother == "l1-jacobi":
+            for _ in range(self.smoothing):
+                x = scale * b if x is None else x + scale * (b - a @ x)
+            assert x is not None
+            return x
+        lmin, lmax = self.bounds[k]
+        theta, delta = 0.5 * (lmax + lmin), 0.5 * (lmax - lmin)
+        sigma = theta / delta
+        r = b.clone() if x is None else b - a @ x
+        out = torch.zeros_like(b) if x is None else x
+        rho = 1.0 / sigma
+        step = scale * r / theta
+        for i in range(self.smoothing):
+            out = out + step
+            if i == self.smoothing - 1:
+                break
+            r = r - a @ step
+            rho_next = 1.0 / (2.0 * sigma - rho)
+            step = rho_next * rho * step + (2.0 * rho_next / delta) * scale * r
+            rho = rho_next
+        return out
 
     def _cycle(self, k: int, b: torch.Tensor) -> torch.Tensor:
         if k == len(self.levels):
             return self.coarse @ b
-        a, p, r, dinv = self.levels[k]
-        x = dinv * b
-        for _ in range(self.smoothing - 1):
-            x = x + dinv * (b - a @ x)
+        a, p, r, _ = self.levels[k]
+        x = self._smooth(k, None, b)
         x = x + p @ self._cycle(k + 1, r @ (b - a @ x))
-        for _ in range(self.smoothing):
-            x = x + dinv * (b - a @ x)
-        return x
+        return self._smooth(k, x, b)
 
     def apply(self, residual: torch.Tensor) -> torch.Tensor:
         b = residual.reshape(-1).to(self.dtype)

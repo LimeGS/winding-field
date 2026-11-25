@@ -3,7 +3,7 @@
 Three tiers, chosen from the memory available when the run starts:
 
 - ``disk``: the field does not fit. Chunks are read from and committed to disk block by
-  block, as before, and the plan carries a warning.
+  block, and the plan carries a warning.
 - ``field``: the decoded field fits. Every chunk stays cached, commits are published once
   per sweep in the background (``solve_blocks(checkpoint="sweep")``), and what is left
   over caches observation boxes until it runs out.

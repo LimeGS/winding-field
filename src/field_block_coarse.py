@@ -61,7 +61,7 @@ class CoarseSpace:
         """Prolongation rows for global ZYX nodes ``zyx`` (N x 3); rows of fixed nodes are zero."""
         n = len(zyx)
         parts = [_axis_weights(self.axes[d], zyx[:, d]) for d in range(3)]
-        cz, cy, cx = self.coarse_shape
+        _, cy, cx = self.coarse_shape
         cols, vals = [], []
         for bz in (0, 1):
             for by in (0, 1):

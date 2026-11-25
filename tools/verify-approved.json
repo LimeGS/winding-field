@@ -1,5 +1,8 @@
 {
- "_comment": "Intended differences from the baseline. Each entry needs a reason; REVIEW.md R9 applies. Remove entries once the baseline includes the change.",
- "api": {},
- "golden": {}
+  "_comment": "Intended differences from the baseline. Each entry needs a reason; REVIEW.md R9 applies. Remove entries once the baseline includes the change.",
+  "api": {},
+  "golden": {
+    "block.case": "Checkpoint chunks are written with np.savez instead of np.savez_compressed. The chunk files (and so the chunk sha256 values these keys hash) change; the stored delta/offset/observed arrays and every decoded field value are identical. Real fields compress only ~1.08x; a 192^3 chunk writes in 0.03 s instead of 0.82 s and decodes 9x faster (about 30 min per 175A sweep). Old compressed chunks still load (np.load reads both).",
+    "block.case.perf": "Checkpoint chunks are written with np.savez instead of np.savez_compressed. The chunk files (and so the chunk sha256 values these keys hash) change; the stored delta/offset/observed arrays and every decoded field value are identical. Real fields compress only ~1.08x; a 192^3 chunk writes in 0.03 s instead of 0.82 s and decodes 9x faster (about 30 min per 175A sweep). Old compressed chunks still load (np.load reads both)."
+  }
 }

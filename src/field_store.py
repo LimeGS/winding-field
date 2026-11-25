@@ -624,7 +624,7 @@ class BlockStore:
                 if not np.isfinite(delta).all() or not np.isfinite(restored).all() or not math.isfinite(error):
                     raise ValueError("nonfinite checkpoint encoding/decoding")
                 stream = io.BytesIO()
-                np.savez_compressed(stream, delta=delta, offset=offset, observed=mask)
+                np.savez(stream, delta=delta, offset=offset, observed=mask)
                 raw = stream.getvalue()
                 decoded = _decode(raw, shape)
                 name = f"{label}.g{uuid.uuid4().hex}.npz"

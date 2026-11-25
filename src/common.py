@@ -107,21 +107,6 @@ def iter_fibre_records(afv_path):
         connection.close()
 
 
-def sample_pairs(P, s, rng, per_fiber=40, span_lo=0.5, span_hi=45.0):
-    """Random index pairs on one fibre -> [(span_mm, p1, p2)]."""
-    if s[-1] < span_lo:
-        return []
-    out = []
-    for _ in range(per_fiber):
-        i, j = rng.integers(0, len(P), 2)
-        if i == j:
-            continue
-        span = abs(s[j] - s[i])
-        if span_lo <= span <= span_hi:
-            out.append((span, P[i], P[j]))
-    return out
-
-
 def trilinear(F, z, y, x):
     """Trilinear sample of a ZYX field at fractional indices (clipped)."""
     nz, ny, nx = F.shape
@@ -141,38 +126,6 @@ def trilinear(F, z, y, x):
         + c[0, 1, 1] * (1 - fz) * fy * fx
         + c[1, 1, 1] * fz * fy * fx
     )
-
-
-def calib_gap(det, n=1500, seed=0):
-    """Median low-detection run length along random axis lines (voxels).
-
-    Estimates the typical air-gap width from the detection volume alone
-    (no fibres, no labels). Used to scale travel costs to sheet units.
-    """
-    rng = np.random.default_rng(seed)
-    nz, ny, nx = det.shape
-    widths = []
-    for _ in range(n):
-        ax = rng.integers(0, 3)
-        line = (
-            det[:, rng.integers(0, ny), rng.integers(0, nx)]
-            if ax == 0
-            else det[rng.integers(0, nz), :, rng.integers(0, nx)]
-            if ax == 1
-            else det[rng.integers(0, nz), rng.integers(0, ny), :]
-        )
-        low = np.asarray(line) < 128
-        if not low.any() or low.all():
-            continue
-        d = np.diff(low.astype(np.int8))
-        starts = list(np.where(d == 1)[0] + 1)
-        ends = list(np.where(d == -1)[0] + 1)
-        if low[0]:
-            starts = [0] + starts
-        if low[-1]:
-            ends = ends + [len(line)]
-        widths += [b - a for a, b in zip(starts, ends) if b - a >= 2]
-    return float(np.median(widths)) if widths else 10.0
 
 
 def report(diffs, bins=BINS, extra_p99=True):

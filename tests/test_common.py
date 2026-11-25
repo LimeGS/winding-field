@@ -62,29 +62,9 @@ def test_streamed_records_preserve_lineage_and_read_only_source(paris_inputs):
     assert paris_inputs.afv.read_bytes() == before
 
 
-def test_pair_sampling_uses_arclength_instead_of_endpoint_chord():
-    points = np.array([[0, 0, 0], [3, 0, 0], [0, 0, 0]], float)
-    lengths = common.arclength(points, 1)
-    np.testing.assert_array_equal(lengths, [0, 3, 6])
-    sampled = common.sample_pairs(points, lengths, np.random.default_rng(9), per_fiber=100, span_lo=5, span_hi=6)
-    assert sampled
-    for span, a, b in sampled:
-        assert span == 6
-        np.testing.assert_array_equal(a, b)
-    assert common.sample_pairs(points, lengths / 100, np.random.default_rng(9)) == []
-
-
 def test_trilinear_preserves_a_non_cubic_linear_field():
     z, y, x = np.indices((3, 4, 5))
     assert common.trilinear(100 * z + 10 * y + x, 0.25, 1.5, 2.75) == pytest.approx(42.75)
-
-
-def test_gap_calibration_counts_low_runs_and_handles_no_evidence():
-    detection = np.full((12, 12, 12), 255, np.uint8)
-    detection[0:2] = detection[4:6] = detection[10:12] = 0
-    assert common.calib_gap(detection, n=300, seed=3) == 2
-    assert common.calib_gap(np.zeros((3, 4, 5), np.uint8)) == 10
-    assert common.calib_gap(np.full((3, 4, 5), 255, np.uint8)) == 10
 
 
 @pytest.mark.parametrize("extra_p99", [False, True])

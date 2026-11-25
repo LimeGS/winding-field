@@ -171,7 +171,6 @@ class StencilConstraints:
         self.digest = identity.hexdigest()
         self.max_cache_bytes = cache_bytes
         self.template_cache_policy = template_cache_policy
-        self.max_spatial_index_bytes = spatial_index_bytes
         self.spatial_index_nbytes = 0
         self._postings = None
         # Bound construction scratch before allocating any slot-sized index arrays.

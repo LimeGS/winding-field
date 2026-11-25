@@ -126,10 +126,3 @@ def sample_volume(
     if not np.isfinite(result).all():
         raise ValueError("nonfinite sampled volume")
     return result
-
-
-def offset_correction(a, b):
-    delta = np.asarray(a) - np.asarray(b)
-    if not np.isfinite(delta).any():
-        raise ValueError("empty overlap")
-    return float(np.median(delta[np.isfinite(delta)]))

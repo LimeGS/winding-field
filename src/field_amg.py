@@ -59,7 +59,8 @@ def assemble_free_operator(
     w = np.asarray(weights, dtype=np.float64)
     shape = w.shape
     n = w.size
-    index = np.arange(n, dtype=np.int64).reshape(shape)
+    itype = np.int32 if n < 2**31 else np.int64
+    index = np.arange(n, dtype=itype).reshape(shape)
     rows, cols, vals = [], [], []
     diagonal = np.zeros(n, dtype=np.float64)
     for axis in range(3):
@@ -72,19 +73,19 @@ def assemble_free_operator(
         rows += [a, b]
         cols += [b, a]
         vals += [-edge, -edge]
-        np.add.at(diagonal, a, edge)
-        np.add.at(diagonal, b, edge)
+        for ends in (a, b):
+            diagonal += np.bincount(ends.astype(np.intp), weights=edge, minlength=n)
     if pairs is not None and len(pairs) and lam:
-        p = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+        p = np.asarray(pairs, dtype=np.int64).reshape(-1, 2).astype(itype)
         p = p[p[:, 0] != p[:, 1]]
         coupling = np.full(len(p), float(lam))
         rows += [p[:, 0], p[:, 1]]
         cols += [p[:, 1], p[:, 0]]
         vals += [-coupling, -coupling]
-        np.add.at(diagonal, p[:, 0], coupling)
-        np.add.at(diagonal, p[:, 1], coupling)
-    rows.append(np.arange(n))
-    cols.append(np.arange(n))
+        for ends in (p[:, 0], p[:, 1]):
+            diagonal += np.bincount(ends.astype(np.intp), weights=coupling, minlength=n)
+    rows.append(index.ravel())
+    cols.append(index.ravel())
     vals.append(diagonal + np.broadcast_to(np.asarray(reference_weight, dtype=np.float64), shape).ravel())
     matrix = _csr(np.concatenate(rows), np.concatenate(cols), np.concatenate(vals), n)
     if constraints is not None:

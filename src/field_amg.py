@@ -6,11 +6,13 @@ This module builds an algebraic multigrid (AMG) hierarchy for the *same* free-no
 system and applies one symmetric V-cycle per CG iteration. Its iteration count grows
 only slowly with the grid side.
 
-Setup runs once on the CPU with PyAMG (smoothed aggregation, optional dependency
-``pyamg``); the resulting operators are moved to the solve device as Torch CSR
-tensors, so every V-cycle runs on the GPU when the solve does. A prepared hierarchy
-depends only on the static operator (weights, pairs, constraint rows and fixed mask):
-right-hand sides, constraint targets and fixed values may change between solves.
+The hierarchy is built once per static operator (weights, pairs, constraint rows and
+fixed mask; right-hand sides, constraint targets and fixed values may change between
+solves). The default ``setup="torch"`` builds it with Torch tensor ops on the solve
+device: pairwise-matching aggregation on the strong graph, Jacobi-smoothed prolongation
+and Galerkin coarse operators, with no extra dependency. ``setup="pyamg"`` builds it on
+the CPU with PyAMG (optional dependency ``pyamg``) and moves it to the device. Every
+V-cycle runs on the solve device.
 
 The preconditioner is a fixed symmetric positive definite linear map (Chebyshev-Jacobi or
 l1-Jacobi pre- and post-smoothing, Galerkin coarse operators, exact coarsest solve), so CG
@@ -117,6 +119,135 @@ def _torch_csr(matrix: sp.csr_matrix, device, dtype) -> torch.Tensor:
         )
 
 
+def _csr_rows(a: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    crow = a.crow_indices()
+    rows = torch.repeat_interleave(torch.arange(a.shape[0], device=crow.device), crow.diff())
+    return rows, a.col_indices(), a.values()
+
+
+def _diagonal(a: torch.Tensor) -> torch.Tensor:
+    rows, cols, vals = _csr_rows(a)
+    on = rows == cols
+    return torch.zeros(a.shape[0], dtype=vals.dtype, device=vals.device).index_add_(0, rows[on], vals[on])
+
+
+def _spectral_bound(a: torch.Tensor, scale: torch.Tensor, steps: int = 20) -> float:
+    """Power-iteration estimate of the largest eigenvalue of ``diag(scale) @ a``."""
+    generator = torch.Generator().manual_seed(0)
+    x = (torch.rand(a.shape[0], generator=generator, dtype=torch.float64) + 0.5).to(scale.device, scale.dtype)
+    bound = 1.0
+    for _ in range(steps):
+        y = scale * (a @ x)
+        norm = torch.linalg.vector_norm(y)
+        bound = float(norm / torch.linalg.vector_norm(x))
+        x = y / norm
+    return bound
+
+
+def _pairwise_aggregates(a: torch.Tensor, theta: float, seed: int, rounds: int = 6) -> torch.Tensor:
+    """One pass of parallel handshake matching on the strong graph of ``a``.
+
+    An off-diagonal entry is strong when ``-a_ij / sqrt(a_ii a_jj)`` is at least ``theta``
+    times its row maximum. Mutually best strong neighbours pair up; unmatched nodes with a
+    strong edge to a matched node join that node's aggregate. Returns aggregate ids.
+    """
+    n = a.shape[0]
+    device = a.values().device
+    rows, cols, vals = _csr_rows(a)
+    diagonal = _diagonal(a)
+    off = rows != cols
+    rows, cols, vals = rows[off], cols[off], vals[off]
+    strength = (-vals).clamp(min=0) / torch.sqrt(diagonal[rows] * diagonal[cols])
+    rowmax = torch.zeros(n, dtype=strength.dtype, device=device).scatter_reduce_(0, rows, strength, "amax")
+    keep = (strength > 0) & (strength >= theta * rowmax[rows])
+    rows, cols, strength = rows[keep], cols[keep], strength[keep]
+    lo, hi = torch.minimum(rows, cols), torch.maximum(rows, cols)
+    jitter = ((lo * 2654435761 + hi * 97531 + seed * 7919) % 1000003).to(strength.dtype) / 1000003.0
+    score = strength * (1.0 + 0.1 * jitter)
+    nodes = torch.arange(n, device=device)
+    partner = torch.full((n,), -1, dtype=torch.int64, device=device)
+    for _ in range(rounds):
+        free = partner < 0
+        active = free[rows] & free[cols]
+        if not bool(active.any()):
+            break
+        r, c, sc = rows[active], cols[active], score[active]
+        best = torch.full((n,), -1.0, dtype=sc.dtype, device=device).scatter_reduce_(0, r, sc, "amax")
+        pick = sc == best[r]
+        choice = torch.full((n,), -1, dtype=torch.int64, device=device)
+        choice[r[pick]] = c[pick]
+        chosen = torch.nonzero(choice >= 0).squeeze(1)
+        chosen = chosen[choice[choice[chosen]] == chosen]
+        partner[chosen] = choice[chosen]
+    root = torch.where(partner >= 0, torch.minimum(nodes, partner), nodes)
+    single = partner < 0
+    edge = single[rows] & ~single[cols]
+    if bool(edge.any()):
+        r, c, sc = rows[edge], cols[edge], strength[edge]
+        best = torch.full((n,), -1.0, dtype=sc.dtype, device=device).scatter_reduce_(0, r, sc, "amax")
+        pick = sc == best[r]
+        root[r[pick]] = root[c[pick]]
+    return torch.unique(root, return_inverse=True)[1]
+
+
+def _galerkin_aggregate(a: torch.Tensor, aggregates: torch.Tensor, size: int) -> torch.Tensor:
+    rows, cols, vals = _csr_rows(a)
+    index = torch.stack([aggregates[rows], aggregates[cols]])
+    return torch.sparse_coo_tensor(index, vals, (size, size)).coalesce().to_sparse_csr()
+
+
+def _torch_hierarchy(
+    matrix: sp.csr_matrix,
+    device: str | torch.device,
+    *,
+    max_coarse: int,
+    max_levels: int,
+    theta: float = 0.25,
+    passes: int = 3,
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor, float]:
+    """Smoothed-aggregation hierarchy built with Torch tensor ops on ``device``.
+
+    Aggregates come from ``passes`` composed pairwise matchings (about 2**passes nodes
+    each); the tentative prolongator is smoothed by one damped Jacobi step with weight
+    ``4 / (3 lmax)``; coarse operators are Galerkin products. Returns ``[(A_k, P_k)]``
+    for every level except the coarsest, the coarsest operator, and the operator
+    complexity.
+    """
+    current = _torch_csr(matrix, device, torch.float64)
+    fine_nnz = current.values().numel()
+    total_nnz = fine_nnz
+    levels: list[tuple[torch.Tensor, torch.Tensor]] = []
+    while current.shape[0] > max_coarse and len(levels) + 1 < max_levels:
+        n = current.shape[0]
+        aggregates = torch.arange(n, device=current.values().device)
+        reduced = current
+        for k in range(passes):
+            step = _pairwise_aggregates(reduced, theta, seed=10 * len(levels) + k)
+            size = int(step.max()) + 1
+            aggregates = step[aggregates]
+            reduced = _galerkin_aggregate(reduced, step, size)
+        size = int(aggregates.max()) + 1
+        if size > 0.9 * n:
+            break
+        scale = 1.0 / _diagonal(current)
+        omega = (4.0 / 3.0) / _spectral_bound(current, scale)
+        nodes = torch.arange(n, device=aggregates.device)
+        tentative = torch.sparse_coo_tensor(
+            torch.stack([nodes, aggregates]), torch.ones(n, dtype=torch.float64, device=aggregates.device), (n, size)
+        ).coalesce()
+        product = torch.sparse.mm(current.to_sparse_coo(), tentative).coalesce()
+        index = product.indices()
+        smoothed = torch.sparse_coo_tensor(index, product.values() * (omega * scale[index[0]]), product.shape)
+        prolong = (tentative - smoothed).coalesce()
+        coarse = torch.sparse.mm(prolong.t().coalesce(), torch.sparse.mm(current.to_sparse_coo(), prolong).coalesce())
+        coarse = coarse.coalesce()
+        coarse = 0.5 * (coarse + coarse.t()).coalesce()
+        levels.append((current, prolong.to_sparse_csr()))
+        current = coarse.to_sparse_csr()
+        total_nnz += current.values().numel()
+    return levels, current.to_dense(), total_nnz / fine_nnz
+
+
 class AMGPreconditioner:
     """One symmetric V-cycle of a smoothed-aggregation hierarchy, applied on a device.
 
@@ -138,13 +269,12 @@ class AMGPreconditioner:
         dtype: torch.dtype = torch.float64,
         smoothing: int = 2,
         smoother: str = "chebyshev",
+        setup: str = "torch",
         max_coarse: int = 1000,
         max_levels: int = 12,
     ) -> None:
-        try:
-            import pyamg
-        except ImportError as exc:  # pragma: no cover - exercised only without the extra
-            raise ValueError("preconditioner='amg' requires the optional 'pyamg' package") from exc
+        if setup not in ("torch", "pyamg"):
+            raise ValueError("setup must be torch or pyamg")
         if smoothing < 1 or max_coarse < 1:
             raise ValueError("smoothing and max_coarse must be positive")
         if smoother not in ("chebyshev", "l1-jacobi"):
@@ -154,50 +284,45 @@ class AMGPreconditioner:
         self.mask = mask
         self.smoothing = int(smoothing)
         self.dtype = dtype
-        hierarchy = pyamg.smoothed_aggregation_solver(
-            matrix,
-            symmetry="symmetric",
-            max_coarse=max_coarse,
-            max_levels=max_levels,
-            keep=False,
-        )
+        self.setup = setup
+        if setup == "pyamg":
+            try:
+                import pyamg
+            except ImportError as exc:  # pragma: no cover - exercised only without the extra
+                raise ValueError("setup='pyamg' requires the optional 'pyamg' package") from exc
+            hierarchy = pyamg.smoothed_aggregation_solver(
+                matrix, symmetry="symmetric", max_coarse=max_coarse, max_levels=max_levels, keep=False
+            )
+            built = [
+                (_torch_csr(level.A, device, torch.float64), _torch_csr(level.P, device, torch.float64))
+                for level in hierarchy.levels[:-1]
+            ]
+            coarsest = torch.as_tensor(hierarchy.levels[-1].A.toarray(), dtype=torch.float64, device=device)
+            complexity = float(hierarchy.operator_complexity())
+        else:
+            built, coarsest, complexity = _torch_hierarchy(matrix, device, max_coarse=max_coarse, max_levels=max_levels)
         self.levels: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
         self.bounds: list[tuple[float, float]] = []
-        rng = np.random.default_rng(0)
-        for level in hierarchy.levels[:-1]:
-            a = sp.csr_matrix(level.A)
+        for a, p in built:
             if smoother == "chebyshev":
-                d = a.diagonal()
-                if not np.isfinite(d).all() or (d <= 0).any():
+                d = _diagonal(a)
+                if not bool(torch.isfinite(d).all()) or bool((d <= 0).any()):
                     raise ValueError("AMG level has a nonpositive diagonal")
                 scale = 1.0 / d
-                x = rng.random(a.shape[0]) + 0.5
-                lmax = 1.0
-                for _ in range(20):
-                    y = scale * (a @ x)
-                    lmax = float(np.linalg.norm(y) / np.linalg.norm(x))
-                    x = y / np.linalg.norm(y)
-                lmax *= 1.1
+                lmax = 1.1 * _spectral_bound(a, scale)
                 self.bounds.append((lmax / 30.0, lmax))
             else:
-                l1 = np.asarray(abs(a).sum(axis=1)).ravel()
-                if not np.isfinite(l1).all() or (l1 <= 0).any():
+                rows, _, vals = _csr_rows(a)
+                l1 = torch.zeros(a.shape[0], dtype=vals.dtype, device=vals.device).index_add_(0, rows, vals.abs())
+                if not bool(torch.isfinite(l1).all()) or bool((l1 <= 0).any()):
                     raise ValueError("AMG level has a nonpositive l1 row norm")
                 scale = 1.0 / l1
-            self.levels.append(
-                (
-                    _torch_csr(a, device, dtype),
-                    _torch_csr(level.P, device, dtype),
-                    _torch_csr(sp.csr_matrix(level.P.T), device, dtype),
-                    torch.as_tensor(scale, dtype=dtype, device=device),
-                )
-            )
-        coarse = np.asarray(hierarchy.levels[-1].A.toarray(), dtype=np.float64)
-        coarse = 0.5 * (coarse + coarse.T)
-        inverse = np.linalg.pinv(coarse, hermitian=True)
-        self.coarse = torch.as_tensor(inverse, dtype=dtype, device=device)
-        self.complexity = float(hierarchy.operator_complexity())
-        self.depth = len(hierarchy.levels)
+            pt = p.to_sparse_coo().t().coalesce().to_sparse_csr()
+            self.levels.append((a.to(dtype), p.to(dtype), pt.to(dtype), scale.to(dtype)))
+        coarsest = 0.5 * (coarsest + coarsest.T)
+        self.coarse = torch.linalg.pinv(coarsest, hermitian=True).to(dtype)
+        self.complexity = complexity
+        self.depth = len(built) + 1
         if not math.isfinite(self.complexity):
             raise ValueError("AMG hierarchy is not finite")
 
@@ -206,6 +331,7 @@ class AMGPreconditioner:
             kind="amg",
             levels=self.depth,
             operator_complexity=self.complexity,
+            setup=self.setup,
             smoother=self.smoother,
             smoothing=self.smoothing,
         )

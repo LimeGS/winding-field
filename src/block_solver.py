@@ -227,7 +227,7 @@ def solve_blocks(
     ``status_policy='checkpoints'`` publishes the first RUNNING, every committed
     checkpoint and every terminal status, suppressing later observation/solve
     notices. This advisory policy may change on resume. Jacobi (default) and the
-    algebraic multigrid ``'amg'`` (optional ``pyamg``) support the partial fixed-face
+    algebraic multigrid ``'amg'`` support the partial fixed-face
     masks used by block solves. Jacobi is an implicit invariant of the v1 run identity;
     ``'amg'`` is recorded in the identity, so a run cannot switch policy on resume.
     The AMG hierarchy is built per block and retained with the prepared workspace.

@@ -1,7 +1,7 @@
 # winding-field
 
 [![Audit](https://github.com/LimeGS/winding-field/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/LimeGS/winding-field/actions/workflows/ci.yml)
-[![Coverage (local): 92.54%](https://img.shields.io/badge/coverage%20%28local%29-92.54%25-brightgreen)](#development)
+[![Coverage (local): 93.31%](https://img.shields.io/badge/coverage%20%28local%29-93.31%25-brightgreen)](#development)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python 3.11–3.12](https://img.shields.io/badge/python-3.11%E2%80%933.12-blue)](pyproject.toml)
 [![Release](https://img.shields.io/github/v/release/LimeGS/winding-field?include_prereleases)](https://github.com/LimeGS/winding-field/releases)
@@ -65,7 +65,8 @@ Extras: `data` (Zarr), `test`, `dev`, or `all`.
 | I want to… | Start here |
 |---|---|
 | Solve a field from arrays (NumPy or PyTorch) | [`field_solver.solve_field`](src/field_solver.py); arrays are ZYX, coordinates and gradients XYZ |
-| Solve large volumes block by block, with resume | [`block_solver.solve_blocks`](src/block_solver.py), [`field_store.BlockStore`](src/field_store.py), [fibre constraints](src/constraint_templates.py) |
+| Solve large volumes block by block, with resume | [`block_solver.solve_blocks`](src/block_solver.py), [`field_store.BlockStore`](src/field_store.py), [fibre constraints](src/constraint_templates.py); see [Large volumes](#large-volumes) |
+| Size a run to the host's RAM | [`field_memory.plan_memory`](src/field_memory.py) |
 | Build a field from my own data | [Dataset configuration](DATASET.md) and `tools/run_coherence.py` |
 | Score a saved field against a frozen case | [Benchmark guide](benchmarks/winding/README.md) |
 | Get meshes, renders or flattened CT | [`winding-field-cli`](https://github.com/LimeGS/winding-field-cli#quick-start) |
@@ -131,12 +132,27 @@ the CLI.
 the [fine-band measurement](docs/RESULTS.md).
 [Image attribution and terms](DATA.md#readme-illustrations).*
 
+## Large volumes
+
+A whole scroll does not fit one solve. These options keep the solved system
+unchanged and change only how fast and in how much memory it converges:
+
+| Option | What it does |
+|---|---|
+| `preconditioner="amg"` | Smoothed-aggregation algebraic multigrid ([`field_amg.py`](src/field_amg.py)) instead of Jacobi. CG iterations grow only slowly with block size. Built with Torch on the solve device; `setup="pyamg"` needs the `amg` extra. Recorded in the block run identity, so a run cannot switch on resume. |
+| `solve_blocks(coarse_factor=k)` | Two-level multiplicative Schwarz: each sweep starts with a Galerkin coarse correction on every `k`-th node ([`field_block_coarse.py`](src/field_block_coarse.py)), so long-range error is corrected in every sweep instead of travelling one block per sweep. Part of the run identity; not available with `partial_order`. |
+| `solve_blocks(checkpoint="sweep")` | Keeps committed cores in RAM and publishes them once per sweep in the background. A crash resumes from the last published sweep. |
+| `field_memory.plan_memory(shape, chunk, halo)` | Picks the `disk`, `field` or `all` tier from the memory available at start (cgroup limits included) and returns the cache budgets and checkpoint mode for it. |
+| [`field_schwarz.solve_schwarz`](src/field_schwarz.py) | In-memory two-level Schwarz with flexible-CG outer iteration, for validation up to a few hundred million nodes. |
+
+Runs on CPU or CUDA (`device="cuda"`); Jacobi runs written by 1.x resume byte-identically.
+
 ## Documentation
 
 - [Method and glossary](docs/METHOD.md): what a winding field is and the open problems.
 - [Results](docs/RESULTS.md): latest Paris4 fine-grid drift measurement.
-- [All documentation](docs/README.md), including data terms, migration from
-  `winding-field-experiments` and developer notes.
+- [All documentation](docs/README.md), including data terms, migration to 2.0.0 and
+  developer notes.
 
 ## Repository layout
 
@@ -158,8 +174,8 @@ python tools/verify.py   # API, golden outputs and resume vs main; see REVIEW.md
 ```
 
 CI enforces 90% statement coverage over `src/` and runs the base branch's verifier on
-every pull request. The coverage badge is a local snapshot (November 4, 2026: 1297
-tests, 92.54%), not a live feed. Solver throughput work is recorded in the
+every pull request. The coverage badge is a local snapshot (November 25, 2026: 1290
+tests, 93.31%), not a live feed. Solver throughput work is recorded in the
 [developer notes](docs/dev/README.md).
 
 Changes are listed in the [changelog](CHANGELOG.md).
@@ -179,6 +195,7 @@ Maintenance is best-effort, with no release cadence or support SLA.
 Part of the LimeGS toolchain for the [Vesuvius Challenge](https://scrollprize.org):
 
 - [winding-field-cli](https://github.com/LimeGS/winding-field-cli): end-to-end CLI from CT to fibres, winding field, meshes and flattened charts.
+- [winding-field-studio](https://github.com/LimeGS/winding-field-studio): web UI, API and MCP server over every CLI command.
 - [ink-sdk](https://github.com/LimeGS/ink-sdk): standalone ink inference on surface volumes, or on tifxyz meshes plus CT.
 - [helena-framework](https://github.com/LimeGS/helena-framework): reproducible, auditable orchestration of the volume → surface → ink → page pipeline.
 - [herculaneum-legibility-index](https://github.com/LimeGS/herculaneum-legibility-index): legibility triage over the official ink maps.

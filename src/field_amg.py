@@ -220,23 +220,41 @@ def _expand(
     vals: torch.Tensor,
     right: torch.Tensor,
     shape: tuple[int, int],
+    budget: int = 1 << 24,
 ) -> torch.Tensor:
     """Sparse product by expand, sort and compress.
 
     ``(rows, inner, vals)`` are the entries of the left factor; ``right`` is a CSR matrix
     whose rows are indexed by ``inner``. Every left entry is expanded against its right
-    row and duplicates are summed, so memory is proportional to the expanded entry count
-    (unlike library SpGEMM, whose workspace can reach many times the operands).
+    row and duplicates are summed. The left entries are processed in chunks of at most
+    ``budget`` expanded products (unlike library SpGEMM, whose workspace can reach many
+    times the operands), so peak memory stays bounded even where rows are dense.
     """
     crow, cols, values = right.crow_indices(), right.col_indices(), right.values()
-    first = crow[inner]
-    counts = crow[inner + 1] - first
-    total = int(counts.sum())
-    owner = torch.repeat_interleave(torch.arange(rows.numel(), device=rows.device), counts)
-    starts = torch.cumsum(counts, 0) - counts
-    position = first[owner] + torch.arange(total, device=rows.device) - starts[owner]
-    index = torch.stack([rows[owner], cols[position]])
-    return torch.sparse_coo_tensor(index, vals[owner] * values[position], shape).coalesce()
+    counts = crow[inner + 1] - crow[inner]
+    ends = torch.cumsum(counts, 0)
+    total_count = int(ends[-1]) if ends.numel() else 0
+    chunks = max(1, -(-total_count // budget))
+    cuts = torch.searchsorted(ends, torch.linspace(0, total_count, chunks + 1, device=ends.device).to(ends.dtype))
+    edges = sorted({0, rows.numel(), *(min(int(c) + 1, rows.numel()) for c in cuts[1:-1].tolist())})
+    result: torch.Tensor | None = None
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        if hi <= lo:
+            continue
+        first = crow[inner[lo:hi]]
+        count = counts[lo:hi]
+        size = int(count.sum())
+        owner = torch.repeat_interleave(torch.arange(hi - lo, device=rows.device), count)
+        starts = torch.cumsum(count, 0) - count
+        position = first[owner] + torch.arange(size, device=rows.device) - starts[owner]
+        index = torch.stack([rows[lo:hi][owner], cols[position]])
+        part = torch.sparse_coo_tensor(index, vals[lo:hi][owner] * values[position], shape).coalesce()
+        del owner, starts, position, index
+        result = part if result is None else (result + part).coalesce()
+    if result is None:
+        empty = torch.zeros((2, 0), dtype=torch.int64, device=rows.device)
+        return torch.sparse_coo_tensor(empty, vals[:0], shape).coalesce()
+    return result
 
 
 def _galerkin(a: torch.Tensor, p: torch.Tensor, block_nnz: int = 1 << 20) -> torch.Tensor:
@@ -271,6 +289,28 @@ def _galerkin(a: torch.Tensor, p: torch.Tensor, block_nnz: int = 1 << 20) -> tor
     return total
 
 
+def _truncate(p: torch.Tensor, threshold: float) -> torch.Tensor:
+    """Drop prolongator entries below ``threshold`` times their row's largest magnitude.
+
+    Kept entries are rescaled so every row keeps its sum (the smoothed prolongator
+    reproduces constants). Returns CSR. Fewer entries per row keep the Galerkin coarse
+    operators sparse on deep levels.
+    """
+    if threshold <= 0:
+        return p.to_sparse_csr()
+    index, vals = p.indices(), p.values()
+    n = p.shape[0]
+    zero = torch.zeros(n, dtype=vals.dtype, device=vals.device)
+    rowmax = zero.clone().scatter_reduce_(0, index[0], vals.abs(), "amax")
+    keep = vals.abs() >= threshold * rowmax[index[0]]
+    before = zero.clone().index_add_(0, index[0], vals)
+    index, vals = index[:, keep], vals[keep]
+    after = zero.clone().index_add_(0, index[0], vals)
+    ratio = torch.where(after != 0, before / after, torch.ones_like(after))
+    out = torch.sparse_coo_tensor(index, vals * ratio[index[0]], p.shape).coalesce()
+    return out.to_sparse_csr()
+
+
 def _torch_hierarchy(
     matrix: sp.csr_matrix,
     device: str | torch.device,
@@ -280,12 +320,14 @@ def _torch_hierarchy(
     theta: float = 0.25,
     passes: int = 3,
     dtype: torch.dtype = torch.float64,
+    truncate: float = 0.2,
 ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor, float]:
     """Smoothed-aggregation hierarchy built with Torch tensor ops on ``device``.
 
     Aggregates come from ``passes`` composed pairwise matchings (about 2**passes nodes
     each); the tentative prolongator is smoothed by one damped Jacobi step with weight
-    ``4 / (3 lmax)``; coarse operators are Galerkin products. Returns ``[(A_k, P_k)]``
+    ``4 / (3 lmax)`` and entries below ``truncate`` times their row maximum are dropped
+    (row sums kept); coarse operators are Galerkin products. Returns ``[(A_k, P_k)]``
     for every level except the coarsest, the coarsest operator, and the operator
     complexity.
     """
@@ -317,7 +359,7 @@ def _torch_hierarchy(
         product = torch.sparse_coo_tensor(index, vals, (n, size)).coalesce()
         index = product.indices()
         smoothed = torch.sparse_coo_tensor(index, product.values() * (omega * scale[index[0]]), product.shape)
-        prolong = (tentative - smoothed).coalesce().to_sparse_csr()
+        prolong = _truncate((tentative - smoothed).coalesce(), truncate)
         coarse = _galerkin(current, prolong)
         coarse = (0.5 * (coarse + coarse.t())).coalesce()
         del product, smoothed, tentative, rows, cols, vals, index

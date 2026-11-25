@@ -134,3 +134,19 @@ def test_blockwise_galerkin_matches_direct_product():
     p_t = field_amg._torch_csr(p, "cpu", torch.float64)
     blocked = field_amg._galerkin(a_t, p_t, block_nnz=97).to_dense().numpy()
     np.testing.assert_allclose(blocked, (p.T @ matrix @ p).toarray(), rtol=1e-12, atol=1e-9)
+
+
+@pytest.mark.parametrize("budget", [1, 7, 1 << 24])
+def test_chunked_expansion_matches_sparse_product(budget):
+    rng = np.random.default_rng(6)
+    left = sp.random(30, 25, density=0.2, random_state=rng, format="coo")
+    right = sp.random(25, 20, density=0.3, random_state=rng, format="csr")
+    out = field_amg._expand(
+        torch.as_tensor(left.row, dtype=torch.int64),
+        torch.as_tensor(left.col, dtype=torch.int64),
+        torch.as_tensor(left.data),
+        field_amg._torch_csr(right, "cpu", torch.float64),
+        (30, 20),
+        budget=budget,
+    )
+    np.testing.assert_allclose(out.to_dense().numpy(), (left @ right).toarray(), rtol=1e-12, atol=1e-12)

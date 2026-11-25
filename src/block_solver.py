@@ -1,6 +1,7 @@
 """Opt-in, single-writer block solves with durable progress and immutable prefetch."""
 
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -13,10 +14,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+import scipy.sparse as sp
 import torch
 from numpy.typing import ArrayLike
 
 from constraint_templates import StencilConstraints
+from field_block_coarse import CoarseSpace, block_residual
 from field_constraints import QuadraticConstraints
 from field_prefetch import ObservationPrefetch
 from field_runtime import ResourceUnavailable, check_resources
@@ -187,6 +190,10 @@ def solve_blocks(
     admit: Callable[[], Any] | None = None,
     prefetch: ObservationPrefetch | None = None,
     observer: Any = None,
+    coarse_factor: int | None = None,
+    coarse_direct_limit: int = 200_000,
+    checkpoint: Literal["block", "sweep"] = "block",
+    memory_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Solve each explicit owned core, persisting its exact next-block cursor.
 
@@ -233,12 +240,28 @@ def solve_blocks(
     The AMG hierarchy is built per block and retained with the prepared workspace.
     Spectral preconditioning is rejected before opening the store.
 
+    ``coarse_factor`` (an integer >= 2) turns the sweeps into two-level multiplicative Schwarz:
+    each sweep starts with a pass that gathers the global residual, restricts it with the
+    trilinear prolongation from every ``coarse_factor``-th node, solves the Galerkin coarse
+    system in memory and adds the prolonged correction to every owned core (see
+    :mod:`field_block_coarse`). The coarse operator is assembled once, during the first pass,
+    and saved next to the checkpoint. The factor is part of the run identity; a stop inside the
+    coarse phase resumes there. Not available with ``partial_order``.
+
     ``nonconvergence_policy='fail'`` (default) stops at the first local solve that
     does not reach ``rtol``. ``'continue'`` commits a local solve that only exhausted
     ``maxiter`` and keeps the sweep budget; numerical breakdowns always fail. The
     cumulative ``nonconverged_solves`` count is checkpointed with progress and every
     status reports it with ``local_solves_converged``. The policy is an execution
     choice, not part of the checkpoint identity, and may change on resume.
+
+    ``checkpoint='sweep'`` keeps committed cores in memory and publishes them once per
+    sweep, in the background while the next sweep runs, and before every
+    ``CHECKPOINTED_STOP`` or ``SWEEP_BUDGET_REACHED`` status. A crash then resumes from the
+    last published sweep instead of the last block. Memory must hold the whole field
+    (see :mod:`field_memory`); ``cache_bytes`` should cover it too, or published chunks
+    are read back from disk. Not available with an observer. ``memory_report`` is shown
+    verbatim as ``STATUS.json["memory"]``. Neither is part of the run identity.
     """
     if observer is not None and not all(
         callable(getattr(observer, name, None)) for name in ("restore", "prepare", "complete")
@@ -303,6 +326,17 @@ def solve_blocks(
             if callback is not None and not callable(callback):
                 raise ValueError("stop/admit must be callable")
         ordered = _block_order(order, shape, chunk, partial_order)
+        if coarse_factor is not None:
+            coarse_factor = _integer(coarse_factor, 2)
+            coarse_direct_limit = _integer(coarse_direct_limit)
+            if partial_order:
+                raise ValueError("coarse correction needs the full block order")
+        if checkpoint not in ("block", "sweep"):
+            raise ValueError("checkpoint must be block or sweep")
+        if checkpoint == "sweep" and observer_requested:
+            raise ValueError("sweep checkpoints do not support a field observer")
+        if memory_report is not None:
+            memory_report = json.loads(json.dumps(memory_report, allow_nan=False))
         if partial_order and fixed is None:
             raise ValueError("partial_order requires a fixed provider for unowned halo nodes")
         if halo == 0 and len(ordered) > 1:
@@ -337,6 +371,7 @@ def solve_blocks(
             device=str(device),
             # Jacobi stays implicit so v1 identities (and their checkpoints) are unchanged.
             **({} if preconditioner == "jacobi" else {"preconditioner": preconditioner}),
+            **({} if coarse_factor is None else {"coarse": dict(kind="trilinear", factor=coarse_factor)}),
         )
         json.dumps(problem, allow_nan=False)
         root, started = Path(root), time.perf_counter()
@@ -351,6 +386,7 @@ def solve_blocks(
             workers=read_workers,
             max_bytes=max_bytes,
             reserve_bytes=reserve_bytes,
+            write_back=checkpoint == "sweep",
         ) as store:
             manifest = store.manifest
             progress = manifest["progress"]
@@ -441,6 +477,8 @@ def solve_blocks(
                     return None
                 if status != "RUNNING":
                     release_prepared()
+                    if checkpoint == "sweep" and status in ("CHECKPOINTED_STOP", "SWEEP_BUDGET_REACHED"):
+                        store.flush(wait=True)  # The terminal status names a published checkpoint.
                 result = dict(
                     status=status,
                     pid=os.getpid(),
@@ -462,6 +500,9 @@ def solve_blocks(
                     nonconverged_solves=nonconverged,
                     local_solves_converged=nonconverged == 0,
                     elapsed_s=time.perf_counter() - started,
+                    **({"coarse": dict(coarse_status)} if coarse_factor is not None else {}),
+                    checkpoint_policy=dict(policy=checkpoint, pending_chunks=store.pending_chunks, **store.flush_stats),
+                    **({} if memory_report is None else {"memory": memory_report}),
                     **extra,
                 )
                 atomic_json(root / "STATUS.json", result)
@@ -492,6 +533,177 @@ def solve_blocks(
                 low = key * chunk
                 high = np.minimum(low + chunk, shape)
                 return low, high, np.maximum(low - halo, 0), np.minimum(high + halo, shape)
+
+            def global_fixed(lo, hi, crop_shape):
+                """Exact global fixed values of a crop (NaN where free), as the block solve uses them."""
+                values = np.full(crop_shape, np.nan)
+                if fixed is None:
+                    if not lo.any():
+                        values[0, 0, 0] = 0.0
+                    return values
+                declared = np.asarray(fixed(lo, hi))
+                if declared.shape != crop_shape or declared.dtype.kind not in "iuf" or np.isinf(declared).any():
+                    raise ValueError("invalid fixed-value observation")
+                declared = declared.astype(np.float64)
+                label = "fixed:" + ",".join(map(str, (*lo, *hi)))
+                _record_sources(seen, {label: hashlib.sha256(declared.tobytes()).hexdigest()})
+                valid = np.isfinite(declared)
+                values[valid] = declared[valid]
+                return values
+
+            def local_rows(lo, hi):
+                if constraints is None:
+                    rows = None
+                elif isinstance(constraints, StencilConstraints):
+                    rows = constraints.restrict(lo, hi, store.nodes)
+                else:
+                    rows = constraints(lo, hi, store.nodes)
+                if rows is not None and not isinstance(rows, QuadraticConstraints):
+                    raise ValueError("constraint provider must return local QuadraticConstraints")
+                return rows
+
+            def exterior_terms(lo, hi, rows):
+                """Terms the constraint provider moved out of the crop, when it can name them."""
+                if rows is None:
+                    return None
+                if isinstance(constraints, StencilConstraints):
+                    template = constraints.prepare(lo, hi)
+                    terms = None if template is None else template.exterior()
+                elif callable(getattr(constraints, "exterior", None)):
+                    terms = constraints.exterior(lo, hi)
+                else:
+                    return None
+                if terms is None:
+                    return None
+                row, node, coeff = (np.asarray(a) for a in terms)
+                # Exterior fixed values are known only for the zero gauge; others count as free.
+                node_free = node != 0 if fixed is None else np.ones(len(node), bool)
+                return row, node, node_free, coeff
+
+            space = None
+            coarse_status: dict[str, Any] = {}
+            operator_path = root / "COARSE_OPERATOR.npz"
+            correction_path = root / "COARSE_CORRECTION.npy"
+
+            def file_sha(path):
+                return hashlib.sha256(path.read_bytes()).hexdigest()
+
+            correction = None
+            grid_shape = tuple(int(n) for n in (np.asarray(shape) + chunk - 1) // chunk)
+            visit = np.full(grid_shape, -1, np.int64)
+            visit[tuple(ordered.T)] = np.arange(len(ordered))
+
+            def pending_correction(lo, hi, block):
+                """``P e`` on the crop nodes whose chunk this sweep has not committed yet (else 0)."""
+                out = np.zeros(tuple(map(int, hi - lo)))
+                declared = global_fixed(lo, hi, out.shape)
+                for key in itertools.product(*(range(a // chunk, (b - 1) // chunk + 1) for a, b in zip(lo, hi))):
+                    if visit[key] < block:
+                        continue
+                    a = np.maximum(np.array(key) * chunk, lo)
+                    b = np.minimum((np.array(key) + 1) * chunk, hi)
+                    zyx = np.stack([g.ravel() for g in np.meshgrid(*map(np.arange, a, b), indexing="ij")], 1)
+                    region = tuple(slice(int(x - o), int(y - o)) for x, y, o in zip(a, b, lo))
+                    free = ~np.isfinite(declared[region])
+                    out[region] = (space.rows(zyx, free.ravel()) @ correction).reshape(free.shape)
+                return out
+
+            def corrected_nodes(block):
+                """A node reader that adds the pending correction outside committed chunks."""
+
+                def read(flat):
+                    flat = np.asarray(flat, np.int64)
+                    values = np.array(store.nodes(flat), dtype=np.float64)
+                    zyx = np.stack(np.unravel_index(flat.ravel(), shape), 1)
+                    late = visit[tuple((zyx // chunk).T)] >= block
+                    if late.any():
+                        free = zyx[late].any(1) if fixed is None else np.ones(int(late.sum()), bool)
+                        values.reshape(-1)[late] += space.rows(zyx[late], free) @ correction
+                    return values
+
+                return read
+
+            def coarse_phase(sweep):
+                """Prepare the coarse correction of ``sweep``; a returned status ends the run.
+
+                The correction is not written in a separate pass: every block read of the sweep adds
+                ``P e`` to the chunks the sweep has not committed yet, so the sweep's own commits
+                apply it. A resume inside the sweep reloads the saved correction.
+                """
+                nonlocal space, progress, correction
+                state = progress.get("coarse")
+                if space is None:
+                    space = CoarseSpace(shape, coarse_factor)
+                    recorded = progress.get("coarse_operator")
+                    if recorded is not None:
+                        if not operator_path.is_file() or file_sha(operator_path) != recorded.get("sha256"):
+                            raise ValueError("coarse operator file differs from the checkpoint")
+                        space.matrix = sp.load_npz(operator_path).tocsr()
+                    space.assembled = recorded is not None
+                if isinstance(state, dict) and state.get("sweep") == sweep:
+                    if not correction_path.is_file() or file_sha(correction_path) != state.get("correction_sha256"):
+                        raise ValueError("coarse correction file differs from the checkpoint")
+                    correction = np.load(correction_path)
+                    coarse_status.update(state, factor=coarse_factor)
+                    return None
+                phase_started = time.perf_counter()
+                assemble = not space.assembled
+                rhs = np.zeros(space.size)
+                norm_sq = norm0_sq = 0.0
+                for block, key in enumerate(ordered):
+                    if stopped():
+                        return emit("CHECKPOINTED_STOP")
+                    admitted()
+                    coarse_status.update(stage="residual", sweep=sweep, next_block=block)
+                    emit("RUNNING", phase="coarse-residual", active_sweep=sweep, active_block=block)
+                    low, high, lo, hi = bounds(key)
+                    crop_shape = tuple(map(int, hi - lo))
+                    target, weights, _, receipts = _observations(load_observations(lo, hi), crop_shape)
+                    _record_sources(seen, receipts)
+                    target, weights = _numpy(target), _numpy(weights)
+                    declared = global_fixed(lo, hi, crop_shape)
+                    mask = np.isfinite(declared)
+                    values = np.where(mask, declared, store.read(lo, hi))
+                    rows = local_rows(lo, hi)
+                    r, r0 = block_residual(target, weights, spacing, rows, values, mask, device)
+                    owned = tuple(slice(int(a), int(b)) for a, b in zip(low - lo, high - lo))
+                    r_core, r0_core = r[owned], r0[owned]
+                    norm_sq += float(np.sum(r_core * r_core))
+                    norm0_sq += float(np.sum(r0_core * r0_core))
+                    zyx = np.stack([g.ravel() for g in np.meshgrid(*map(np.arange, low, high), indexing="ij")], 1)
+                    rhs += space.rows(zyx, ~mask[owned].ravel()).T @ r_core.ravel()
+                    if assemble:
+                        space.add_block(lo, low, high, weights, ~mask, rows, exterior=exterior_terms(lo, hi, rows))
+                    del target, weights, values, rows, r, r0
+                if assemble:
+                    sp.save_npz(operator_path, space.matrix, compressed=False)
+                    space.assembled = True
+                    progress = dict(progress, coarse_operator=dict(sha256=file_sha(operator_path)))
+                    store.save_progress(progress)
+                if space.solve is None:
+                    coarse_status.update(stage="solve")
+                    emit("RUNNING", phase="coarse-solve", active_sweep=sweep)
+                    space.solve, space.info = space.solver(coarse_direct_limit)
+                if stopped():
+                    return emit("CHECKPOINTED_STOP")
+                solve_started = time.perf_counter()
+                correction = space.solve(rhs)
+                solve_s = time.perf_counter() - solve_started
+                np.save(correction_path, correction)
+                norm, norm0 = math.sqrt(norm_sq), math.sqrt(norm0_sq)
+                state = dict(
+                    sweep=sweep,
+                    stage="apply",
+                    correction_sha256=file_sha(correction_path),
+                    residual_norm=norm,
+                    relative_residual=norm / norm0 if norm0 else None,
+                    solve_s=solve_s,
+                    seconds=time.perf_counter() - phase_started,
+                )
+                progress = dict(progress, coarse=state)
+                store.save_progress(progress)
+                coarse_status.update(state, **(space.info or {}), factor=coarse_factor, next_block=0)
+                return None
 
             segment_started = time.perf_counter()
             segment_boundary_start = boundary_s
@@ -539,6 +751,10 @@ def solve_blocks(
                         advice_state = _new_advice(sweep, 0, scientific_sha)
                         segment_started, segment_prefix = time.perf_counter(), 0.0
                         segment_boundary_start = boundary_s
+                    if coarse_factor is not None:
+                        finished = coarse_phase(sweep)
+                        if finished is not None:
+                            return finished
                     for block in range(first_block if sweep == first_sweep else 0, len(ordered)):
                         block_started = time.perf_counter() if observer is not None else None
                         block_boundary_start = boundary_s
@@ -577,12 +793,17 @@ def solve_blocks(
                             _, _, next_lo, next_hi = bounds(ordered[block + 1])
                             prefetch.submit(next_lo, next_hi)
                         current = store.read(lo, hi)
+                        reader = store.nodes
+                        if correction is not None:
+                            current += pending_correction(lo, hi, block)
+                            reader = corrected_nodes(block)
+                            coarse_status.update(stage="apply", next_block=block)
                         if constraints is None:
                             rows = None
                         elif isinstance(constraints, StencilConstraints):
-                            rows = constraints.restrict(lo, hi, store.nodes)
+                            rows = constraints.restrict(lo, hi, reader)
                         else:
-                            rows = constraints(lo, hi, store.nodes)
+                            rows = constraints(lo, hi, reader)
                         if rows is not None and not isinstance(rows, QuadraticConstraints):
                             raise ValueError("constraint provider must return local QuadraticConstraints")
                         fixed_values = np.full(crop_shape, np.nan)
@@ -711,7 +932,14 @@ def solve_blocks(
                                 del selected, delta
                         next_completed = list(completed)
                         if block + 1 == len(ordered):
-                            next_completed.append(dict(sweep=sweep, cores=len(ordered), max_core_update=maximum))
+                            stats = dict(sweep=sweep, cores=len(ordered), max_core_update=maximum)
+                            if coarse_factor is not None:
+                                opened = progress.get("coarse") or {}
+                                stats.update(
+                                    relative_residual=opened.get("relative_residual"),
+                                    coarse_s=opened.get("seconds"),
+                                )
+                            next_completed.append(stats)
                         # Report precision loss separately from the pre-encoding local gate.
                         fixed_error = _decoded_anchor_error(core, fixed_values[owned])
                         pending = dict(
@@ -726,6 +954,7 @@ def solve_blocks(
                             decoded_fixed_value_error_max=fixed_error,
                             global_converged=False,
                             physical_acceptance=False,
+                            **{k: progress[k] for k in ("coarse", "coarse_operator") if k in progress},
                         )
                         admitted()
                         if observer is None:
@@ -747,6 +976,10 @@ def solve_blocks(
                         nonconverged = pending["nonconverged_solves"]
                         if block + 1 == len(ordered):
                             completed_advice()
+                            if coarse_factor is not None:
+                                coarse_status.update(stage="done", next_block=len(ordered))
+                            # Publish the finished sweep while the next one starts from memory.
+                            store.flush(wait=False)
                         emit("RUNNING", phase="checkpointed")
                         del (
                             target,

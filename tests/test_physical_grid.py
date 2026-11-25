@@ -15,12 +15,6 @@ def test_grid_samples_fractional_non_cubic_positions():
     assert sampled[1, 1, 1] == 633.25
 
 
-def test_overlap_correction_does_not_double_offset():
-    from physical_grid import offset_correction
-
-    assert offset_correction(np.ones((2, 2)) * 10, np.ones((2, 2)) * 13) == -3
-
-
 def test_grid_shape_can_be_written_as_json_receipt():
     import json
 

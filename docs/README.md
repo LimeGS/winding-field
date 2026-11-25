@@ -7,5 +7,5 @@
 | [Dataset configuration](../DATASET.md) | Building a field from your own data with `tools/run_coherence.py` |
 | [Benchmark guide](../benchmarks/winding/README.md) | Frozen cases, candidate contracts and the evaluator |
 | [Data and terms](../DATA.md) | What data is external, attribution and licences |
-| [Migration](MIGRATION.md) | Moving from `winding-field-experiments` |
+| [Migration](MIGRATION.md) | Upgrading to 2.0.0, or moving from `winding-field-experiments` |
 | [Developer notes](dev/README.md) | Performance and reuse engineering records |

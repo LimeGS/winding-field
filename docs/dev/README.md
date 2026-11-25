@@ -7,7 +7,7 @@ reuse work was measured and are not needed to use the library.
 - [Solver performance v3](PERFORMANCE_V3.md) and its [plan](PERFORMANCE_V3_PLAN.md)
 - [Work reuse](WORK_REUSE.md)
 
-## Notes moved from the README
+## Notes
 
 For opt-in throughput measurements (distinct from the scientific quality benchmark),
 see result-preserving performance (v2). Solver performance v3 covers optional CPU
@@ -15,7 +15,7 @@ float64 spectral PCG, prepared consensus indices, bounded template/gather caches
 durable I/O measurements, including unsupported geometries and the spatial-index
 regime that became slower.
 
-`solve_blocks(..., prepared_cache_bytes=0)` keeps the historical default: no prepared
+`solve_blocks(..., prepared_cache_bytes=0)` is the default: no prepared
 workspace retention between visits. A positive byte budget admits a stable subset of
 workspaces; observation receipts, static snapshots and live boundary/constraint
 targets are still validated on every visit. The budget is operational and may change

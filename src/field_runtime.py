@@ -440,7 +440,7 @@ def run_supervised(
 
         interrupted = False
 
-        def interrupt(signum, frame):
+        def interrupt(_signum, _frame):
             nonlocal interrupted
             interrupted = True  # Popen must return before its owned PID is acted on.
 

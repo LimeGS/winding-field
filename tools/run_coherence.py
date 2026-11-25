@@ -256,7 +256,7 @@ def synthetic_run(out):
     out = Path(out)
     out.mkdir(exist_ok=False)
     shape = (5, 7, 9)
-    z, y, x = np.indices(shape)
+    *_, x = np.indices(shape)
     target = np.zeros((*shape, 3), np.float32)
     target[..., 0] = 1
     weights = np.ones(shape, np.float32)
@@ -345,7 +345,7 @@ def make_split(dataset, out):
     return manifest
 
 
-def score_fields(dataset, out, fields, metas, split, scope):
+def score_fields(dataset, out, fields):
     case = artifact(dataset, "evaluation_case")
     if case is None:
         return {name: dict(status="NOT_EVALUATED", reason="no evaluation case supplied") for name in fields}
@@ -354,7 +354,7 @@ def score_fields(dataset, out, fields, metas, split, scope):
     producer_path = out / "receipt.json"
     producer = json.loads(producer_path.read_text()) if producer_path.is_file() else {}
     result = {}
-    for name, field in fields.items():
+    for name in fields:
         path = out / (name + ".npy")
         if not path.is_file():
             result[name] = dict(status="NOT_EVALUATED", reason="candidate was not published")
@@ -480,8 +480,7 @@ def global_run(dataset, out, device, production=False, stages=None):
         stages=stages or ["B2"],
         parameters={**dataset.get("constraints", {}), **dataset.get("solver", {})},
     )
-    metas = {k: m for k in fields}
-    scores = score_fields(dataset, out, fields, metas, split, "whole_coarse")
+    scores = score_fields(dataset, out, fields)
     if train is None:
         for value in scores.values():
             value["reserved"] = None
@@ -575,11 +574,7 @@ def continuous_pilot_run(dataset, out, device):
     )
     scores = {}
     if assembled is not None:
-        sm = {
-            k: dict(m, origin_xyz=lo.tolist(), spacing_xyz=h.tolist(), shape_zyx=list(weights.shape))
-            for k in ("assembled", "monolithic")
-        }
-        scores = score_fields(dataset, results, dict(assembled=assembled, monolithic=mono), sm, split, "fine_assembled")
+        scores = score_fields(dataset, results, ("assembled", "monolithic"))
     return finish(
         out,
         dict(
@@ -598,7 +593,7 @@ def arrival_boundary_run(dataset, out, device=None):
     if (device or dataset.get("solver", {}).get("device", "cpu")) != "cpu":
         raise ValueError("arrival-boundary currently supports only the CPU backend")
     out.mkdir(exist_ok=False)
-    target, weights, fixed, m = observations(dataset)
+    target, _weights, fixed, m = observations(dataset)
     g = np.asarray(target)
     norm = np.linalg.norm(g, axis=-1)
     origin, h = np.array(m["origin_xyz"]), np.array(m["spacing_xyz"])
@@ -661,7 +656,7 @@ def local_run(dataset, out, device):
     grid = dataset["grid"]
     lo, h = np.array(grid["origin_xyz"]), np.array(grid["spacing_xyz"])
     hi = lo + h * np.array(grid["shape_zyx"][::-1])
-    target, weights, pairs, m = load_paris_box(lo, hi, spacing=h, dataset=dataset, shape_zyx=grid["shape_zyx"])
+    target, weights, _pairs, m = load_paris_box(lo, hi, spacing=h, dataset=dataset, shape_zyx=grid["shape_zyx"])
     m["step"] = dataset["sheet_step"]
     p = sample_source(dataset, "surface", lo, h, weights.shape) * dataset["prediction"]["surface_scale"]
     if (p < 0).any() or (p > 1).any():
@@ -705,7 +700,7 @@ def local_run(dataset, out, device):
     np.save(out / "charts.npy", charts)
     write(out / "charts.json", chart_info)
     train = None if split is None else {r["fibre_id"] for r in split["fibres"] if r["split"] == "train"}
-    fields, cases = run_gradient_cases(
+    _fields, cases = run_gradient_cases(
         out,
         target,
         weights,
@@ -765,10 +760,7 @@ def local_run(dataset, out, device):
             seed_authority="declared parent exterior faces retained in this crop, fixed support and observed CT",
             scope="bounded_observation_crop_not_whole_reference",
         )
-    inputs = {
-        name: array
-        for name, array in dict(target=target, weights=weights, probability=p, ct=ct, directors=directors).items()
-    }
+    inputs = dict(target=target, weights=weights, probability=p, ct=ct, directors=directors)
     for name, array in inputs.items():
         np.save(out / (name + "-input.npy"), array)
     return finish(

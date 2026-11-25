@@ -54,6 +54,36 @@ def _bounds(lo: ArrayLike, hi: ArrayLike, shape: tuple[int, ...]) -> tuple[tuple
     return low, high
 
 
+_FileId = tuple[int, int, int]
+
+
+def _open_npy(path: Path, sha256: str, label: str) -> tuple[np.memmap, _FileId, str]:
+    """Memory-map a pinned NPY; return it with the file identity and header hash to recheck."""
+    with path.open("rb") as stream:
+        stat = os.fstat(stream.fileno())
+        if hashlib.file_digest(stream, "sha256").hexdigest() != sha256:
+            raise ValueError(label + " hash differs")
+        array = np.load(path, mmap_mode="r", allow_pickle=False)
+        if not isinstance(array, np.memmap):
+            if isinstance(array, np.lib.npyio.NpzFile):
+                array.close()
+            raise ValueError(label + " is not a memory-mappable NPY array")
+        stream.seek(0)
+        header = hashlib.sha256(stream.read(array.offset)).hexdigest()
+    file_id = (stat.st_dev, stat.st_ino, stat.st_size)
+    _check_npy(path, array, file_id, header, label)
+    return array, file_id, header
+
+
+def _check_npy(path: Path, array: np.memmap, file_id: _FileId, header: str, label: str) -> None:
+    with path.open("rb") as stream:
+        stat = os.fstat(stream.fileno())
+        if (stat.st_dev, stat.st_ino, stat.st_size) != file_id or hashlib.sha256(
+            stream.read(array.offset)
+        ).hexdigest() != header:
+            raise ValueError(label + " file or header changed")
+
+
 class CertifiedPresence:
     """Read a pinned, complete-coverage Zarr v2 uint8 inventory.
 
@@ -237,23 +267,12 @@ class NpyObservations:
         self._hashes = {key: _digest(hashes[key]) for key in names}
         self._paths = dict(zip(names, (Path(p).absolute() for p in (target_path, weights_path, observed_path))))
         self._arrays: dict[str, np.memmap] = {}
-        self._files: dict[str, tuple[int, int, int]] = {}
+        self._files: dict[str, _FileId] = {}
         self._headers: dict[str, str] = {}
         for key, path in self._paths.items():
-            with path.open("rb") as stream:
-                stat = os.fstat(stream.fileno())
-                if hashlib.file_digest(stream, "sha256").hexdigest() != self._hashes[key]:
-                    raise ValueError("NPY source hash differs: " + key)
-                array = np.load(path, mmap_mode="r", allow_pickle=False)
-                if not isinstance(array, np.memmap):
-                    if isinstance(array, np.lib.npyio.NpzFile):
-                        array.close()
-                    raise ValueError("expected a memory-mappable NPY array")
-                self._arrays[key] = array
-                self._files[key] = (stat.st_dev, stat.st_ino, stat.st_size)
-                stream.seek(0)
-                self._headers[key] = hashlib.sha256(stream.read(array.offset)).hexdigest()
-            self._check_file(key)
+            self._arrays[key], self._files[key], self._headers[key] = _open_npy(
+                path, self._hashes[key], "NPY source " + key
+            )
         target, weights, observed = (self._arrays[key] for key in names)
         if target.ndim != 4 or target.shape[-1] != 3 or any(n <= 0 for n in target.shape):
             raise ValueError("target shape must be nonempty ZYX3")
@@ -274,12 +293,7 @@ class NpyObservations:
         return type(self), (*self._paths.values(), self._hashes)
 
     def _check_file(self, key: str) -> None:
-        with self._paths[key].open("rb") as stream:
-            stat = os.fstat(stream.fileno())
-            if (stat.st_dev, stat.st_ino, stat.st_size) != self._files[key] or hashlib.sha256(
-                stream.read(self._arrays[key].offset)
-            ).hexdigest() != self._headers[key]:
-                raise ValueError("NPY source file or header changed: " + key)
+        _check_npy(self._paths[key], self._arrays[key], self._files[key], self._headers[key], "NPY source " + key)
 
     def __call__(
         self, lo_zyx: ArrayLike, hi_zyx: ArrayLike
@@ -327,24 +341,11 @@ class NpyFixedValues:
         self.shape = _triple(shape, "fixed shape")
         if any(n <= 0 for n in self.shape):
             raise ValueError("fixed shape must be positive ZYX")
-        with self._path.open("rb") as stream:
-            stat = os.fstat(stream.fileno())
-            if hashlib.file_digest(stream, "sha256").hexdigest() != self._sha256:
-                raise ValueError("fixed NPY source hash differs")
-            array = np.load(self._path, mmap_mode="r", allow_pickle=False)
-            if not isinstance(array, np.memmap):
-                if isinstance(array, np.lib.npyio.NpzFile):
-                    array.close()
-                raise ValueError("expected a memory-mappable fixed NPY array")
-            if array.shape != self.shape:
-                raise ValueError("fixed NPY source shape differs")
-            if array.dtype.kind != "f" or array.dtype.itemsize not in (4, 8):
-                raise ValueError("fixed NPY dtype must be float32/float64")
-            self._array = array
-            self._file = (stat.st_dev, stat.st_ino, stat.st_size)
-            stream.seek(0)
-            self._header = hashlib.sha256(stream.read(array.offset)).hexdigest()
-        self._check_file()
+        self._array, self._file, self._header = _open_npy(self._path, self._sha256, "fixed NPY source")
+        if self._array.shape != self.shape:
+            raise ValueError("fixed NPY source shape differs")
+        if self._array.dtype.kind != "f" or self._array.dtype.itemsize not in (4, 8):
+            raise ValueError("fixed NPY dtype must be float32/float64")
 
     @property
     def identity(self) -> dict[str, str]:
@@ -354,12 +355,7 @@ class NpyFixedValues:
         return type(self), (self._path, self._sha256, self.shape)
 
     def _check_file(self) -> None:
-        with self._path.open("rb") as stream:
-            stat = os.fstat(stream.fileno())
-            if (stat.st_dev, stat.st_ino, stat.st_size) != self._file or hashlib.sha256(
-                stream.read(self._array.offset)
-            ).hexdigest() != self._header:
-                raise ValueError("fixed NPY source file or header changed")
+        _check_npy(self._path, self._array, self._file, self._header, "fixed NPY source")
 
     def __call__(self, lo: ArrayLike, hi: ArrayLike) -> NDArray[np.float32] | NDArray[np.float64]:
         low, high = _bounds(lo, hi, self.shape)

@@ -11,8 +11,8 @@ Pairs whose second endpoint lies outside a crop enter the local solve as the exa
 penalty ``lam * (phi[p] - field[q])**2`` through ``solve_field``'s reference term, so every
 local solve is the exact Dirichlet restriction of the global operator.
 
-This module keeps all global vectors in memory; it is meant for validation up to a few hundred
-million nodes and as the numerical core of a later out-of-core driver.
+This module keeps all global vectors in memory, which suits up to a few hundred million nodes.
+The out-of-core form is :func:`block_solver.solve_blocks` with ``coarse_factor``.
 """
 
 from __future__ import annotations

@@ -174,3 +174,14 @@ def test_amg_coarse_solve_and_progress_callback():
     assert info["converged"] and info["coarse"]["method"] == "amg-pcg"
     assert [event["iteration"] for event in seen] == list(range(1, info["iterations"] + 1))
     np.testing.assert_allclose(field, expected, atol=1e-4)
+
+
+def test_reused_local_workspaces_give_the_same_field():
+    target, weights, pairs = _problem()
+    options = dict(
+        pairs=pairs, lam=10.0, chunk=8, halo=2, coarse_factor=4, rtol=1e-9, maxiter=40, local_preconditioner="amg"
+    )
+    fresh, a = solve_schwarz(target, weights, reuse_local=False, **options)
+    reused, b = solve_schwarz(target, weights, reuse_local=True, **options)
+    assert a["converged"] and b["converged"] and a["iterations"] == b["iterations"]
+    np.testing.assert_allclose(reused, fresh, atol=1e-7)

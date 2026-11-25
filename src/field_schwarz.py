@@ -30,7 +30,8 @@ import torch
 from numpy.typing import ArrayLike, NDArray
 
 from field_amg import assemble_free_operator
-from field_solver import _FieldOperator, solve_field
+from field_constraints import QuadraticConstraints
+from field_solver import PreparedField, _FieldOperator, solve_field
 
 __all__ = ["solve_schwarz", "trilinear_prolongation"]
 
@@ -150,6 +151,7 @@ def solve_schwarz(
     initial: ArrayLike | None = None,
     direct_coarse_limit: int = 200_000,
     restricted: bool = False,
+    reuse_local: bool = True,
     callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[NDArray[np.float64], dict[str, Any]]:
     """Solve the ``solve_field`` system by two-level Schwarz-preconditioned flexible CG.
@@ -161,6 +163,10 @@ def solve_schwarz(
     solves default to ``rtol / 100``. Each outer iteration costs one sweep of local solves
     and one global operator application. Returns the field and a JSON-compatible receipt;
     ``converged`` is False when ``maxiter`` outer iterations do not reach ``rtol``.
+
+    ``reuse_local`` (default) keeps one :class:`field_solver.PreparedField` per tile, so each
+    tile's operator and AMG hierarchy are built once; retained memory grows with the tile
+    count. ``restricted=True`` writes only owned cores (RAS) instead of whole crops.
     """
     started = time.perf_counter()
     if type(chunk) is not int or chunk < 1 or type(halo) is not int or halo < 0:
@@ -229,6 +235,7 @@ def solve_schwarz(
     shape_a = np.array(shape)
     flat_index = np.arange(n).reshape(shape)
     stats = dict(local_solves=0, local_iterations=0, local_seconds=0.0, nonconverged=0)
+    workspaces: dict[tuple[int, ...], PreparedField] = {}
     endpoints = [np.stack(np.unravel_index(pair_array[:, j], shape), axis=1) for j in (0, 1)]
     position = np.full(n, -1, np.int64)
 
@@ -252,6 +259,7 @@ def solve_schwarz(
                 local_pairs = None
                 reference = None
                 reference_weight: Any = 0.0
+                rows: QuadraticConstraints | None = None
                 if len(pair_array):
                     inside = [np.all((c >= lo) & (c < hi), axis=1) for c in endpoints]
                     local_index = flat_index[crop].ravel()
@@ -259,18 +267,42 @@ def solve_schwarz(
                     both = inside[0] & inside[1]
                     local_pairs = position[pair_array[both]]
                     # A pair leaving the crop is the exact nodal penalty lam*(phi[p]-field[q])**2.
-                    rw = np.zeros(crop_shape)
-                    numerator = np.zeros(crop_shape)
                     flat_field = field.ravel()
+                    cut_at, cut_value = [], []
                     for here, there in ((0, 1), (1, 0)):
                         cut = inside[here] & ~inside[there]
-                        if cut.any():
-                            at = position[pair_array[cut, here]]
-                            np.add.at(rw.reshape(-1), at, lam)
-                            np.add.at(numerator.reshape(-1), at, lam * flat_field[pair_array[cut, there]])
-                    if rw.any():
+                        cut_at.append(position[pair_array[cut, here]])
+                        cut_value.append(flat_field[pair_array[cut, there]])
+                    at, value = np.concatenate(cut_at), np.concatenate(cut_value)
+                    if reuse_local:
+                        # The same penalties as continuous rows, whose structure is static per tile,
+                        # so the tile's operator and AMG hierarchy are reused across visits.
+                        m = len(local_pairs)
+                        size = int(np.prod(crop_shape))
+                        matrix = sp.csr_matrix(
+                            (
+                                np.concatenate([np.ones(m), -np.ones(m), np.ones(len(at))]),
+                                (
+                                    np.concatenate([np.arange(m), np.arange(m), m + np.arange(len(at))]),
+                                    np.concatenate([local_pairs[:, 0], local_pairs[:, 1], at]),
+                                ),
+                            ),
+                            shape=(m + len(at), size),
+                        )
+                        rows = QuadraticConstraints(
+                            matrix, weights=float(lam), targets=np.concatenate([np.zeros(m), value])
+                        )
+                        local_pairs = None
+                    elif len(at):
+                        rw = np.zeros(crop_shape)
+                        numerator = np.zeros(crop_shape)
+                        np.add.at(rw.reshape(-1), at, lam)
+                        np.add.at(numerator.reshape(-1), at, lam * value)
                         reference = np.divide(numerator, rw, out=np.zeros(crop_shape), where=rw > 0)
                         reference_weight = rw
+                prepared = None
+                if reuse_local:
+                    prepared = workspaces.setdefault(key, PreparedField())
                 tic = time.perf_counter()
                 result, info = solve_field(
                     target[crop],
@@ -287,6 +319,8 @@ def solve_schwarz(
                     rtol=local_rtol,
                     maxiter=local_maxiter,
                     preconditioner=local_preconditioner,
+                    constraints=rows,
+                    prepared=prepared,
                 )
                 stats["local_seconds"] += time.perf_counter() - tic
                 stats["local_solves"] += 1

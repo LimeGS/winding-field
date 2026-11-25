@@ -122,3 +122,15 @@ def test_spectral_and_unknown_policies_still_rejected_for_amg_mismatch():
     solve_field(target, weights, preconditioner="amg", prepared=prepared, dtype="float64")
     with pytest.raises(ValueError, match="policy changed"):
         solve_field(target, weights, preconditioner="jacobi", prepared=prepared, dtype="float64")
+
+
+def test_blockwise_galerkin_matches_direct_product():
+    _, weights, pairs = _problem(8)
+    mask = np.zeros(weights.shape, bool)
+    matrix = field_amg.assemble_free_operator(weights, mask, pairs=pairs, lam=1000.0)
+    rng = np.random.default_rng(5)
+    p = sp.random(matrix.shape[0], 40, density=0.05, random_state=rng, format="csr") + sp.eye(matrix.shape[0], 40)
+    a_t = field_amg._torch_csr(matrix, "cpu", torch.float64)
+    p_t = field_amg._torch_csr(p, "cpu", torch.float64)
+    blocked = field_amg._galerkin(a_t, p_t, block_nnz=97).to_dense().numpy()
+    np.testing.assert_allclose(blocked, (p.T @ matrix @ p).toarray(), rtol=1e-12, atol=1e-9)

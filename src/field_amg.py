@@ -22,6 +22,7 @@ keeps its guarantees. It changes iteration counts only, never the system that is
 from __future__ import annotations
 
 import math
+import time
 import warnings
 from typing import Any
 
@@ -119,13 +120,16 @@ def _torch_csr(matrix: sp.csr_matrix, device, dtype) -> torch.Tensor:
         )
 
 
-def _compact(a: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Return CSR ``a`` with ``dtype`` values and int32 indices when they fit."""
+def _compact(a: torch.Tensor, dtype: torch.dtype, device: str | torch.device) -> torch.Tensor:
+    """Return CSR ``a`` on ``device`` with ``dtype`` values and int32 indices when they fit."""
     index = torch.int32 if max(a.shape[0], a.shape[1], a.values().numel()) < 2**31 else torch.int64
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Sparse CSR tensor support is in beta state.*")
         return torch.sparse_csr_tensor(
-            a.crow_indices().to(index), a.col_indices().to(index), a.values().to(dtype), size=a.shape
+            a.crow_indices().to(device, index),
+            a.col_indices().to(device, index),
+            a.values().to(device, dtype),
+            size=a.shape,
         )
 
 
@@ -206,6 +210,40 @@ def _galerkin_aggregate(a: torch.Tensor, aggregates: torch.Tensor, size: int) ->
     return torch.sparse_coo_tensor(index, vals, (size, size)).coalesce().to_sparse_csr()
 
 
+def _row_block(a: torch.Tensor, start: int, stop: int) -> torch.Tensor:
+    """Rows ``start:stop`` of CSR ``a`` as a COO tensor (row indices local to the block)."""
+    crow = a.crow_indices()
+    lo, hi = int(crow[start]), int(crow[stop])
+    rows = torch.repeat_interleave(torch.arange(stop - start, device=crow.device), crow[start : stop + 1].diff())
+    index = torch.stack([rows, a.col_indices()[lo:hi]])
+    return torch.sparse_coo_tensor(index, a.values()[lo:hi], (stop - start, a.shape[1])).coalesce()
+
+
+def _galerkin(a: torch.Tensor, p: torch.Tensor, block_nnz: int = 1 << 22) -> torch.Tensor:
+    """Return ``p.T @ a @ p`` as CSR, accumulated over row blocks of ``a`` and ``p``.
+
+    Sparse products allocate workspace in proportion to their operands, so the fine
+    dimension is contracted block by block (about ``block_nnz`` entries of ``a`` each)
+    and the partial coarse operators are summed as they are produced.
+    """
+    n = a.shape[0]
+    crow = a.crow_indices()
+    nnz = int(crow[-1])
+    blocks = max(1, -(-nnz // block_nnz))
+    cuts = torch.searchsorted(crow, torch.linspace(0, nnz, blocks + 1, dtype=crow.dtype, device=crow.device))
+    edges = sorted({0, n, *(min(int(e), n) for e in cuts.tolist())})
+    p_coo = p.to_sparse_coo().coalesce()
+    total: torch.Tensor | None = None
+    for start, stop in zip(edges[:-1], edges[1:]):
+        if stop <= start:
+            continue
+        ap = torch.sparse.mm(_row_block(a, start, stop), p_coo).coalesce()
+        part = torch.sparse.mm(_row_block(p, start, stop).t().coalesce(), ap).coalesce()
+        total = part if total is None else (total + part).coalesce()
+    assert total is not None
+    return total
+
+
 def _torch_hierarchy(
     matrix: sp.csr_matrix,
     device: str | torch.device,
@@ -245,14 +283,17 @@ def _torch_hierarchy(
         tentative = torch.sparse_coo_tensor(
             torch.stack([nodes, aggregates]), torch.ones(n, dtype=torch.float64, device=aggregates.device), (n, size)
         ).coalesce()
-        product = torch.sparse.mm(current.to_sparse_coo(), tentative).coalesce()
+        # A @ P0 sums the columns of A within each aggregate: no sparse product needed.
+        rows, cols, vals = _csr_rows(current)
+        index = torch.stack([rows, aggregates[cols]])
+        product = torch.sparse_coo_tensor(index, vals, (n, size)).coalesce()
         index = product.indices()
         smoothed = torch.sparse_coo_tensor(index, product.values() * (omega * scale[index[0]]), product.shape)
-        prolong = (tentative - smoothed).coalesce()
-        coarse = torch.sparse.mm(prolong.t().coalesce(), torch.sparse.mm(current.to_sparse_coo(), prolong).coalesce())
-        coarse = coarse.coalesce()
-        coarse = 0.5 * (coarse + coarse.t()).coalesce()
-        levels.append((current, prolong.to_sparse_csr()))
+        prolong = (tentative - smoothed).coalesce().to_sparse_csr()
+        coarse = _galerkin(current, prolong)
+        coarse = (0.5 * (coarse + coarse.t())).coalesce()
+        del product, smoothed, tentative, rows, cols, vals, index
+        levels.append((current, prolong))
         current = coarse.to_sparse_csr()
         total_nnz += current.values().numel()
     return levels, current.to_dense(), total_nnz / fine_nnz
@@ -295,6 +336,7 @@ class AMGPreconditioner:
         self.smoothing = int(smoothing)
         self.dtype = dtype
         self.setup = setup
+        started = time.perf_counter()
         if setup == "pyamg":
             try:
                 import pyamg
@@ -310,10 +352,23 @@ class AMGPreconditioner:
             coarsest = torch.as_tensor(hierarchy.levels[-1].A.toarray(), dtype=torch.float64, device=device)
             complexity = float(hierarchy.operator_complexity())
         else:
-            built, coarsest, complexity = _torch_hierarchy(matrix, device, max_coarse=max_coarse, max_levels=max_levels)
+            try:
+                built, coarsest, complexity = _torch_hierarchy(
+                    matrix, device, max_coarse=max_coarse, max_levels=max_levels
+                )
+            except torch.OutOfMemoryError:
+                # Sparse products need transient workspace well beyond the hierarchy;
+                # build on the host instead and move only the compact result.
+                torch.cuda.empty_cache()
+                built, coarsest, complexity = _torch_hierarchy(
+                    matrix, "cpu", max_coarse=max_coarse, max_levels=max_levels
+                )
         self.levels: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
         self.bounds: list[tuple[float, float]] = []
-        for a, p in built:
+        depth = len(built) + 1
+        built.reverse()
+        while built:  # pop so each float64 level is freed once it is compacted
+            a, p = built.pop()
             if smoother == "chebyshev":
                 d = _diagonal(a)
                 if not bool(torch.isfinite(d).all()) or bool((d <= 0).any()):
@@ -328,11 +383,20 @@ class AMGPreconditioner:
                     raise ValueError("AMG level has a nonpositive l1 row norm")
                 scale = 1.0 / l1
             pt = p.to_sparse_coo().t().coalesce().to_sparse_csr()
-            self.levels.append((_compact(a, dtype), _compact(p, dtype), _compact(pt, dtype), scale.to(dtype)))
+            self.levels.append(
+                (
+                    _compact(a, dtype, device),
+                    _compact(p, dtype, device),
+                    _compact(pt, dtype, device),
+                    scale.to(device, dtype),
+                )
+            )
+            del a, p, pt
         coarsest = 0.5 * (coarsest + coarsest.T)
-        self.coarse = torch.linalg.pinv(coarsest, hermitian=True).to(dtype)
+        self.coarse = torch.linalg.pinv(coarsest, hermitian=True).to(device, dtype)
         self.complexity = complexity
-        self.depth = len(built) + 1
+        self.setup_seconds = time.perf_counter() - started
+        self.depth = depth
         if not math.isfinite(self.complexity):
             raise ValueError("AMG hierarchy is not finite")
 
@@ -342,6 +406,7 @@ class AMGPreconditioner:
             levels=self.depth,
             operator_complexity=self.complexity,
             setup=self.setup,
+            setup_seconds=round(self.setup_seconds, 3),
             dtype=str(self.dtype).removeprefix("torch."),
             smoother=self.smoother,
             smoothing=self.smoothing,

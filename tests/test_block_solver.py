@@ -487,3 +487,22 @@ def test_partial_order_requires_fixed_values_and_full_order_identity_is_unchange
         runner()(tmp_path / "short", **dict(options, partial_order=False))
     runner()(tmp_path / "full", **case(tmp_path))
     assert "order_scope" not in json.loads((tmp_path / "full/CHECKPOINT.json").read_text())["identity"]
+
+
+def test_amg_block_run_matches_jacobi_and_is_part_of_identity(tmp_path):
+    runner()(tmp_path / "jacobi", **case(tmp_path))
+    result = runner()(tmp_path / "amg", **dict(case(tmp_path), preconditioner="amg", prepared_cache_bytes=10**8))
+    assert result["local_solves_converged"] is True
+    jacobi_meta, jacobi_field, observed = state(tmp_path / "jacobi")
+    amg_meta, amg_field, amg_observed = state(tmp_path / "amg")
+    np.testing.assert_allclose(amg_field, jacobi_field, atol=1e-6)
+    np.testing.assert_array_equal(amg_observed, observed)
+    assert "preconditioner" not in jacobi_meta["identity"]
+    assert amg_meta["identity"]["preconditioner"] == "amg"
+    with pytest.raises(ValueError):
+        runner()(tmp_path / "amg", resume=True, **case(tmp_path))
+
+
+def test_spectral_block_runs_are_still_rejected(tmp_path):
+    with pytest.raises(ValueError, match="'jacobi' or 'amg'"):
+        runner()(tmp_path / "spectral", **dict(case(tmp_path), preconditioner="spectral"))

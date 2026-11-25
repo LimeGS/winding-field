@@ -173,7 +173,7 @@ def solve_blocks(
     rtol: float = 1e-5,
     maxiter: int = 4000,
     dtype: Literal["float32", "float64"] = "float64",
-    preconditioner: Literal["jacobi"] = "jacobi",
+    preconditioner: Literal["jacobi", "amg"] = "jacobi",
     nonconvergence_policy: Literal["fail", "continue"] = "fail",
     device: str = "cpu",
     cache_bytes: int = 0,
@@ -226,10 +226,12 @@ def solve_blocks(
     decision affects performance only, since no numerical operator is retained.
     ``status_policy='checkpoints'`` publishes the first RUNNING, every committed
     checkpoint and every terminal status, suppressing later observation/solve
-    notices. This advisory policy may change on resume. Only the Jacobi
-    preconditioner supports the partial fixed-face masks used by block solves.
-    Jacobi is an implicit invariant of the v1 run identity; other policies are
-    rejected before opening the store. The solver receipt records it explicitly.
+    notices. This advisory policy may change on resume. Jacobi (default) and the
+    algebraic multigrid ``'amg'`` (optional ``pyamg``) support the partial fixed-face
+    masks used by block solves. Jacobi is an implicit invariant of the v1 run identity;
+    ``'amg'`` is recorded in the identity, so a run cannot switch policy on resume.
+    The AMG hierarchy is built per block and retained with the prepared workspace.
+    Spectral preconditioning is rejected before opening the store.
 
     ``nonconvergence_policy='fail'`` (default) stops at the first local solve that
     does not reach ``rtol``. ``'continue'`` commits a local solve that only exhausted
@@ -271,9 +273,9 @@ def solve_blocks(
         prepared_stats.update(retained_bytes=0, entries=0, denied_entries=0, denied_bytes=0)
 
     try:
-        if preconditioner != "jacobi":
+        if preconditioner not in ("jacobi", "amg"):
             raise ValueError(
-                "block solves require preconditioner='jacobi'; spectral partial block masks are unsupported"
+                "block solves require preconditioner='jacobi' or 'amg'; spectral partial block masks are unsupported"
             )
         if nonconvergence_policy not in ("fail", "continue"):
             raise ValueError("nonconvergence_policy must be fail or continue")
@@ -333,6 +335,8 @@ def solve_blocks(
             maxiter=maxiter,
             dtype=dtype,
             device=str(device),
+            # Jacobi stays implicit so v1 identities (and their checkpoints) are unchanged.
+            **({} if preconditioner == "jacobi" else {"preconditioner": preconditioner}),
         )
         json.dumps(problem, allow_nan=False)
         root, started = Path(root), time.perf_counter()

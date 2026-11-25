@@ -191,7 +191,9 @@ def _amg_preconditioner(weight, mask, pairs, lam, constraints, reference_weight)
         constraints=constraints,
         reference_weight=rw,
     )
-    return AMGPreconditioner(matrix, tuple(weight.shape), mask.clone(), device=weight.device, dtype=weight.dtype)
+    # The hierarchy is stored and applied in float32 for every solve precision: CG keeps its
+    # float64 iterates, and the float32 V-cycle needs the same iterations at half the memory.
+    return AMGPreconditioner(matrix, tuple(weight.shape), mask.clone(), device=weight.device, dtype=torch.float32)
 
 
 class PreparedField:

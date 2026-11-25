@@ -119,6 +119,16 @@ def _torch_csr(matrix: sp.csr_matrix, device, dtype) -> torch.Tensor:
         )
 
 
+def _compact(a: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Return CSR ``a`` with ``dtype`` values and int32 indices when they fit."""
+    index = torch.int32 if max(a.shape[0], a.shape[1], a.values().numel()) < 2**31 else torch.int64
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Sparse CSR tensor support is in beta state.*")
+        return torch.sparse_csr_tensor(
+            a.crow_indices().to(index), a.col_indices().to(index), a.values().to(dtype), size=a.shape
+        )
+
+
 def _csr_rows(a: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     crow = a.crow_indices()
     rows = torch.repeat_interleave(torch.arange(a.shape[0], device=crow.device), crow.diff())
@@ -318,7 +328,7 @@ class AMGPreconditioner:
                     raise ValueError("AMG level has a nonpositive l1 row norm")
                 scale = 1.0 / l1
             pt = p.to_sparse_coo().t().coalesce().to_sparse_csr()
-            self.levels.append((a.to(dtype), p.to(dtype), pt.to(dtype), scale.to(dtype)))
+            self.levels.append((_compact(a, dtype), _compact(p, dtype), _compact(pt, dtype), scale.to(dtype)))
         coarsest = 0.5 * (coarsest + coarsest.T)
         self.coarse = torch.linalg.pinv(coarsest, hermitian=True).to(dtype)
         self.complexity = complexity
@@ -332,6 +342,7 @@ class AMGPreconditioner:
             levels=self.depth,
             operator_complexity=self.complexity,
             setup=self.setup,
+            dtype=str(self.dtype).removeprefix("torch."),
             smoother=self.smoother,
             smoothing=self.smoothing,
         )

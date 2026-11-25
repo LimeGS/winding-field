@@ -252,6 +252,7 @@ def _torch_hierarchy(
     max_levels: int,
     theta: float = 0.25,
     passes: int = 3,
+    dtype: torch.dtype = torch.float64,
 ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor, float]:
     """Smoothed-aggregation hierarchy built with Torch tensor ops on ``device``.
 
@@ -261,7 +262,7 @@ def _torch_hierarchy(
     for every level except the coarsest, the coarsest operator, and the operator
     complexity.
     """
-    current = _torch_csr(matrix, device, torch.float64)
+    current = _torch_csr(matrix, device, dtype)
     fine_nnz = current.values().numel()
     total_nnz = fine_nnz
     levels: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -281,7 +282,7 @@ def _torch_hierarchy(
         omega = (4.0 / 3.0) / _spectral_bound(current, scale)
         nodes = torch.arange(n, device=aggregates.device)
         tentative = torch.sparse_coo_tensor(
-            torch.stack([nodes, aggregates]), torch.ones(n, dtype=torch.float64, device=aggregates.device), (n, size)
+            torch.stack([nodes, aggregates]), torch.ones(n, dtype=dtype, device=aggregates.device), (n, size)
         ).coalesce()
         # A @ P0 sums the columns of A within each aggregate: no sparse product needed.
         rows, cols, vals = _csr_rows(current)

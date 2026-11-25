@@ -21,30 +21,6 @@ def test_explicit_afv_does_not_require_a_default_data_directory(paris_inputs, mo
             paris_solve.run_config(paris_inputs.config)
 
 
-def test_pair_loader_keeps_context_but_scores_only_eligible_endpoints(tmp_path, monkeypatch):
-    monkeypatch.setenv("WREV_DATA", str(tmp_path))
-    collections = {
-        "selected": {
-            "points": {
-                "a": {"p": [1, 2, 100], "wind_a": 0},
-                "b": {"p": [2, 2, 199], "wind_a": 1},
-                "upper_boundary": {"p": [3, 2, 200], "wind_a": 2},
-                "d": {"p": [4, 2, 150], "wind_a": 7},
-            }
-        },
-        "context": {"points": {"a": {"p": [1, 2, 90], "wind_a": 0}, "b": {"p": [1, 2, 95], "wind_a": 1}}},
-        "far": {"points": {"a": {"p": [1, 2, 500], "wind_a": 0}, "b": {"p": [1, 2, 501], "wind_a": 1}}},
-        "singleton": {"points": {"a": {"p": [1, 2, 100], "wind_a": 0}}},
-    }
-    (tmp_path / "relwind.json").write_text(json.dumps({"collections": collections}))
-    pairs, context = paris_solve.load_pairs(tmp_path / "relwind.json", 100, 200, max_dw=6)
-    assert set(context) == {"selected", "context"}
-    assert [(a.tolist(), b.tolist(), dw, cid) for a, b, dw, cid in pairs] == [
-        ([1, 2, 100], [2, 2, 199], 1, "selected"),
-        ([2, 2, 199], [4, 2, 150], 6, "selected"),
-    ]
-
-
 def test_slab_grouping_sorts_by_z_and_splits_before_exceeding_capacity(monkeypatch):
     monkeypatch.setattr(paris_solve, "MARGIN", 1)
     monkeypatch.setattr(paris_solve, "CAP", 16)

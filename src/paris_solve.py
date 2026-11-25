@@ -17,14 +17,9 @@ import torch
 from dataset_config import artifact_path, load_dataset, mode_constraints, positive
 from paris_data import load_paris_box, sample_source, save_field
 from patch_check import sha256
-from physical_grid import grid_shape
 
 MARGIN = 100
 CAP = 40_000_000
-
-
-def working_shape(lo_xyz, hi_xyz, spacing):
-    return grid_shape(lo_xyz, hi_xyz, np.broadcast_to(spacing, (3,)))
 
 
 def run_config(path=None):
@@ -54,13 +49,6 @@ def run_config(path=None):
     if not np.isfinite(config["lam"]) or config["lam"] < 0 or config["fiber_limit"] < 1 or config["pair_limit"] < 1:
         raise ValueError("invalid fibre weight or limits")
     return config
-
-
-def load_pairs(path, zlo, zhi, *, max_dw=None):
-    from paris_pair_check import load_pair_records
-
-    records, collections, _ = load_pair_records(path, zlo, zhi, max_dw=max_dw)
-    return [(np.array(r["a_xyz"]), np.array(r["b_xyz"]), r["dw"], r["collection_id"]) for r in records], collections
 
 
 def group_slabs(colls, spacing):

@@ -94,12 +94,6 @@ def test_lasagna_normals_decode_hemisphere_not_cosine_phase():
     assert (got[:, 2] >= 0).all()
 
 
-def test_paris_non_cubic_window_has_zyx_shape():
-    from paris_solve import working_shape
-
-    assert working_shape(np.array([10, 20, 30]), np.array([30, 60, 90]), spacing=2) == (30, 20, 10)
-
-
 @pytest.mark.parametrize("problem", [None, "format", "dimensions", "missing_channel"])
 def test_patch_loader_preserves_xyz_and_rejects_incomplete_grids(tmp_path, problem):
     import json

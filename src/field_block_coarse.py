@@ -202,8 +202,9 @@ def block_residual(target, weights, spacing, rows, values, fixed_mask, device) -
     ``values`` hold the current field with exact fixed values already substituted. Only rows of
     the owned core are meaningful; crop faces miss neighbours outside the crop.
     """
-    w = torch.as_tensor(np.asarray(weights), dtype=torch.float64, device=device)
-    g = torch.as_tensor(np.asarray(target), dtype=torch.float64, device=device)
+    # Copies: cached observations may be read-only, which torch cannot wrap.
+    w = torch.as_tensor(np.array(weights, dtype=np.float64), device=device)
+    g = torch.as_tensor(np.array(target, dtype=np.float64), device=device)
     x = torch.as_tensor(values, dtype=torch.float64, device=device)
     mask = torch.as_tensor(fixed_mask, device=device)
     operator = _FieldOperator(w, None, 0.0)

@@ -46,6 +46,7 @@ py-modules = [
   "dataset_config",
   "evaluation_split",
   "field_amg",
+  "field_block_coarse",
   "field_constraints",
   "field_observations",
   "field_prefetch",

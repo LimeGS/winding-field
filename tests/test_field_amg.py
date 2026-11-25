@@ -150,3 +150,25 @@ def test_chunked_expansion_matches_sparse_product(budget):
         budget=budget,
     )
     np.testing.assert_allclose(out.to_dense().numpy(), (left @ right).toarray(), rtol=1e-12, atol=1e-12)
+
+
+def test_fixed_faces_are_eliminated_before_coarsening():
+    # Fixed nodes are isolated identity rows; kept in the hierarchy they never aggregate and a
+    # block with fixed faces ended in a dense coarsest level of thousands of nodes.
+    rng = np.random.default_rng(3)
+    shape = (24, 24, 24)
+    weights = np.where(rng.random(shape) > 0.5, 1.0, 1e-3)
+    mask = np.zeros(shape, bool)
+    mask[[0, -1]] = True
+    mask[:, [0, -1]] = True
+    mask[:, :, [0, -1]] = True
+    matrix = field_amg.assemble_free_operator(weights, mask)
+    amg = field_amg.AMGPreconditioner(matrix, shape, torch.as_tensor(mask), max_coarse=200)
+    assert amg.coarse.shape[0] <= 200
+    r = torch.as_tensor(rng.standard_normal(shape))
+    out = amg.apply(r)
+    assert bool((out[torch.as_tensor(mask)] == 0).all()) and bool(torch.isfinite(out).all())
+    everything = field_amg.AMGPreconditioner(
+        field_amg.assemble_free_operator(weights, np.ones(shape, bool)), shape, torch.ones(shape, dtype=torch.bool)
+    )
+    assert bool((everything.apply(r) == 0).all())

@@ -408,6 +408,16 @@ class AMGPreconditioner:
         self.dtype = dtype
         self.setup = setup
         started = time.perf_counter()
+        # Fixed nodes are identity rows with no neighbours: aggregation can never merge them, so
+        # a block with fixed faces would keep them all to the dense coarsest level. Build and
+        # apply the hierarchy on free nodes only; fixed nodes get a zero correction.
+        fixed = mask.detach().reshape(-1).cpu().numpy().astype(bool)
+        self.free: torch.Tensor | None = None
+        if fixed.any():
+            keep = np.flatnonzero(~fixed)
+            # An all-fixed block keeps a 1x1 placeholder hierarchy that apply never reaches.
+            matrix = matrix[keep][:, keep].tocsr() if len(keep) else sp.identity(1, format="csr")
+            self.free = torch.as_tensor(keep, device=device)
         if setup == "pyamg":
             try:
                 import pyamg
@@ -516,7 +526,13 @@ class AMGPreconditioner:
         return self._smooth(k, x, b)
 
     def apply(self, residual: torch.Tensor) -> torch.Tensor:
-        b = residual.reshape(-1).to(self.dtype)
-        out = self._cycle(0, b).reshape(self.shape).to(residual.dtype)
+        b = residual.reshape(-1)
+        if self.free is None:
+            out = self._cycle(0, b.to(self.dtype)).to(residual.dtype)
+        else:
+            out = torch.zeros_like(b)
+            if len(self.free):
+                out[self.free] = self._cycle(0, b[self.free].to(self.dtype)).to(residual.dtype)
+        out = out.reshape(self.shape)
         out[self.mask] = 0
         return out

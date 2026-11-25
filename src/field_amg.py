@@ -362,7 +362,6 @@ def _torch_hierarchy(
         smoothed = torch.sparse_coo_tensor(index, product.values() * (omega * scale[index[0]]), product.shape)
         prolong = _truncate((tentative - smoothed).coalesce(), truncate)
         coarse = _galerkin(current, prolong)
-        coarse = (0.5 * (coarse + coarse.t())).coalesce()
         del product, smoothed, tentative, rows, cols, vals, index
         levels.append((current, prolong))
         current = coarse.to_sparse_csr()

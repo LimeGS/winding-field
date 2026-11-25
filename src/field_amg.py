@@ -210,35 +210,58 @@ def _galerkin_aggregate(a: torch.Tensor, aggregates: torch.Tensor, size: int) ->
     return torch.sparse_coo_tensor(index, vals, (size, size)).coalesce().to_sparse_csr()
 
 
-def _row_block(a: torch.Tensor, start: int, stop: int) -> torch.Tensor:
-    """Rows ``start:stop`` of CSR ``a`` as a COO tensor (row indices local to the block)."""
-    crow = a.crow_indices()
-    lo, hi = int(crow[start]), int(crow[stop])
-    rows = torch.repeat_interleave(torch.arange(stop - start, device=crow.device), crow[start : stop + 1].diff())
-    index = torch.stack([rows, a.col_indices()[lo:hi]])
-    return torch.sparse_coo_tensor(index, a.values()[lo:hi], (stop - start, a.shape[1])).coalesce()
+def _expand(
+    rows: torch.Tensor,
+    inner: torch.Tensor,
+    vals: torch.Tensor,
+    right: torch.Tensor,
+    shape: tuple[int, int],
+) -> torch.Tensor:
+    """Sparse product by expand, sort and compress.
+
+    ``(rows, inner, vals)`` are the entries of the left factor; ``right`` is a CSR matrix
+    whose rows are indexed by ``inner``. Every left entry is expanded against its right
+    row and duplicates are summed, so memory is proportional to the expanded entry count
+    (unlike library SpGEMM, whose workspace can reach many times the operands).
+    """
+    crow, cols, values = right.crow_indices(), right.col_indices(), right.values()
+    first = crow[inner]
+    counts = crow[inner + 1] - first
+    total = int(counts.sum())
+    owner = torch.repeat_interleave(torch.arange(rows.numel(), device=rows.device), counts)
+    starts = torch.cumsum(counts, 0) - counts
+    position = first[owner] + torch.arange(total, device=rows.device) - starts[owner]
+    index = torch.stack([rows[owner], cols[position]])
+    return torch.sparse_coo_tensor(index, vals[owner] * values[position], shape).coalesce()
 
 
-def _galerkin(a: torch.Tensor, p: torch.Tensor, block_nnz: int = 1 << 22) -> torch.Tensor:
-    """Return ``p.T @ a @ p`` as CSR, accumulated over row blocks of ``a`` and ``p``.
+def _galerkin(a: torch.Tensor, p: torch.Tensor, block_nnz: int = 1 << 20) -> torch.Tensor:
+    """Return ``p.T @ a @ p`` (COO), contracted over row blocks of ``a`` and ``p``.
 
-    Sparse products allocate workspace in proportion to their operands, so the fine
-    dimension is contracted block by block (about ``block_nnz`` entries of ``a`` each)
-    and the partial coarse operators are summed as they are produced.
+    Each block of about ``block_nnz`` entries of ``a`` forms ``(A P)_block`` and then
+    ``P_block^T (A P)_block`` by expansion, and the partial coarse operators are summed
+    as they are produced, so peak memory is bounded by the block size.
     """
     n = a.shape[0]
-    crow = a.crow_indices()
-    nnz = int(crow[-1])
+    size = p.shape[1]
+    a_crow, a_cols, a_vals = a.crow_indices(), a.col_indices(), a.values()
+    p_crow, p_cols, p_vals = p.crow_indices(), p.col_indices(), p.values()
+    nnz = int(a_crow[-1])
     blocks = max(1, -(-nnz // block_nnz))
-    cuts = torch.searchsorted(crow, torch.linspace(0, nnz, blocks + 1, dtype=crow.dtype, device=crow.device))
+    cuts = torch.searchsorted(a_crow, torch.linspace(0, nnz, blocks + 1, dtype=a_crow.dtype, device=a_crow.device))
     edges = sorted({0, n, *(min(int(e), n) for e in cuts.tolist())})
-    p_coo = p.to_sparse_coo().coalesce()
     total: torch.Tensor | None = None
     for start, stop in zip(edges[:-1], edges[1:]):
         if stop <= start:
             continue
-        ap = torch.sparse.mm(_row_block(a, start, stop), p_coo).coalesce()
-        part = torch.sparse.mm(_row_block(p, start, stop).t().coalesce(), ap).coalesce()
+        local = torch.arange(stop - start, device=a_crow.device)
+        lo, hi = int(a_crow[start]), int(a_crow[stop])
+        rows = torch.repeat_interleave(local, a_crow[start : stop + 1].diff())
+        ap = _expand(rows, a_cols[lo:hi], a_vals[lo:hi], p, (stop - start, size)).to_sparse_csr()
+        lo, hi = int(p_crow[start]), int(p_crow[stop])
+        rows = torch.repeat_interleave(local, p_crow[start : stop + 1].diff())
+        part = _expand(p_cols[lo:hi], rows, p_vals[lo:hi], ap, (size, size))
+        del ap, rows
         total = part if total is None else (total + part).coalesce()
     assert total is not None
     return total

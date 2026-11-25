@@ -27,10 +27,11 @@ import os
 import re
 import shutil
 import stat
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import dataclass
 from numbers import Integral
@@ -225,6 +226,13 @@ class BlockStore:
     unrelated writers. Both are logical byte budgets, not filesystem block usage.
     ``stored_bytes`` in a commit receipt counts only manifest-referenced payloads.
     ``manifest`` returns a detached snapshot; no caller may mutate store files.
+
+    ``write_back=True`` keeps commits in memory: reads see them at once, and
+    ``flush`` publishes every pending chunk with the latest progress as one
+    checkpoint (in the background with ``wait=False``). The on-disk checkpoint is
+    always a state some sequence of commits reached, never a mix. ``close`` and
+    ``save_progress`` flush and wait. Pending chunks are never evicted, so the
+    caller sizes memory for them; ``prepare`` observers need ``write_back=False``.
     """
 
     def __init__(
@@ -239,6 +247,7 @@ class BlockStore:
         workers: int = 1,
         max_bytes: int | None = None,
         reserve_bytes: int = 0,
+        write_back: bool = False,
     ) -> None:
         self.root = Path(root)
         self.shape = _triple(shape, 1)
@@ -250,6 +259,15 @@ class BlockStore:
         self.max_bytes = None if max_bytes is None else _integer(max_bytes)
         self.reserve_bytes = _integer(reserve_bytes)
         identity = _json_load(_json_bytes(identity))
+        if not isinstance(write_back, bool):
+            raise ValueError("write_back must be boolean")
+        self.write_back = write_back
+        self._dirty: dict[str, tuple[_Chunk | None, float]] = {}
+        self._pending_progress: dict[str, Any] | None = None
+        self._flush_lock = Lock()
+        self._flusher: ThreadPoolExecutor | None = None
+        self._flush_future: Future[None] | None = None
+        self.flush_stats: dict[str, Any] = dict(flushes=0, chunks=0, bytes=0, seconds=0.0, last_s=None, running=False)
         if not isinstance(resume, bool) or self.root.is_symlink():
             raise ValueError("invalid resume flag or symlink store root")
         self.stats = dict(hits=0, loads=0, zeros=0, evictions=0, peak_cache_bytes=0)
@@ -386,7 +404,12 @@ class BlockStore:
         return value[0].nbytes + value[2].nbytes + 512
 
     def _load(self, key: _Key) -> _Chunk | None:
-        record = self._manifest["chunks"].get("-".join(map(str, key)))
+        label = "-".join(map(str, key))
+        with self._cache_lock:
+            if label in self._dirty:
+                self.stats["hits"] += 1
+                return self._dirty[label][0]
+        record = self._manifest["chunks"].get(label)
         with self._cache_lock:
             if record is None:
                 self.stats["zeros"] += 1
@@ -592,8 +615,11 @@ class BlockStore:
         error, not a stored/global residual or a decoded fixed-value guarantee.
         Caller validation of the pre-encoding solve remains the acceptance gate.
         """
+        if self.write_back and prepare is not None:
+            raise ValueError("prepare observers need write_back=False")
         with self._operation:
             self._ensure_open()
+            self._raise_flush_error()
             key = self._key(key)
             shape = self._shape(key)
             array = np.asarray(values)
@@ -608,6 +634,8 @@ class BlockStore:
                 if support.shape != shape or support.dtype != np.bool_:
                     raise ValueError("observed must be a matching boolean array")
                 mask = np.packbits(support)
+            if self.write_back:
+                return self._commit_pending("-".join(map(str, key)), array, mask, observed is not None, progress)
             next_manifest = deepcopy(self._manifest)
             next_manifest["progress"] = self._progress(progress)
             label = "-".join(map(str, key))
@@ -668,16 +696,174 @@ class BlockStore:
                 result.update(diagnostics)
             return result
 
+    @staticmethod
+    def _encode(array: NDArray[np.float64]) -> tuple[NDArray[np.float32], float, float]:
+        with np.errstate(over="ignore", invalid="ignore"):
+            offset = np.float64(array.mean())
+            delta = (array - offset).astype(np.float32)
+            restored = delta.astype(np.float64) + offset
+            error = float(np.max(np.abs(restored - array)))
+        if not np.isfinite(delta).all() or not np.isfinite(restored).all() or not math.isfinite(error):
+            raise ValueError("nonfinite checkpoint encoding/decoding")
+        return delta, float(offset), error
+
+    def _commit_pending(
+        self,
+        label: str,
+        array: NDArray[np.float64],
+        mask: NDArray[np.uint8],
+        observed: bool,
+        progress: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Write-back commit: the decoded chunk a flush will publish, held in memory."""
+        progress = self._progress(progress)
+        value: _Chunk | None = None
+        error = 0.0
+        if array.any() or observed:
+            delta, offset, error = self._encode(array)
+            delta.setflags(write=False)
+            mask.setflags(write=False)
+            value = (delta, offset, mask)
+        with self._cache_lock:
+            self._dirty.pop(label, None)  # Keep commit order: flushes write the oldest first.
+            self._dirty[label] = (value, error)
+        self._pending_progress = progress
+        return dict(quantization_max=error, stored_bytes=sum(v["bytes"] for v in self._manifest["chunks"].values()))
+
+    @property
+    def pending_chunks(self) -> int:
+        """Committed chunks a flush has not published yet (write-back only)."""
+        return len(self._dirty)
+
+    def _raise_flush_error(self) -> None:
+        future = self._flush_future
+        if future is not None and future.done():
+            self._flush_future = None
+            future.result()
+
+    def flush(self, wait: bool = True) -> None:
+        """Publish pending write-back commits and progress as one checkpoint.
+
+        With ``wait=False`` the files are written by a background thread; the
+        next flush, ``save_progress`` or ``close`` waits for it and raises its error.
+        A no-op without write-back.
+        """
+        if not self.write_back:
+            return
+        with self._flush_lock:
+            previous, self._flush_future = self._flush_future, None
+            if previous is not None:
+                previous.result()
+            with self._operation:
+                self._ensure_open()
+                if not self._dirty and self._pending_progress is None:
+                    return
+                with self._cache_lock:
+                    snapshot = list(self._dirty.items())
+                progress = self._manifest["progress"] if self._pending_progress is None else self._pending_progress
+                self._pending_progress = None
+                base = deepcopy(self._manifest)
+                self.flush_stats["running"] = True
+            if wait:
+                self._write_back(snapshot, progress, base)
+                return
+            if self._flusher is None:
+                self._flusher = ThreadPoolExecutor(max_workers=1, thread_name_prefix="field-flush")
+            self._flush_future = self._flusher.submit(self._write_back, snapshot, progress, base)
+
+    def _write_back(
+        self,
+        snapshot: list[tuple[str, tuple[_Chunk | None, float]]],
+        progress: dict[str, Any],
+        manifest: dict[str, Any],
+    ) -> None:
+        started = time.perf_counter()
+        written: list[tuple[str, _Chunk, str]] = []
+        retired: list[dict[str, Any]] = []
+        total = 0
+        try:
+            manifest["progress"] = progress
+            upper = sum(v[0].nbytes + v[2].nbytes + 4096 for _, (v, _) in snapshot if v is not None)
+            self._admit(upper + len(_json_bytes(manifest)) + 512 * len(snapshot))
+            for label, (value, error) in snapshot:
+                old = manifest["chunks"].pop(label, None)
+                if old is not None:
+                    retired.append(old)
+                if value is None:
+                    continue
+                delta, offset, mask = value
+                stream = io.BytesIO()
+                np.savez(stream, delta=delta, offset=np.float64(offset), observed=mask)
+                raw = stream.getvalue()
+                name = f"{label}.g{uuid.uuid4().hex}.npz"
+                temporary = self.root / (name + ".pending")
+                _write_file(temporary, raw)
+                os.replace(temporary, self.root / name)
+                manifest["chunks"][label] = dict(
+                    path=name, sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw), quantization_max=error
+                )
+                written.append((label, value, name))
+                total += len(raw)
+            _sync_directory(self.root)
+            _atomic_json_bytes(self.root / "CHECKPOINT.json", _json_bytes(manifest))
+            with self._operation:
+                self._manifest = manifest
+                with self._cache_lock:
+                    for label, entry in snapshot:
+                        if label in self._dirty and self._dirty[label] is entry:
+                            del self._dirty[label]
+                for _, value, name in written:
+                    self._retain(name, value)
+            referenced = {v["path"] for v in manifest["chunks"].values()}
+            for old in retired:
+                if old["path"] not in referenced:
+                    (self.root / old["path"]).unlink(missing_ok=True)
+            if retired:
+                _sync_directory(self.root)
+        except BaseException:
+            self._poisoned = True
+            raise
+        finally:
+            seconds = time.perf_counter() - started
+            self.flush_stats.update(
+                flushes=self.flush_stats["flushes"] + 1,
+                chunks=self.flush_stats["chunks"] + len(written),
+                bytes=self.flush_stats["bytes"] + total,
+                seconds=self.flush_stats["seconds"] + seconds,
+                last_s=seconds,
+                running=False,
+            )
+
     def save_progress(self, progress: dict[str, Any]) -> None:
         """Replace all progress atomically; preserve cumulative sweep statistics."""
+        if self.write_back:
+            with self._operation:
+                self._ensure_open()
+                self._pending_progress = self._progress(progress)
+            self.flush(wait=True)
+            return
         with self._operation:
             self._ensure_open()
             manifest = deepcopy(self._manifest)
             manifest["progress"] = self._progress(progress)
             self._publish(manifest)
 
-    def close(self) -> None:
-        """Drain readers, drop retention, and release the writer lease; idempotent."""
+    def close(self, flush: bool = True) -> None:
+        """Flush write-back commits, drain readers, drop retention, release the lease; idempotent.
+
+        ``flush=False`` (used while an exception propagates) still waits for a running
+        background flush but publishes nothing new and ignores its error.
+        """
+        if self.write_back and not self._closed:
+            try:
+                if flush and not self._poisoned:
+                    self.flush(wait=True)
+                elif self._flush_future is not None:
+                    wait([self._flush_future])
+            finally:
+                if self._flusher is not None:
+                    self._flusher.shutdown(wait=True)
+                    self._flusher = None
         with self._operation:
             try:
                 if self._pool is not None:
@@ -696,5 +882,12 @@ class BlockStore:
         self._ensure_open()
         return self
 
-    def __exit__(self, *exc: object) -> None:
-        self.close()
+    def __exit__(self, kind: object, *exc: object) -> None:
+        if kind is None:
+            self.close()
+            return
+        try:
+            self.close()
+        except Exception:
+            # Keep the original error; a failed final flush leaves the previous checkpoint.
+            self.close(flush=False)

@@ -192,6 +192,8 @@ def solve_blocks(
     observer: Any = None,
     coarse_factor: int | None = None,
     coarse_direct_limit: int = 200_000,
+    checkpoint: Literal["block", "sweep"] = "block",
+    memory_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Solve each explicit owned core, persisting its exact next-block cursor.
 
@@ -252,6 +254,14 @@ def solve_blocks(
     cumulative ``nonconverged_solves`` count is checkpointed with progress and every
     status reports it with ``local_solves_converged``. The policy is an execution
     choice, not part of the checkpoint identity, and may change on resume.
+
+    ``checkpoint='sweep'`` keeps committed cores in memory and publishes them once per
+    sweep, in the background while the next sweep runs, and before every
+    ``CHECKPOINTED_STOP`` or ``SWEEP_BUDGET_REACHED`` status. A crash then resumes from the
+    last published sweep instead of the last block. Memory must hold the whole field
+    (see :mod:`field_memory`); ``cache_bytes`` should cover it too, or published chunks
+    are read back from disk. Not available with an observer. ``memory_report`` is shown
+    verbatim as ``STATUS.json["memory"]``. Neither is part of the run identity.
     """
     if observer is not None and not all(
         callable(getattr(observer, name, None)) for name in ("restore", "prepare", "complete")
@@ -321,6 +331,12 @@ def solve_blocks(
             coarse_direct_limit = _integer(coarse_direct_limit)
             if partial_order:
                 raise ValueError("coarse correction needs the full block order")
+        if checkpoint not in ("block", "sweep"):
+            raise ValueError("checkpoint must be block or sweep")
+        if checkpoint == "sweep" and observer_requested:
+            raise ValueError("sweep checkpoints do not support a field observer")
+        if memory_report is not None:
+            memory_report = json.loads(json.dumps(memory_report, allow_nan=False))
         if partial_order and fixed is None:
             raise ValueError("partial_order requires a fixed provider for unowned halo nodes")
         if halo == 0 and len(ordered) > 1:
@@ -370,6 +386,7 @@ def solve_blocks(
             workers=read_workers,
             max_bytes=max_bytes,
             reserve_bytes=reserve_bytes,
+            write_back=checkpoint == "sweep",
         ) as store:
             manifest = store.manifest
             progress = manifest["progress"]
@@ -460,6 +477,8 @@ def solve_blocks(
                     return None
                 if status != "RUNNING":
                     release_prepared()
+                    if checkpoint == "sweep" and status in ("CHECKPOINTED_STOP", "SWEEP_BUDGET_REACHED"):
+                        store.flush(wait=True)  # The terminal status names a published checkpoint.
                 result = dict(
                     status=status,
                     pid=os.getpid(),
@@ -482,6 +501,8 @@ def solve_blocks(
                     local_solves_converged=nonconverged == 0,
                     elapsed_s=time.perf_counter() - started,
                     **({"coarse": dict(coarse_status)} if coarse_factor is not None else {}),
+                    checkpoint_policy=dict(policy=checkpoint, pending_chunks=store.pending_chunks, **store.flush_stats),
+                    **({} if memory_report is None else {"memory": memory_report}),
                     **extra,
                 )
                 atomic_json(root / "STATUS.json", result)
@@ -957,6 +978,8 @@ def solve_blocks(
                             completed_advice()
                             if coarse_factor is not None:
                                 coarse_status.update(stage="done", next_block=len(ordered))
+                            # Publish the finished sweep while the next one starts from memory.
+                            store.flush(wait=False)
                         emit("RUNNING", phase="checkpointed")
                         del (
                             target,

@@ -71,6 +71,10 @@ class _Template:
                 array = array.base
             self.nbytes += array.nbytes  # Conservatively charge shared backing buffers twice.
 
+    def exterior(self):
+        """Return (local row, global flat node, coefficient) of every term outside the crop."""
+        return self.slots // self.width, self.nodes, self.coeff
+
     def restrict(self, read_nodes):
         terms = np.zeros((self.matrix.shape[0], self.width), np.float64)
         if self.nodes.size:

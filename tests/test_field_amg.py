@@ -81,6 +81,23 @@ def test_preconditioner_is_symmetric_and_positive(setup, smoother):
         field_amg.AMGPreconditioner(matrix, weights.shape, torch.tensor(mask), setup="ruge")
 
 
+def test_chebyshev_bounds_cover_every_level_spectrum():
+    # An lmax below the top eigenvalue of D^-1 A amplifies those modes and can make the
+    # V-cycle indefinite (an occasional nonpositive CG curvature on real 175A blocks).
+    _, weights, pairs = _problem(10)
+    mask = np.zeros(weights.shape, bool)
+    mask.flat[0] = True
+    matrix = field_amg.assemble_free_operator(weights, mask, pairs=pairs, lam=1000.0)
+    amg = field_amg.AMGPreconditioner(matrix, weights.shape, torch.tensor(mask), max_coarse=50)
+    assert len(amg.bounds) == len(amg.levels) >= 1
+    for (a, _, _, scale), (lmin, lmax) in zip(amg.levels, amg.bounds):
+        dense = (scale[:, None] * a.to_dense()).double().numpy()
+        top = float(np.max(np.linalg.eigvals(dense).real))
+        assert top <= lmax * (1 + 1e-6)
+        assert lmax <= 1.5 * top
+        assert lmin == pytest.approx(lmax / 30)
+
+
 @pytest.mark.parametrize("dtype", ["float64", "float32"])
 def test_amg_solution_matches_jacobi_with_far_fewer_iterations(dtype):
     target, weights, pairs = _problem(18)

@@ -50,6 +50,7 @@ py-modules = [
   "field_observations",
   "field_prefetch",
   "field_runtime",
+  "field_schwarz",
   "field_solver",
   "field_sources",
   "field_store",

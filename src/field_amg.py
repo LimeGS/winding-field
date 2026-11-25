@@ -322,6 +322,7 @@ def _torch_hierarchy(
     passes: int = 3,
     dtype: torch.dtype = torch.float64,
     truncate: float = 0.2,
+    dense: bool = True,
 ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor, float]:
     """Smoothed-aggregation hierarchy built with Torch tensor ops on ``device``.
 
@@ -329,8 +330,8 @@ def _torch_hierarchy(
     each); the tentative prolongator is smoothed by one damped Jacobi step with weight
     ``4 / (3 lmax)`` and entries below ``truncate`` times their row maximum are dropped
     (row sums kept); coarse operators are Galerkin products. Returns ``[(A_k, P_k)]``
-    for every level except the coarsest, the coarsest operator, and the operator
-    complexity.
+    for every level except the coarsest, the coarsest operator (dense unless ``dense``
+    is False, then sparse CSR), and the operator complexity.
     """
     current = _torch_csr(matrix, device, dtype)
     fine_nnz = current.values().numel()
@@ -366,7 +367,7 @@ def _torch_hierarchy(
         levels.append((current, prolong))
         current = coarse.to_sparse_csr()
         total_nnz += current.values().numel()
-    return levels, current.to_dense(), total_nnz / fine_nnz
+    return levels, current.to_dense() if dense else current, total_nnz / fine_nnz
 
 
 class AMGPreconditioner:

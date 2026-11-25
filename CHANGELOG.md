@@ -8,8 +8,9 @@ versions follow the GitHub releases.
 ## [2.0.0] - unreleased
 
 Released in lockstep with winding-field-cli 2.0.0 and winding-field-studio 2.0.0
-(one version across the three repositories). No public API is removed; Jacobi
-identities and checkpoints are unchanged and resume byte-identically.
+(one version across the three repositories). Five unused public helpers are removed
+(see Removed and [docs/MIGRATION.md](docs/MIGRATION.md)); Jacobi identities and
+checkpoints are unchanged and resume byte-identically.
 
 ### Added
 - `solve_field`/`solve_blocks(preconditioner="amg")` (`field_amg.py`): smoothed-aggregation
@@ -18,9 +19,23 @@ identities and checkpoints are unchanged and resume byte-identically.
   operator and AMG hierarchy are reused across sweeps.
 - `GpuLease(query_interval)` may reuse a recent NVIDIA inventory between rechecks
   (default 0, unchanged).
+- `solve_blocks(coarse_factor=k)` (`field_block_coarse.py`): out-of-core two-level
+  multiplicative Schwarz over the block sweeps; the factor is part of the run identity.
+- `solve_blocks(checkpoint="sweep")`: committed cores stay in memory and are published
+  once per sweep; the default `"block"` is unchanged.
+- `field_memory.plan_memory`: picks a host-memory tier (`disk`, `field`, `all`) from the
+  memory available at start and maps it to the block solver's checkpoint mode.
 
 ### Changed
 - `field_store.py` commits chunks uncompressed; decoded values are unchanged.
+- `NpyObservations` and `NpyFixedValues` share one pinned-NPY open and recheck; their
+  errors now read `<label> hash differs`, `<label> is not a memory-mappable NPY array`
+  and `<label> file or header changed`.
+
+### Removed
+- `common.sample_pairs`, `common.calib_gap`, `physical_grid.offset_correction`,
+  `paris_solve.working_shape` and `paris_solve.load_pairs`: nothing called them.
+  Replacements are in [docs/MIGRATION.md](docs/MIGRATION.md#upgrading-to-200).
 
 ## [1.7.0] - 2026-11-21
 

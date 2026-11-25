@@ -179,6 +179,23 @@ def _constraint_operator(constraints, device, dtype):
     return constraints.operator(device, np.float64, layout="csr")
 
 
+def _amg_preconditioner(weight, mask, pairs, lam, constraints, reference_weight):
+    from field_amg import AMGPreconditioner, assemble_free_operator
+
+    rw = reference_weight.detach().cpu().numpy() if isinstance(reference_weight, torch.Tensor) else reference_weight
+    matrix = assemble_free_operator(
+        weight.detach().cpu().numpy(),
+        mask.detach().cpu().numpy(),
+        pairs=None if pairs is None else pairs.detach().cpu().numpy(),
+        lam=lam,
+        constraints=constraints,
+        reference_weight=rw,
+    )
+    # The hierarchy is stored and applied in float32 for every solve precision: CG keeps its
+    # float64 iterates, and the float32 V-cycle needs the same iterations at half the memory.
+    return AMGPreconditioner(matrix, tuple(weight.shape), mask.clone(), device=weight.device, dtype=torch.float32)
+
+
 class PreparedField:
     """Own static operators for one block; anchors and constraint targets stay live.
 
@@ -191,6 +208,7 @@ class PreparedField:
         self.signature: tuple[Any, ...] | None = None
         self.preconditioner_policy: str | None = None
         self.spectral: _SpectralPreconditioner | None = None
+        self.amg: Any = None
 
     @property
     def retained_bytes(self) -> int:
@@ -247,10 +265,17 @@ class PreparedField:
         return self.operator, self.extra, self.gradient_rhs.clone()
 
     def bind_preconditioner(
-        self, policy: str, weights: torch.Tensor, mask: torch.Tensor
-    ) -> _SpectralPreconditioner | None:
+        self, policy: str, weights: torch.Tensor, mask: torch.Tensor, constraints: Any = None
+    ) -> Any:
         if self.preconditioner_policy is not None and self.preconditioner_policy != policy:
             raise ValueError("prepared preconditioner policy changed; create a new workspace")
+        if policy == "amg":
+            # The hierarchy depends on weights, constraint rows and the fixed mask; bind()
+            # already pins the first two, so only a changed mask needs a new hierarchy.
+            if self.amg is None or not torch.equal(self.amg.mask, mask):
+                self.amg = _amg_preconditioner(weights, mask, None, 0.0, constraints, 0.0)
+            self.preconditioner_policy = policy
+            return self.amg
         if policy == "spectral":
             if self.spectral is None:
                 self.spectral = _SpectralPreconditioner(weights, mask)
@@ -279,7 +304,7 @@ def solve_field(
     dtype: Literal["float32"] = "float32",
     prepared: PreparedField | None = None,
     return_tensor: Literal[False] = False,
-    preconditioner: Literal["jacobi", "spectral"] = "jacobi",
+    preconditioner: Literal["jacobi", "spectral", "amg"] = "jacobi",
 ) -> tuple[NDArray[np.float32], dict[str, Any]]: ...
 
 
@@ -302,7 +327,7 @@ def solve_field(
     dtype: Literal["float64"],
     prepared: PreparedField | None = None,
     return_tensor: Literal[False] = False,
-    preconditioner: Literal["jacobi", "spectral"] = "jacobi",
+    preconditioner: Literal["jacobi", "spectral", "amg"] = "jacobi",
 ) -> tuple[NDArray[np.float64], dict[str, Any]]: ...
 
 
@@ -325,7 +350,7 @@ def solve_field(
     dtype: Literal["float32", "float64"] = "float32",
     prepared: PreparedField | None = None,
     return_tensor: Literal[True],
-    preconditioner: Literal["jacobi", "spectral"] = "jacobi",
+    preconditioner: Literal["jacobi", "spectral", "amg"] = "jacobi",
 ) -> tuple[torch.Tensor, dict[str, Any]]: ...
 
 
@@ -348,7 +373,7 @@ def solve_field(
     dtype: Literal["float32", "float64"] = "float32",
     prepared: PreparedField | None = None,
     return_tensor: bool = False,
-    preconditioner: Literal["jacobi", "spectral"] = "jacobi",
+    preconditioner: Literal["jacobi", "spectral", "amg"] = "jacobi",
 ) -> tuple[NDArray[np.float32] | NDArray[np.float64] | torch.Tensor, dict[str, Any]]: ...
 
 
@@ -371,7 +396,7 @@ def solve_field(
     dtype: Literal["float32", "float64"] = "float32",
     prepared: PreparedField | None = None,
     return_tensor: bool = False,
-    preconditioner: Literal["jacobi", "spectral"] = "jacobi",
+    preconditioner: Literal["jacobi", "spectral", "amg"] = "jacobi",
 ) -> tuple[NDArray[np.float32] | NDArray[np.float64] | torch.Tensor, dict[str, Any]]:
     """Return a ZYX field and a JSON-compatible solver receipt (float32 by default).
 
@@ -414,8 +439,8 @@ def solve_field(
     start = time.perf_counter()
     if dtype not in ("float32", "float64"):
         raise ValueError("dtype must be float32 or float64")
-    if preconditioner not in ("jacobi", "spectral"):
-        raise ValueError("preconditioner must be jacobi or spectral")
+    if preconditioner not in ("jacobi", "spectral", "amg"):
+        raise ValueError("preconditioner must be jacobi, spectral or amg")
     if preconditioner == "spectral" and (dtype != "float64" or torch.device(device).type != "cpu"):
         raise ValueError("spectral preconditioning requires CPU float64")
     if type(return_tensor) is not bool:
@@ -519,7 +544,9 @@ def solve_field(
     inverse = diagonal.reciprocal()
     spectral = None
     if prepared is not None:
-        spectral = prepared.bind_preconditioner(preconditioner, weight, mask)
+        spectral = prepared.bind_preconditioner(preconditioner, weight, mask, constraints)
+    elif preconditioner == "amg":
+        spectral = _amg_preconditioner(weight, mask, pairs_t, lam, constraints, rw)
     elif preconditioner == "spectral":
         spectral = _SpectralPreconditioner(weight, mask)
     del target, weight, ref, diagonal
@@ -605,7 +632,11 @@ def solve_field(
         dtype=dtype,
         preconditioner=preconditioner,
         preconditioner_metadata=(
-            dict(kind="jacobi") if spectral is None else dict(kind=spectral.kind, alpha=spectral.alpha)
+            dict(kind="jacobi")
+            if spectral is None
+            else spectral.metadata()
+            if preconditioner == "amg"
+            else dict(kind=spectral.kind, alpha=spectral.alpha)
         ),
     )
     return field, info

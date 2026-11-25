@@ -61,6 +61,8 @@ class GpuLease:
     owner leaves the lease held until the final inherited/duplicated FD closes.
     Call ``recheck()`` immediately before work, including after slow preparation.
     NVIDIA queries are bounded and exclude only this process's own GPU context.
+    ``query_interval`` seconds (default 0: every recheck) reuses the last passing
+    NVIDIA inventory; deadline, lock-file and environment checks still run every time.
     """
 
     def __init__(
@@ -72,6 +74,7 @@ class GpuLease:
         min_free_bytes: int = 0,
         deadline: float | None = None,
         inherited_fd: int | None = None,
+        query_interval: float = 0.0,
     ) -> None:
         self.index: int = _nonnegative(index, "index")
         if not isinstance(uuid, str) or not uuid.startswith("GPU-") or any(c.isspace() for c in uuid):
@@ -82,6 +85,8 @@ class GpuLease:
         self.min_free_bytes: int = _nonnegative(min_free_bytes, "min_free_bytes")
         self.deadline: float | None = None if deadline is None else _seconds(deadline, "deadline")
         self.inherited_fd: int | None = None if inherited_fd is None else _nonnegative(inherited_fd, "inherited_fd")
+        self.query_interval: float = _seconds(query_interval, "query_interval", zero=True)
+        self._queried: float | None = None
         self._fd: int | None = None
 
     def __enter__(self) -> Self:
@@ -117,6 +122,8 @@ class GpuLease:
         _same_file(self.fileno(), self.lock_path)
         if os.environ.get("CUDA_VISIBLE_DEVICES") != self.uuid:
             raise ValueError("GPU environment identity changed")
+        if self.query_interval and self._queried is not None and time.monotonic() - self._queried < self.query_interval:
+            return
 
         def query(fields, *extra):
             _deadline(self.deadline)
@@ -153,6 +160,7 @@ class GpuLease:
             if used == self.uuid and foreign:
                 raise ResourceUnavailable("foreign compute process on GPU")
         _deadline(self.deadline)
+        self._queried = time.monotonic()
 
     def close(self) -> None:
         if self._fd is not None:

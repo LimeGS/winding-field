@@ -20,9 +20,12 @@ dependencies = [
 [project.optional-dependencies]
 # Runtime access to the public Vesuvius datasets.
 data = ["zarr>=3,<4", "numcodecs>=0.13,<1"]
-test = ["pytest>=8,<10", "pytest-cov>=5,<8"]
+# Optional PyAMG hierarchy setup for preconditioner="amg" (AMGPreconditioner setup="pyamg").
+amg = ["pyamg>=5.1,<6"]
+test = ["pytest>=8,<10", "pytest-cov>=5,<8", "pyamg>=5.1,<6"]
 dev = ["ruff==0.17.3", "mypy==2.4.1", "build>=1.2,<2"]
 all = [
+  "pyamg>=5.1,<6",
   "zarr>=3,<4",
   "numcodecs>=0.13,<1",
   "pytest>=8,<10",
@@ -42,10 +45,12 @@ py-modules = [
   "common",
   "dataset_config",
   "evaluation_split",
+  "field_amg",
   "field_constraints",
   "field_observations",
   "field_prefetch",
   "field_runtime",
+  "field_schwarz",
   "field_solver",
   "field_sources",
   "field_store",

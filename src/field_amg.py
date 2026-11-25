@@ -146,18 +146,32 @@ def _diagonal(a: torch.Tensor) -> torch.Tensor:
     return torch.zeros(a.shape[0], dtype=vals.dtype, device=vals.device).index_add_(0, rows[on], vals[on])
 
 
-def _spectral_bound(a: torch.Tensor, scale: torch.Tensor) -> float:
-    """Upper bound of the largest eigenvalue of ``diag(scale) @ a``: its infinity norm.
+def _spectral_bound(a: torch.Tensor, scale: torch.Tensor, steps: int = 20) -> float:
+    """Power-iteration estimate of the largest eigenvalue of ``diag(scale) @ a``."""
+    generator = torch.Generator().manual_seed(0)
+    x = (torch.rand(a.shape[0], generator=generator, dtype=torch.float64) + 0.5).to(scale.device, scale.dtype)
+    bound = 1.0
+    for _ in range(steps):
+        y = scale * (a @ x)
+        norm = torch.linalg.vector_norm(y)
+        bound = float(norm / torch.linalg.vector_norm(x))
+        x = y / norm
+    return bound
 
-    The Chebyshev smoother is SPD only if ``lmax`` bounds the spectrum. A 20-step power
-    estimate with a 1.1 margin came out up to 23 % low on coarse levels of real 175A blocks,
-    and an occasional block solve then aborted on a nonpositive CG curvature. The scaled
-    row-sum (Gershgorin) bound is never low, and within 1.1 of the top eigenvalue on the
-    diffusion-plus-pair operators measured.
+
+def _chebyshev_bound(a: torch.Tensor, scale: torch.Tensor) -> float:
+    """Upper end of the Chebyshev interval for ``diag(scale) @ a``.
+
+    Chebyshev smoothing amplifies modes above ``lmax``, so an estimate below the top
+    eigenvalue can make the V-cycle indefinite. A 20-step power estimate times 1.1 came
+    out up to 23 % low on coarse levels of real PHerc0175A blocks, and a block solve then
+    occasionally aborted on a nonpositive CG curvature. This takes a 40-step estimate times
+    1.3, capped by the scaled row-sum norm, which bounds the spectrum by construction but
+    is up to ~2.8x loose on fine levels with stiff fibre pairs.
     """
     rows, _, vals = _csr_rows(a)
     sums = torch.zeros(a.shape[0], dtype=vals.dtype, device=vals.device).index_add_(0, rows, vals.abs())
-    return float((scale * sums).max())
+    return min(float((scale * sums).max()), 1.3 * _spectral_bound(a, scale, steps=40))
 
 
 def _pairwise_aggregates(a: torch.Tensor, theta: float, seed: int, rounds: int = 6) -> torch.Tensor:
@@ -456,7 +470,7 @@ class AMGPreconditioner:
                 if not bool(torch.isfinite(d).all()) or bool((d <= 0).any()):
                     raise ValueError("AMG level has a nonpositive diagonal")
                 scale = 1.0 / d
-                lmax = _spectral_bound(a, scale)
+                lmax = _chebyshev_bound(a, scale)
                 self.bounds.append((lmax / 30.0, lmax))
             else:
                 rows, _, vals = _csr_rows(a)

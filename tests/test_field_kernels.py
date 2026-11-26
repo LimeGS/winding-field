@@ -165,6 +165,19 @@ def test_missing_triton_or_gpu_is_a_fallback(monkeypatch):
     assert field_kernels.unavailable_reason(torch.device("cpu"), "jacobi", False) == "fused kernels need a CUDA device"
 
 
+def test_a_kernel_that_does_not_compile_is_a_fallback(monkeypatch):
+    def broken(**_):
+        raise RuntimeError("no compiler")
+
+    monkeypatch.setattr(field_kernels, "_probed", {})
+    monkeypatch.setattr(field_kernels, "pcg", broken)
+    reason = field_kernels.unavailable_reason(torch.device(DEVICE), "jacobi", False)
+    assert reason == "fused kernels failed to compile (RuntimeError)"
+    target, weights, _ = _problem((2, 3, 4))
+    _, info = solve_field(target, weights, dtype="float64", device=DEVICE, kernel="fused")
+    assert (info["kernel"], info["kernel_fallback"]) == ("eager", reason) and info["converged"]
+
+
 def test_default_receipt_is_unchanged_and_kernel_is_validated():
     target, weights, _ = _problem((2, 3, 4))
     _, info = solve_field(target, weights)

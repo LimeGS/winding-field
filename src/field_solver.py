@@ -620,7 +620,7 @@ def solve_field(
             weights=fused_weight,
             mask=mask,
             rw=rw if has_reference else 0.0,
-            extra=None if extra is None else extra.matvec,
+            extra=extra,
             preconditioner=spectral,
             eager_matvec=matvec,
             norm=_norm,

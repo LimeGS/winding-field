@@ -128,6 +128,7 @@ def main(argv=None):
         out[mask] = 0
 
     fused = field_kernels.FusedOperator(w, mask, 0.0)
+    rows = field_kernels.FusedRows.of(extra)  # Constraint rows as the fused loop applies them.
     alpha = torch.tensor(1e-3, dtype=torch.float64, device=device)
     k = field_kernels._kernels()
     grid = field_kernels._flat_grid(n)
@@ -160,7 +161,7 @@ def main(argv=None):
         eager_fibres=timed(lambda: extra.matvec(p), args.repeat, device),
         eager_vectors=timed(eager_vectors, args.repeat, device),
         fused_k1=timed(lambda: float(fused.apply(p, out)), args.repeat, device),
-        fused_k1_with_fibres=timed(lambda: float(fused.apply(p, out, extra.matvec(p))), args.repeat, device),
+        fused_k1_with_fibres=timed(lambda: float(fused.apply(p, out, rows=rows)), args.repeat, device),
         fused_k2=timed(k2, args.repeat, device),
         fused_k3=timed(k3, args.repeat, device),
     )

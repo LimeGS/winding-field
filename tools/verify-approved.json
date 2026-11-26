@@ -1,5 +1,7 @@
 {
   "_comment": "Intended differences from the baseline. Each entry needs a reason; REVIEW.md R9 applies. Remove entries once the baseline includes the change.",
-  "api": {},
+  "api": {
+    "block_solver.solve_blocks:coarse_direct_limit=200000": "Default lowered to 20000: the sparse LU of a 117,649-unknown coarse operator (175A 384 box) took ~285 s in every process on a rented host, while AMG-PCG on the same operator took 8 s setup and 16-19 iterations to 1e-8. Coarse systems of 20k-200k unknowns now take the AMG-PCG branch, so their corrections agree with the LU to the 1e-8 tolerance instead of to rounding; a two-level run of that size resumed across this change continues with the iterative solve. Migration: pass coarse_direct_limit=200_000 for the old behaviour."
+  },
   "golden": {}
 }

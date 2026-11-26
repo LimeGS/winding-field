@@ -122,6 +122,22 @@ def test_coarse_sweeps_reach_the_single_block_solution_faster(tmp_path):
     assert status["coarse"]["method"] == "direct"
 
 
+def test_iterative_coarse_solve_matches_the_direct_one_and_reports_its_iterations(tmp_path):
+    base = problem(tmp_path)
+    fields = {}
+    for name, limit in (("direct", 10**6), ("amg", 0)):
+        result = run(tmp_path / name, base, 8, halo=2, sweeps=4, coarse_factor=4, coarse_direct_limit=limit)
+        assert result["status"] == "SWEEP_BUDGET_REACHED"
+        fields[name], meta = field(tmp_path / name)
+        coarse = meta["progress"]["coarse"]
+        status = json.loads((tmp_path / name / "STATUS.json").read_text())["coarse"]
+        if name == "amg":
+            assert status["method"] == "amg-pcg" and coarse["converged"] and 0 < coarse["iterations"] < 100
+        else:
+            assert status["method"] == "direct" and "iterations" not in coarse
+    np.testing.assert_allclose(fields["amg"], fields["direct"], atol=1e-6)
+
+
 def test_stop_inside_the_coarse_phase_resumes_to_the_same_field(tmp_path):
     base = problem(tmp_path, pairs=False)
     straight = run(tmp_path / "straight", base, 8, halo=2, sweeps=3, coarse_factor=4)

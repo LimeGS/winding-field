@@ -192,7 +192,7 @@ def solve_blocks(
     prefetch: ObservationPrefetch | None = None,
     observer: Any = None,
     coarse_factor: int | None = None,
-    coarse_direct_limit: int = 200_000,
+    coarse_direct_limit: int = 20_000,
     checkpoint: Literal["block", "sweep"] = "block",
     memory_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -247,7 +247,10 @@ def solve_blocks(
     system in memory and adds the prolonged correction to every owned core (see
     :mod:`field_block_coarse`). The coarse operator is assembled once, during the first pass,
     and saved next to the checkpoint. The factor is part of the run identity; a stop inside the
-    coarse phase resumes there. Not available with ``partial_order``.
+    coarse phase resumes there. Not available with ``partial_order``. Up to
+    ``coarse_direct_limit`` unknowns the coarse system is factorized (a sparse LU, paid by every
+    process and growing steeply with the size); above it, it is solved by AMG-preconditioned CG
+    to 1e-8, whose iterations and convergence each sweep records.
 
     ``nonconvergence_policy='fail'`` (default) stops at the first local solve that
     does not reach ``rtol``. ``'continue'`` commits a local solve that only exhausted
@@ -707,6 +710,7 @@ def solve_blocks(
                     relative_residual=norm / norm0 if norm0 else None,
                     solve_s=solve_s,
                     seconds=time.perf_counter() - phase_started,
+                    **(space.last or {}),
                 )
                 progress = dict(progress, coarse=state)
                 store.save_progress(progress)

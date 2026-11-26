@@ -10,6 +10,12 @@ versions follow the GitHub releases.
   build row blocks on all available CPUs (`threads=` on `assemble_free_operator` and
   `AMGPreconditioner`). The assembled operator is bitwise identical to the serial build
   for any thread count, so hierarchies and iterates do not change.
+- AMG hierarchy build: the Galerkin product sets aside coarse rows that no later block
+  reaches, so its cost grows linearly with the number of row blocks instead of
+  quadratically (the 416³ host build sat in this step); on the host, coalescing uses all
+  torch threads. Both keep every sum's terms and order, so the hierarchy is unchanged.
+- When the device build runs out of memory, the failed attempt is released before the host
+  rebuild instead of being held by the exception for its whole duration.
 
 ## [2.0.0] - unreleased
 

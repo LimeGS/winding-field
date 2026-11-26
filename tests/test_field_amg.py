@@ -1,5 +1,7 @@
 """AMG preconditioning changes iteration counts only, never the solved system."""
 
+import weakref
+
 import numpy as np
 import pytest
 import scipy.sparse as sp
@@ -279,3 +281,62 @@ def test_threaded_setup_gives_the_same_preconditioner():
     )
     v = torch.tensor(np.random.default_rng(4).standard_normal(weights.shape))
     assert torch.equal(one.apply(v), four.apply(v))
+
+
+def test_galerkin_blocks_give_the_same_coarse_operator():
+    _, weights, pairs = _problem(12)
+    mask = np.zeros(weights.shape, bool)
+    mask[0] = True
+    matrix = field_amg.assemble_free_operator(weights, mask, pairs=pairs, lam=1000.0)
+    levels, _, _ = field_amg._torch_hierarchy(matrix, "cpu", max_coarse=50, max_levels=2, dense=False)
+    a, p = levels[0]
+    dense = (p.to_dense().T @ a.to_dense() @ p.to_dense()).numpy()
+    reference = None
+    for block_nnz in (1 << 30, 4096, 256):
+        coarse = field_amg._galerkin(a, p, block_nnz=block_nnz)
+        assert coarse.is_coalesced()
+        np.testing.assert_allclose(coarse.to_dense().numpy(), dense, rtol=1e-12, atol=1e-9)
+        if block_nnz == 4096:
+            reference = coarse
+    small = field_amg._galerkin(a, p, block_nnz=4096)
+    assert reference is not None and torch.equal(small.indices(), reference.indices())
+    assert torch.equal(small.values().view(torch.int64), reference.values().view(torch.int64))
+
+
+def test_out_of_memory_fallback_releases_the_failed_attempt(monkeypatch):
+    real = field_amg._torch_hierarchy
+    held: list = []
+
+    def flaky(matrix, device, **kwargs):
+        if not held:
+            workspace = torch.empty(16)  # stands in for the failed attempt's device tensors
+            held.append(weakref.ref(workspace))
+            raise torch.OutOfMemoryError("simulated")
+        assert held[0]() is None, "the failed attempt is still referenced during the host rebuild"
+        held.append(device)
+        return real(matrix, device, **kwargs)
+
+    monkeypatch.setattr(field_amg, "_torch_hierarchy", flaky)
+    _, weights, pairs = _problem(8)
+    mask = np.zeros(weights.shape, bool)
+    matrix = field_amg.assemble_free_operator(weights, mask, pairs=pairs, lam=10.0)
+    amg = field_amg.AMGPreconditioner(matrix, weights.shape, torch.tensor(mask), max_coarse=50)
+    assert held[1] == "cpu"
+    assert amg.metadata()["levels"] >= 2
+
+
+def test_host_coalesce_is_bitwise_torch_coalesce():
+    generator = torch.Generator().manual_seed(0)
+    size = 4 * field_amg._HOST_COALESCE_MIN
+    for rows, cols in ((40, 30), (5000, 4000)):  # long runs of duplicates, then mostly unique
+        index = torch.stack(
+            [torch.randint(0, rows, (size,), generator=generator), torch.randint(0, cols, (size,), generator=generator)]
+        )
+        scale = torch.pow(10.0, torch.randint(-8, 9, (size,), generator=generator).double())
+        values = torch.randn(size, generator=generator, dtype=torch.float64) * scale
+        values[::97] = -0.0
+        raw = torch.sparse_coo_tensor(index, values, (rows, cols))
+        expected, got = raw.coalesce(), field_amg._coalesce(raw)
+        assert got.is_coalesced()
+        assert torch.equal(got.indices(), expected.indices())
+        assert torch.equal(got.values().view(torch.int64), expected.values().view(torch.int64))

@@ -353,10 +353,41 @@ def _pairwise_aggregates(a: torch.Tensor, theta: float, seed: int, rounds: int =
     return torch.unique(root, return_inverse=True)[1]
 
 
+# Below this many entries the host coalesce of torch is used as is.
+_HOST_COALESCE_MIN = 1 << 16
+
+
+def _coalesce(t: torch.Tensor) -> torch.Tensor:
+    """``t.coalesce()`` of a 2-D COO tensor, bitwise identical and faster on the host.
+
+    On the CPU torch's coalesce sorts the flattened indices stably, then sums each run of
+    equal indices left to right from its first value in one sequential pass. This does the
+    same stable sort, gathers the values in that order and adds them with ``index_add_``
+    into ``-0.0`` (``-0.0 + v`` is ``v`` for every ``v``, as copying the first value is), so
+    every sum has the same terms in the same order while the sort and gathers use all
+    torch threads. Other devices use torch's coalesce.
+    """
+    if t.device.type != "cpu" or t.is_coalesced() or t._nnz() < _HOST_COALESCE_MIN:
+        return t.coalesce()
+    index, values = t._indices(), t._values()
+    columns = t.shape[1]
+    keys, order = torch.sort(index[0] * columns + index[1], stable=True)
+    first = torch.ones(keys.numel(), dtype=torch.bool)
+    first[1:] = keys[1:] != keys[:-1]
+    segment = torch.cumsum(first, 0).sub_(1)
+    keys = keys[first]
+    del first
+    summed = torch.full((keys.numel(),), -0.0, dtype=values.dtype).index_add_(0, segment, values[order])
+    del segment, order
+    rows = keys // columns
+    result = torch.sparse_coo_tensor(torch.stack([rows, keys - rows * columns]), summed, t.shape)
+    return result._coalesced_(True)
+
+
 def _galerkin_aggregate(a: torch.Tensor, aggregates: torch.Tensor, size: int) -> torch.Tensor:
     rows, cols, vals = _csr_rows(a)
     index = torch.stack([aggregates[rows], aggregates[cols]])
-    return torch.sparse_coo_tensor(index, vals, (size, size)).coalesce().to_sparse_csr()
+    return _coalesce(torch.sparse_coo_tensor(index, vals, (size, size))).to_sparse_csr()
 
 
 def _expand(
@@ -393,9 +424,9 @@ def _expand(
         starts = torch.cumsum(count, 0) - count
         position = first[owner] + torch.arange(size, device=rows.device) - starts[owner]
         index = torch.stack([rows[lo:hi][owner], cols[position]])
-        part = torch.sparse_coo_tensor(index, vals[lo:hi][owner] * values[position], shape).coalesce()
+        part = _coalesce(torch.sparse_coo_tensor(index, vals[lo:hi][owner] * values[position], shape))
         del owner, starts, position, index
-        result = part if result is None else (result + part).coalesce()
+        result = part if result is None else _coalesce(result + part)
     if result is None:
         empty = torch.zeros((2, 0), dtype=torch.int64, device=rows.device)
         return torch.sparse_coo_tensor(empty, vals[:0], shape).coalesce()
@@ -407,7 +438,10 @@ def _galerkin(a: torch.Tensor, p: torch.Tensor, block_nnz: int = 1 << 20) -> tor
 
     Each block of about ``block_nnz`` entries of ``a`` forms ``(A P)_block`` and then
     ``P_block^T (A P)_block`` by expansion, and the partial coarse operators are summed
-    as they are produced, so peak memory is bounded by the block size.
+    as they are produced, so peak memory is bounded by the block size. A coarse row that
+    no later block reaches is final: it is set aside instead of being re-sorted with every
+    later block, so the work grows linearly with the number of blocks. Each coarse entry is
+    still the sum of the block partials in block order, as when every row stays open.
     """
     n = a.shape[0]
     size = p.shape[1]
@@ -417,10 +451,16 @@ def _galerkin(a: torch.Tensor, p: torch.Tensor, block_nnz: int = 1 << 20) -> tor
     blocks = max(1, -(-nnz // block_nnz))
     cuts = torch.searchsorted(a_crow, torch.linspace(0, nnz, blocks + 1, dtype=a_crow.dtype, device=a_crow.device))
     edges = sorted({0, n, *(min(int(e), n) for e in cuts.tolist())})
-    total: torch.Tensor | None = None
-    for start, stop in zip(edges[:-1], edges[1:]):
-        if stop <= start:
-            continue
+    spans = [(start, stop) for start, stop in zip(edges[:-1], edges[1:]) if stop > start]
+    # The last block whose prolongator rows reach each coarse row.
+    last = torch.full((size,), -1, dtype=torch.int64, device=p_cols.device)
+    for k, (start, stop) in enumerate(spans):
+        last.index_fill_(0, p_cols[int(p_crow[start]) : int(p_crow[stop])].to(torch.int64), k)
+    done_index: list[torch.Tensor] = []
+    done_values: list[torch.Tensor] = []
+    open_index = torch.zeros((2, 0), dtype=torch.int64, device=a_vals.device)
+    open_values = a_vals.new_zeros(0)
+    for k, (start, stop) in enumerate(spans):
         local = torch.arange(stop - start, device=a_crow.device)
         lo, hi = int(a_crow[start]), int(a_crow[stop])
         rows = torch.repeat_interleave(local, a_crow[start : stop + 1].diff())
@@ -429,9 +469,28 @@ def _galerkin(a: torch.Tensor, p: torch.Tensor, block_nnz: int = 1 << 20) -> tor
         rows = torch.repeat_interleave(local, p_crow[start : stop + 1].diff())
         part = _expand(p_cols[lo:hi], rows, p_vals[lo:hi], ap, (size, size))
         del ap, rows
-        total = part if total is None else (total + part).coalesce()
-    assert total is not None
-    return total
+        if open_values.numel():
+            # Open entries and the block partial are each unique per entry, so every sum
+            # here has two terms and does not depend on the order coalesce visits them.
+            part = _coalesce(
+                torch.sparse_coo_tensor(
+                    torch.cat([open_index, part.indices()], 1), torch.cat([open_values, part.values()]), (size, size)
+                )
+            )
+        index, values = part.indices(), part.values()
+        done = last[index[0]] <= k
+        done_index.append(index[:, done])
+        done_values.append(values[done])
+        open_index, open_values = index[:, ~done], values[~done]
+        del part, index, values, done
+    done_index.append(open_index)
+    done_values.append(open_values)
+    values = torch.cat(done_values)
+    if len(spans) > 1:
+        # Sparse addition starts every sum from +0, which turns a -0 entry into +0.
+        values = values + 0.0
+    # Every entry is final and appears once: coalescing only sorts them.
+    return _coalesce(torch.sparse_coo_tensor(torch.cat(done_index, 1), values, (size, size)))
 
 
 def _truncate(p: torch.Tensor, threshold: float) -> torch.Tensor:
@@ -452,7 +511,7 @@ def _truncate(p: torch.Tensor, threshold: float) -> torch.Tensor:
     index, vals = index[:, keep], vals[keep]
     after = zero.clone().index_add_(0, index[0], vals)
     ratio = torch.where(after != 0, before / after, torch.ones_like(after))
-    out = torch.sparse_coo_tensor(index, vals * ratio[index[0]], p.shape).coalesce()
+    out = _coalesce(torch.sparse_coo_tensor(index, vals * ratio[index[0]], p.shape))
     return out.to_sparse_csr()
 
 
@@ -496,16 +555,18 @@ def _torch_hierarchy(
         scale = 1.0 / _diagonal(current)
         omega = (4.0 / 3.0) / _spectral_bound(current, scale)
         nodes = torch.arange(n, device=aggregates.device)
-        tentative = torch.sparse_coo_tensor(
-            torch.stack([nodes, aggregates]), torch.ones(n, dtype=dtype, device=aggregates.device), (n, size)
-        ).coalesce()
+        tentative = _coalesce(
+            torch.sparse_coo_tensor(
+                torch.stack([nodes, aggregates]), torch.ones(n, dtype=dtype, device=aggregates.device), (n, size)
+            )
+        )
         # A @ P0 sums the columns of A within each aggregate: no sparse product needed.
         rows, cols, vals = _csr_rows(current)
         index = torch.stack([rows, aggregates[cols]])
-        product = torch.sparse_coo_tensor(index, vals, (n, size)).coalesce()
+        product = _coalesce(torch.sparse_coo_tensor(index, vals, (n, size)))
         index = product.indices()
         smoothed = torch.sparse_coo_tensor(index, product.values() * (omega * scale[index[0]]), product.shape)
-        prolong = _truncate((tentative - smoothed).coalesce(), truncate)
+        prolong = _truncate(_coalesce(tentative - smoothed), truncate)
         coarse = _galerkin(current, prolong)
         del product, smoothed, tentative, rows, cols, vals, index
         levels.append((current, prolong))
@@ -520,7 +581,9 @@ class AMGPreconditioner:
     ``matrix`` is the float64 CSR free-node operator (see :func:`assemble_free_operator`).
     Before and after each coarse correction the smoother runs ``smoothing`` steps: a
     degree-``smoothing`` Chebyshev polynomial in ``D^-1 A`` over ``[lmax / 30, lmax]``
-    (default), or that many l1-Jacobi sweeps.
+    (default), or that many l1-Jacobi sweeps. ``threads`` sets the host threads that
+    restrict ``matrix`` to free nodes (default: every CPU this process may use); a
+    hierarchy built on the host uses torch's thread count.
     """
 
     kind = "amg"
@@ -578,13 +641,18 @@ class AMGPreconditioner:
             coarsest = torch.as_tensor(hierarchy.levels[-1].A.toarray(), dtype=torch.float64, device=device)
             complexity = float(hierarchy.operator_complexity())
         else:
+            out_of_memory = False
             try:
                 built, coarsest, complexity = _torch_hierarchy(
                     matrix, device, max_coarse=max_coarse, max_levels=max_levels
                 )
             except torch.OutOfMemoryError:
+                out_of_memory = True
+            if out_of_memory:
                 # Sparse products need transient workspace well beyond the hierarchy;
-                # build on the host instead and move only the compact result.
+                # build on the host instead and move only the compact result. This runs
+                # after the except block: until then the traceback keeps the failed
+                # attempt's device tensors alive and the cache cannot release them.
                 torch.cuda.empty_cache()
                 built, coarsest, complexity = _torch_hierarchy(
                     matrix, "cpu", max_coarse=max_coarse, max_levels=max_levels
@@ -608,7 +676,7 @@ class AMGPreconditioner:
                 if not bool(torch.isfinite(l1).all()) or bool((l1 <= 0).any()):
                     raise ValueError("AMG level has a nonpositive l1 row norm")
                 scale = 1.0 / l1
-            pt = p.to_sparse_coo().t().coalesce().to_sparse_csr()
+            pt = _coalesce(p.to_sparse_coo().t()).to_sparse_csr()
             self.levels.append(
                 (
                     _compact(a, dtype, device),

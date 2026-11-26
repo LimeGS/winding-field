@@ -186,12 +186,21 @@ class CoarseSpace:
 
         Equal to ``rows(nodes, free).T @ values`` for the nodes of the box, up to rounding.
         """
+        window, v = self.restrict_box_part(lo, hi, values, free)
+        out.reshape(self.coarse_shape)[window] += v
+
+    def restrict_box_part(self, lo, hi, values: np.ndarray, free: np.ndarray) -> tuple[tuple[slice, ...], np.ndarray]:
+        """Return ``(window, P^T values)`` of the box ``[lo, hi)`` on its coarse window.
+
+        Pure (reads no mutable state), so threads may call it; adding the parts to the coarse
+        vector in a fixed order gives the same bytes as ``restrict_box`` in that order.
+        """
         (mz, my, mx), window = self._axis_matrices(lo, hi)
         v = np.where(free, values, 0.0)
         v = np.tensordot(mz.T, v, axes=(1, 0))
         v = np.tensordot(v, my, axes=(1, 0))  # axes are now (cz, x, cy)
         v = np.tensordot(v, mx, axes=(1, 0))  # (cz, cy, cx)
-        out.reshape(self.coarse_shape)[window] += v
+        return window, v
 
     def prolong_box(self, lo, hi, coarse: np.ndarray) -> np.ndarray:
         """Return ``P coarse`` on the box ``[lo, hi)``; the caller zeroes fixed nodes.

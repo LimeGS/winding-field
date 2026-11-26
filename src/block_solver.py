@@ -8,7 +8,9 @@ import os
 import re
 import time
 import warnings
+from collections import deque
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
@@ -73,6 +75,16 @@ def _restore_advice(saved, sweep, block, scientific_sha):
         raise ValueError("invalid advisory maximum")
     saved["timing_complete"] = False  # The unrecorded last-commit tail cannot be invented after a restart.
     return saved
+
+
+def default_coarse_workers() -> int:
+    """Threads for the coarse residual pass: three quarters of the CPUs, at most 8.
+
+    A worker holds one block's crop arrays; past a few the calling thread's in-order reads
+    and constraint rows set the pace.
+    """
+    count = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+    return max(1, min(8, math.ceil(count * 0.75)))
 
 
 def _integer(value, minimum=0):
@@ -193,6 +205,7 @@ def solve_blocks(
     observer: Any = None,
     coarse_factor: int | None = None,
     coarse_direct_limit: int = 20_000,
+    coarse_workers: int | None = None,
     checkpoint: Literal["block", "sweep"] = "block",
     memory_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -250,7 +263,12 @@ def solve_blocks(
     coarse phase resumes there. Not available with ``partial_order``. Up to
     ``coarse_direct_limit`` unknowns the coarse system is factorized (a sparse LU, paid by every
     process and growing steeply with the size); above it, it is solved by AMG-preconditioned CG
-    to 1e-8, whose iterations and convergence each sweep records.
+    to 1e-8, whose iterations and convergence each sweep records. The residual pass reads
+    observations, fixed values and constraint rows in block order on the calling thread and
+    computes each block's residual and restriction on ``coarse_workers`` threads (default
+    three quarters of the CPUs, at most 8); parts are added in block order, so the coarse
+    right-hand side has the same bytes for any worker count. An execution choice, not part of
+    the identity.
 
     ``nonconvergence_policy='fail'`` (default) stops at the first local solve that
     does not reach ``rtol``. ``'continue'`` commits a local solve that only exhausted
@@ -336,6 +354,9 @@ def solve_blocks(
         if coarse_factor is not None:
             coarse_factor = _integer(coarse_factor, 2)
             coarse_direct_limit = _integer(coarse_direct_limit)
+            if coarse_workers is None:
+                coarse_workers = default_coarse_workers()
+            coarse_workers = _integer(coarse_workers, 1)
             if partial_order:
                 raise ValueError("coarse correction needs the full block order")
         if checkpoint not in ("block", "sweep"):
@@ -662,30 +683,60 @@ def solve_blocks(
                 assemble = not space.assembled
                 rhs = np.zeros(space.size)
                 norm_sq = norm0_sq = 0.0
-                for block, key in enumerate(ordered):
-                    if stopped():
-                        return emit("CHECKPOINTED_STOP")
-                    admitted()
-                    coarse_status.update(stage="residual", sweep=sweep, next_block=block)
-                    emit("RUNNING", phase="coarse-residual", active_sweep=sweep, active_block=block)
-                    low, high, lo, hi = bounds(key)
-                    crop_shape = tuple(map(int, hi - lo))
-                    target, weights, _, receipts = _observations(load_observations(lo, hi), crop_shape)
-                    _record_sources(seen, receipts)
-                    target, weights = _numpy(target), _numpy(weights)
-                    declared = global_fixed(lo, hi, crop_shape)
-                    mask = np.isfinite(declared)
+
+                def residual_part(lo, hi, low, high, target, weights, declared, mask, rows):
+                    """Owned-core residual norms and ``P^T r`` of one block; pure, thread-safe."""
                     values = np.where(mask, declared, store.read(lo, hi))
-                    rows = local_rows(lo, hi)
                     r, r0 = block_residual(target, weights, spacing, rows, values, mask, device)
                     owned = tuple(slice(int(a), int(b)) for a, b in zip(low - lo, high - lo))
                     r_core, r0_core = r[owned], r0[owned]
-                    norm_sq += float(np.sum(r_core * r_core))
-                    norm0_sq += float(np.sum(r0_core * r0_core))
-                    space.restrict_box(low, high, r_core, ~mask[owned], rhs)
+                    window, part = space.restrict_box_part(low, high, r_core, ~mask[owned])
+                    return float(np.sum(r_core * r_core)), float(np.sum(r0_core * r0_core)), window, part
+
+                def reduce(item):
+                    """Add one block's part in block order; assemble its operator rows if needed."""
+                    nonlocal norm_sq, norm0_sq
+                    lo, low, high, weights, mask, rows, exterior, job = item
+                    block_norm, block_norm0, window, part = job.result() if workers else job
+                    norm_sq += block_norm
+                    norm0_sq += block_norm0
+                    rhs.reshape(space.coarse_shape)[window] += part
                     if assemble:
-                        space.add_block(lo, low, high, weights, ~mask, rows, exterior=exterior_terms(lo, hi, rows))
-                    del target, weights, values, rows, r, r0
+                        space.add_block(lo, low, high, weights, ~mask, rows, exterior=exterior)
+
+                # Providers (observations, fixed values, constraint rows) are called here, in block
+                # order: they may cache per caller. Workers only compute on the arrays they get.
+                workers = coarse_workers if coarse_workers > 1 and len(ordered) > 1 else 0
+                pool = ThreadPoolExecutor(workers, thread_name_prefix="coarse-residual") if workers else None
+                inflight: deque = deque()
+                try:
+                    for block, key in enumerate(ordered):
+                        if stopped():
+                            return emit("CHECKPOINTED_STOP")
+                        admitted()
+                        coarse_status.update(stage="residual", sweep=sweep, next_block=block)
+                        emit("RUNNING", phase="coarse-residual", active_sweep=sweep, active_block=block)
+                        low, high, lo, hi = bounds(key)
+                        crop_shape = tuple(map(int, hi - lo))
+                        target, weights, _, receipts = _observations(load_observations(lo, hi), crop_shape)
+                        _record_sources(seen, receipts)
+                        target, weights = _numpy(target), _numpy(weights)
+                        declared = global_fixed(lo, hi, crop_shape)
+                        mask = np.isfinite(declared)
+                        rows = local_rows(lo, hi)
+                        exterior = exterior_terms(lo, hi, rows) if assemble else None
+                        arguments = (lo, hi, low, high, target, weights, declared, mask, rows)
+                        job = pool.submit(residual_part, *arguments) if pool else residual_part(*arguments)
+                        inflight.append((lo, low, high, weights, mask, rows, exterior, job))
+                        del target, weights, declared, mask, rows, exterior, arguments, job
+                        while inflight and (len(inflight) > 2 * workers or inflight[0][-1].done()):
+                            reduce(inflight.popleft())
+                    while inflight:
+                        reduce(inflight.popleft())
+                finally:
+                    if pool is not None:
+                        pool.shutdown(wait=True, cancel_futures=True)
+                    inflight.clear()
                 if assemble:
                     sp.save_npz(operator_path, space.matrix, compressed=False)
                     space.assembled = True

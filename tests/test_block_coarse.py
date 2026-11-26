@@ -195,3 +195,44 @@ def test_box_transfers_match_the_prolongation_rows(box):
     space.restrict_box(lo, hi, values, free, out)
     np.testing.assert_allclose(out, coarse + space.rows(zyx, free.ravel()).T @ values.ravel(), atol=1e-13)
     np.testing.assert_allclose(space.prolong_box(lo, hi, coarse).ravel(), space.rows(zyx) @ coarse, atol=1e-13)
+
+
+@pytest.mark.parametrize("pairs", [False, True])
+def test_threaded_residual_pass_gives_the_same_bytes(tmp_path, pairs):
+    """Workers only compute; parts are added in block order, so nothing depends on threads."""
+    base = problem(tmp_path, pairs=pairs)
+    out = {}
+    for workers in (1, 3, 8):
+        root = tmp_path / f"w{workers}"
+        result = run(root, base, 8, halo=2, sweeps=3, coarse_factor=4, coarse_workers=workers)
+        assert result["status"] == "SWEEP_BUDGET_REACHED"
+        values, meta = field(root)
+        sweeps = [{k: v for k, v in s.items() if not k.endswith("_s")} for s in meta["progress"]["completed_sweeps"]]
+        operator = hashlib.sha256((root / "COARSE_OPERATOR.npz").read_bytes()).hexdigest()
+        correction = hashlib.sha256((root / "COARSE_CORRECTION.npy").read_bytes()).hexdigest()
+        out[workers] = (values.tobytes(), json.dumps(sweeps, sort_keys=True), operator, correction)
+    assert out[1] == out[3] == out[8]
+
+
+def test_stop_inside_a_threaded_residual_pass_resumes_to_the_same_field(tmp_path):
+    base = problem(tmp_path, pairs=False)
+    straight = run(tmp_path / "straight", base, 8, halo=2, sweeps=3, coarse_factor=4, coarse_workers=1)
+    assert straight["status"] == "SWEEP_BUDGET_REACHED"
+    calls = {"n": 0}
+
+    def stop():
+        calls["n"] += 1
+        return calls["n"] in (5, 40, 75)
+
+    root = tmp_path / "stopped"
+    result = run(root, base, 8, halo=2, sweeps=3, coarse_factor=4, coarse_workers=4, stop=stop)
+    while result["status"] == "CHECKPOINTED_STOP":
+        result = run(root, base, 8, halo=2, sweeps=3, coarse_factor=4, coarse_workers=4, stop=stop, resume=True)
+    assert calls["n"] > 75 and result["status"] == "SWEEP_BUDGET_REACHED"
+    assert field(root)[0].tobytes() == field(tmp_path / "straight")[0].tobytes()
+
+
+@pytest.mark.parametrize("workers", [0, -1, 1.5, True])
+def test_invalid_coarse_workers_are_rejected(tmp_path, workers):
+    with pytest.raises(ValueError):
+        run(tmp_path / "run", problem(tmp_path, pairs=False), 8, halo=2, coarse_factor=4, coarse_workers=workers)

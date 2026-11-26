@@ -236,3 +236,15 @@ def test_stop_inside_a_threaded_residual_pass_resumes_to_the_same_field(tmp_path
 def test_invalid_coarse_workers_are_rejected(tmp_path, workers):
     with pytest.raises(ValueError):
         run(tmp_path / "run", problem(tmp_path, pairs=False), 8, halo=2, coarse_factor=4, coarse_workers=workers)
+
+
+def test_threaded_residual_pass_leaves_sparse_invariant_checks_off(tmp_path):
+    """A process-wide torch flag toggled by concurrent operator builds once stayed on after the pass."""
+    import torch
+
+    assert not torch.sparse.check_sparse_tensor_invariants.is_enabled()
+    for seed in range(3):
+        (tmp_path / str(seed)).mkdir()
+        base = problem(tmp_path / str(seed), seed=seed)
+        run(tmp_path / f"run{seed}", base, 8, halo=2, sweeps=1, coarse_factor=4, coarse_workers=8)
+        assert not torch.sparse.check_sparse_tensor_invariants.is_enabled()

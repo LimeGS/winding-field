@@ -5,6 +5,12 @@ versions follow the GitHub releases.
 
 ## [Unreleased]
 
+### Changed
+- AMG CPU setup is multithreaded: `assemble_free_operator` and the free-node restriction
+  build row blocks on all available CPUs (`threads=` on `assemble_free_operator` and
+  `AMGPreconditioner`). The assembled operator is bitwise identical to the serial build
+  for any thread count, so hierarchies and iterates do not change.
+
 ## [2.0.0] - unreleased
 
 Released in lockstep with winding-field-cli 2.0.0 and winding-field-studio 2.0.0

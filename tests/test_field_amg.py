@@ -189,3 +189,93 @@ def test_fixed_faces_are_eliminated_before_coarsening():
         field_amg.assemble_free_operator(weights, np.ones(shape, bool)), shape, torch.ones(shape, dtype=torch.bool)
     )
     assert bool((everything.apply(r) == 0).all())
+
+
+def _serial_reference(weights, mask, pairs=None, lam=0.0, constraints=None, reference_weight=0.0):
+    """The single-threaded assembly that the row-block assembly must reproduce bit for bit."""
+    w = np.asarray(weights, dtype=np.float64)
+    shape, n = w.shape, w.size
+    index = np.arange(n, dtype=np.int32).reshape(shape)
+    rows, cols, vals = [], [], []
+    diagonal = np.zeros(n)
+    for axis in range(3):
+        lo, hi = [slice(None)] * 3, [slice(None)] * 3
+        lo[axis], hi[axis] = slice(None, -1), slice(1, None)
+        a, b = index[tuple(lo)].ravel(), index[tuple(hi)].ravel()
+        edge = (0.5 * w[tuple(lo)] + 0.5 * w[tuple(hi)]).ravel()
+        rows += [a, b]
+        cols += [b, a]
+        vals += [-edge, -edge]
+        for ends in (a, b):
+            diagonal += np.bincount(ends, weights=edge, minlength=n)
+    if pairs is not None and lam:
+        p = np.asarray(pairs).reshape(-1, 2).astype(np.int32)
+        p = p[p[:, 0] != p[:, 1]]
+        coupling = np.full(len(p), float(lam))
+        rows += [p[:, 0], p[:, 1]]
+        cols += [p[:, 1], p[:, 0]]
+        vals += [-coupling, -coupling]
+        for ends in (p[:, 0], p[:, 1]):
+            diagonal += np.bincount(ends, weights=coupling, minlength=n)
+    rows.append(index.ravel())
+    cols.append(index.ravel())
+    vals.append(diagonal + np.broadcast_to(np.asarray(reference_weight, dtype=np.float64), shape).ravel())
+    matrix = sp.coo_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), (n, n)).tocsr()
+    if constraints is not None:
+        c = sp.csr_matrix(constraints.matrix, dtype=np.float64)
+        matrix = matrix + (c.T @ sp.diags(constraints.weights) @ c).tocsr()
+        if (constraints.groups >= 0).any():
+            means = (constraints.members @ c).tocsr()
+            inverse = np.divide(
+                1, constraints.group_sum, out=np.zeros_like(constraints.group_sum), where=constraints.group_sum > 0
+            )
+            matrix = matrix - (means.T @ sp.diags(inverse) @ means).tocsr()
+    fixed = np.asarray(mask, dtype=bool).ravel()
+    if fixed.any():
+        keep = sp.diags((~fixed).astype(np.float64))
+        matrix = (keep @ matrix @ keep + sp.diags(fixed.astype(np.float64))).tocsr()
+    matrix.sum_duplicates()
+    matrix.eliminate_zeros()
+    return matrix
+
+
+def _bitwise_equal(a, b):
+    return (
+        a.shape == b.shape
+        and np.array_equal(a.indptr, b.indptr)
+        and np.array_equal(a.indices, b.indices)
+        and np.array_equal(a.data.view(np.int64), b.data.view(np.int64))
+    )
+
+
+@pytest.mark.parametrize("groups", [False, True])
+@pytest.mark.parametrize("masked", [False, True])
+def test_threaded_assembly_is_bitwise_serial(groups, masked):
+    _, weights, pairs = _problem(12)
+    shape = weights.shape
+    constraints = _constraints(shape, groups=groups)
+    mask = np.zeros(shape, bool)
+    if masked:
+        mask[0] = mask[:, -1] = True
+    rw = np.random.default_rng(2).random(shape)
+    kwargs = dict(pairs=pairs, lam=1000.0, constraints=constraints, reference_weight=rw)
+    expected = _serial_reference(weights, mask, **kwargs)
+    for threads in (1, 2, 5):
+        got = field_amg.assemble_free_operator(weights, mask, threads=threads, **kwargs)
+        assert _bitwise_equal(got, expected)
+        keep = np.flatnonzero(~mask.ravel())
+        assert _bitwise_equal(field_amg._free_submatrix(got, keep, threads), expected[keep][:, keep].tocsr())
+    with pytest.raises(ValueError, match="threads must be positive"):
+        field_amg.assemble_free_operator(weights, mask, threads=0)
+
+
+def test_threaded_setup_gives_the_same_preconditioner():
+    _, weights, pairs = _problem(10)
+    mask = np.zeros(weights.shape, bool)
+    mask[0] = True
+    matrix = field_amg.assemble_free_operator(weights, mask, pairs=pairs, lam=1000.0)
+    one, four = (
+        field_amg.AMGPreconditioner(matrix, weights.shape, torch.tensor(mask), max_coarse=50, threads=t) for t in (1, 4)
+    )
+    v = torch.tensor(np.random.default_rng(4).standard_normal(weights.shape))
+    assert torch.equal(one.apply(v), four.apply(v))

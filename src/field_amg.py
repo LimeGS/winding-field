@@ -22,8 +22,10 @@ keeps its guarantees. It changes iteration counts only, never the system that is
 from __future__ import annotations
 
 import math
+import os
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -42,6 +44,70 @@ def _csr(rows, cols, vals, n):
     return sp.coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr()
 
 
+def _workers(threads: int | None) -> int:
+    """Worker threads for the CPU setup: ``threads``, else every CPU this process may use."""
+    if threads is not None:
+        if int(threads) < 1:
+            raise ValueError("threads must be positive")
+        return int(threads)
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # pragma: no cover - macOS and Windows
+        return max(1, os.cpu_count() or 1)
+
+
+def _row_blocks(n: int, workers: int, rows_per_block: int = 1 << 19) -> list[tuple[int, int]]:
+    """Contiguous row ranges: enough to balance ``workers`` and bound per-block scratch."""
+    count = max(1, min(n, max(4 * workers if workers > 1 else 1, -(-n // rows_per_block))))
+    cuts = np.linspace(0, n, count + 1).astype(np.int64)
+    return [(int(lo), int(hi)) for lo, hi in zip(cuts[:-1], cuts[1:]) if hi > lo]
+
+
+def _map_blocks(function, blocks, workers):
+    if workers <= 1 or len(blocks) <= 1:
+        return [function(*block) for block in blocks]
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="amg-setup") as pool:
+        return list(pool.map(lambda block: function(*block), blocks))
+
+
+def _stack_rows(parts: list[sp.csr_matrix], columns: int, workers: int) -> sp.csr_matrix:
+    """Stack canonical CSR row blocks into one CSR matrix, copying the blocks in parallel."""
+    counts = np.array([part.nnz for part in parts], dtype=np.int64)
+    offsets = np.concatenate([[0], np.cumsum(counts)])
+    rows = sum(part.shape[0] for part in parts)
+    total = int(offsets[-1])
+    itype = np.int32 if max(total, columns, rows) < 2**31 else np.int64
+    indptr = np.empty(rows + 1, dtype=itype)
+    indices = np.empty(total, dtype=itype)
+    data = np.empty(total, dtype=np.float64)
+    indptr[0] = 0
+    row_offsets = np.concatenate([[0], np.cumsum([part.shape[0] for part in parts])])
+
+    def copy(k):
+        part, lo, hi = parts[k], int(offsets[k]), int(offsets[k + 1])
+        indptr[row_offsets[k] + 1 : row_offsets[k + 1] + 1] = part.indptr[1:] + lo
+        indices[lo:hi] = part.indices
+        data[lo:hi] = part.data
+
+    _map_blocks(copy, [(k,) for k in range(len(parts))], workers)
+    matrix = sp.csr_matrix((data, indices, indptr), shape=(rows, columns), copy=False)
+    matrix.has_sorted_indices = all(part.has_sorted_indices for part in parts)
+    return matrix
+
+
+def _gram_rows(left: sp.csr_matrix, weights: np.ndarray, right: sp.csr_matrix, lo: int, hi: int):
+    """Rows ``lo:hi`` of ``right.T @ diag(weights) @ right`` as CSR.
+
+    ``left`` is ``right.T`` in CSR with sorted indices. Each entry is the sum over the
+    shared index in ascending order of ``right[k, j] * (right[k, i] * weights[k])``,
+    the same terms in the same order as the serial column-major product, so the values
+    are bitwise equal to ``(right.T @ sp.diags(weights) @ right)[lo:hi]``.
+    """
+    block = left[lo:hi]
+    scaled = sp.csr_matrix((block.data * weights[block.indices], block.indices, block.indptr), shape=block.shape)
+    return scaled @ right
+
+
 def assemble_free_operator(
     weights: np.ndarray,
     mask: np.ndarray,
@@ -50,48 +116,48 @@ def assemble_free_operator(
     lam: float = 0.0,
     constraints: Any = None,
     reference_weight: np.ndarray | float = 0.0,
+    threads: int | None = None,
 ) -> sp.csr_matrix:
     """Return the float64 CSR matrix that ``solve_field`` applies on free nodes.
 
     Fixed nodes (``mask``) have identity rows and columns, matching the solver's exact
     elimination. ``weights`` are nodal; edge weights are their arithmetic means.
+
+    Rows are assembled in contiguous blocks on ``threads`` worker threads (default: every
+    CPU this process may use). Every entry is summed in the same order as a serial
+    assembly, so the result is bitwise identical for any thread count.
     """
     w = np.asarray(weights, dtype=np.float64)
     shape = w.shape
     n = w.size
+    workers = _workers(threads)
     itype = np.int32 if n < 2**31 else np.int64
     index = np.arange(n, dtype=itype).reshape(shape)
-    rows, cols, vals = [], [], []
-    diagonal = np.zeros(n, dtype=np.float64)
+    # Stencil edges per axis; both endpoint lists are increasing, so the edges of a row
+    # block are one contiguous range of each list.
+    edges = []
     for axis in range(3):
         lo = [slice(None)] * 3
         hi = [slice(None)] * 3
         lo[axis], hi[axis] = slice(None, -1), slice(1, None)
         a = index[tuple(lo)].ravel()
         b = index[tuple(hi)].ravel()
-        edge = (0.5 * w[tuple(lo)] + 0.5 * w[tuple(hi)]).ravel()
-        rows += [a, b]
-        cols += [b, a]
-        vals += [-edge, -edge]
-        for ends in (a, b):
-            diagonal += np.bincount(ends.astype(np.intp), weights=edge, minlength=n)
+        edges.append((a, b, (0.5 * w[tuple(lo)] + 0.5 * w[tuple(hi)]).ravel()))
+    del index
+    # Pair couplings as (row ends, column ends, values), in the serial assembly's order.
+    couplings: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     if pairs is not None and len(pairs) and lam:
         p = np.asarray(pairs, dtype=np.int64).reshape(-1, 2).astype(itype)
         p = p[p[:, 0] != p[:, 1]]
         coupling = np.full(len(p), float(lam))
-        rows += [p[:, 0], p[:, 1]]
-        cols += [p[:, 1], p[:, 0]]
-        vals += [-coupling, -coupling]
-        for ends in (p[:, 0], p[:, 1]):
-            diagonal += np.bincount(ends.astype(np.intp), weights=coupling, minlength=n)
-    rows.append(index.ravel())
-    cols.append(index.ravel())
-    vals.append(diagonal + np.broadcast_to(np.asarray(reference_weight, dtype=np.float64), shape).ravel())
-    matrix = _csr(np.concatenate(rows), np.concatenate(cols), np.concatenate(vals), n)
+        couplings = [(p[:, 0], p[:, 1], coupling), (p[:, 1], p[:, 0], coupling)]
+    reference = np.broadcast_to(np.asarray(reference_weight, dtype=np.float64), shape).ravel()
+    fixed = np.asarray(mask, dtype=bool).ravel()
+    gram = []
     if constraints is not None:
         c = sp.csr_matrix(constraints.matrix, dtype=np.float64)
         cw = np.asarray(constraints.weights, dtype=np.float64)
-        matrix = matrix + (c.T @ sp.diags(cw) @ c).tocsr()
+        gram.append((c.T.tocsr(), cw, c, 1.0))
         groups = np.asarray(getattr(constraints, "groups", np.full(c.shape[0], -1)))
         if (groups >= 0).any():
             means = (constraints.members @ c).tocsr()
@@ -99,14 +165,77 @@ def assemble_free_operator(
             if dense <= _GROUP_DENSE_LIMIT:
                 total = np.asarray(constraints.group_sum, dtype=np.float64)
                 inverse = np.divide(1, total, out=np.zeros_like(total), where=total > 0)
-                matrix = matrix - (means.T @ sp.diags(inverse) @ means).tocsr()
-    fixed = np.asarray(mask, dtype=bool).ravel()
-    if fixed.any():
-        keep = sp.diags((~fixed).astype(np.float64))
-        matrix = (keep @ matrix @ keep + sp.diags(fixed.astype(np.float64))).tocsr()
-    matrix.sum_duplicates()
-    matrix.eliminate_zeros()
-    return matrix
+                gram.append((means.T.tocsr(), inverse, means, -1.0))
+    for left, _, _, _ in gram:
+        left.sort_indices()
+
+    def block(lo: int, hi: int) -> sp.csr_matrix:
+        rows, cols, vals = [], [], []
+        diagonal = np.zeros(hi - lo, dtype=np.float64)
+        for a, b, edge in edges:
+            for ends, other in ((a, b), (b, a)):
+                s, e = np.searchsorted(ends, (lo, hi))
+                rows.append(ends[s:e] - lo)
+                cols.append(other[s:e])
+                vals.append(-edge[s:e])
+            for ends in (a, b):
+                s, e = np.searchsorted(ends, (lo, hi))
+                diagonal += np.bincount((ends[s:e] - lo).astype(np.intp), weights=edge[s:e], minlength=hi - lo)
+        inside = [(ends >= lo) & (ends < hi) for ends, _, _ in couplings]
+        for (ends, other, value), selected in zip(couplings, inside):
+            rows.append(ends[selected] - lo)
+            cols.append(other[selected])
+            vals.append(-value[selected])
+        for (ends, _, value), selected in zip(couplings, inside):
+            diagonal += np.bincount((ends[selected] - lo).astype(np.intp), weights=value[selected], minlength=hi - lo)
+        local = np.arange(hi - lo, dtype=itype)
+        rows.append(local)
+        cols.append(local + lo)
+        vals.append(diagonal + reference[lo:hi])
+        part = sp.coo_matrix(
+            (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(hi - lo, n)
+        ).tocsr()
+        for left, scale, right, sign in gram:
+            product = _gram_rows(left, scale, right, lo, hi)
+            part = part + product if sign > 0 else part - product
+        if fixed.any():
+            keep = (~fixed).astype(np.float64)
+            part = (sp.diags(keep[lo:hi]) @ part @ sp.diags(keep)).tocsr()
+            pinned = np.flatnonzero(fixed[lo:hi])
+            part = part + sp.csr_matrix((np.ones(len(pinned)), (pinned, pinned + lo)), shape=(hi - lo, n))
+        part = sp.csr_matrix(part)
+        part.sum_duplicates()
+        part.eliminate_zeros()
+        return part
+
+    return _stack_rows(_map_blocks(block, _row_blocks(n, workers), workers), n, workers)
+
+
+def _free_submatrix(matrix: sp.csr_matrix, keep: np.ndarray, threads: int | None = None) -> sp.csr_matrix:
+    """``matrix[keep][:, keep]`` for increasing ``keep``, built on row blocks in parallel."""
+    matrix = sp.csr_matrix(matrix)
+    workers = _workers(threads)
+    keep = np.asarray(keep)
+    if not matrix.has_canonical_format:
+        matrix = matrix.copy()
+        matrix.sum_duplicates()
+    position = np.full(matrix.shape[1], -1, dtype=np.int64)
+    position[keep] = np.arange(len(keep))
+
+    def block(lo: int, hi: int) -> sp.csr_matrix:
+        rows = keep[lo:hi]
+        starts, stops = matrix.indptr[rows], matrix.indptr[rows + 1]
+        counts = (stops - starts).astype(np.int64)
+        take = np.repeat(starts - np.cumsum(counts) + counts, counts) + np.arange(int(counts.sum()))
+        cols = position[matrix.indices[take]]
+        inside = cols >= 0
+        owner = np.repeat(np.arange(hi - lo), counts)[inside]
+        indptr = np.concatenate([[0], np.cumsum(np.bincount(owner, minlength=hi - lo))])
+        part = sp.csr_matrix((matrix.data[take][inside], cols[inside], indptr), shape=(hi - lo, len(keep)))
+        part.has_sorted_indices = True  # positions are increasing in the original column order
+        return part
+
+    return _stack_rows(_map_blocks(block, _row_blocks(len(keep), workers), workers), len(keep), workers)
 
 
 def _torch_csr(matrix: sp.csr_matrix, device, dtype) -> torch.Tensor:
@@ -224,10 +353,41 @@ def _pairwise_aggregates(a: torch.Tensor, theta: float, seed: int, rounds: int =
     return torch.unique(root, return_inverse=True)[1]
 
 
+# Below this many entries the host coalesce of torch is used as is.
+_HOST_COALESCE_MIN = 1 << 16
+
+
+def _coalesce(t: torch.Tensor) -> torch.Tensor:
+    """``t.coalesce()`` of a 2-D COO tensor, bitwise identical and faster on the host.
+
+    On the CPU torch's coalesce sorts the flattened indices stably, then sums each run of
+    equal indices left to right from its first value in one sequential pass. This does the
+    same stable sort, gathers the values in that order and adds them with ``index_add_``
+    into ``-0.0`` (``-0.0 + v`` is ``v`` for every ``v``, as copying the first value is), so
+    every sum has the same terms in the same order while the sort and gathers use all
+    torch threads. Other devices use torch's coalesce.
+    """
+    if t.device.type != "cpu" or t.is_coalesced() or t._nnz() < _HOST_COALESCE_MIN:
+        return t.coalesce()
+    index, values = t._indices(), t._values()
+    columns = t.shape[1]
+    keys, order = torch.sort(index[0] * columns + index[1], stable=True)
+    first = torch.ones(keys.numel(), dtype=torch.bool)
+    first[1:] = keys[1:] != keys[:-1]
+    segment = torch.cumsum(first, 0).sub_(1)
+    keys = keys[first]
+    del first
+    summed = torch.full((keys.numel(),), -0.0, dtype=values.dtype).index_add_(0, segment, values[order])
+    del segment, order
+    rows = keys // columns
+    result = torch.sparse_coo_tensor(torch.stack([rows, keys - rows * columns]), summed, t.shape)
+    return result._coalesced_(True)
+
+
 def _galerkin_aggregate(a: torch.Tensor, aggregates: torch.Tensor, size: int) -> torch.Tensor:
     rows, cols, vals = _csr_rows(a)
     index = torch.stack([aggregates[rows], aggregates[cols]])
-    return torch.sparse_coo_tensor(index, vals, (size, size)).coalesce().to_sparse_csr()
+    return _coalesce(torch.sparse_coo_tensor(index, vals, (size, size))).to_sparse_csr()
 
 
 def _expand(
@@ -264,9 +424,9 @@ def _expand(
         starts = torch.cumsum(count, 0) - count
         position = first[owner] + torch.arange(size, device=rows.device) - starts[owner]
         index = torch.stack([rows[lo:hi][owner], cols[position]])
-        part = torch.sparse_coo_tensor(index, vals[lo:hi][owner] * values[position], shape).coalesce()
+        part = _coalesce(torch.sparse_coo_tensor(index, vals[lo:hi][owner] * values[position], shape))
         del owner, starts, position, index
-        result = part if result is None else (result + part).coalesce()
+        result = part if result is None else _coalesce(result + part)
     if result is None:
         empty = torch.zeros((2, 0), dtype=torch.int64, device=rows.device)
         return torch.sparse_coo_tensor(empty, vals[:0], shape).coalesce()
@@ -278,7 +438,10 @@ def _galerkin(a: torch.Tensor, p: torch.Tensor, block_nnz: int = 1 << 20) -> tor
 
     Each block of about ``block_nnz`` entries of ``a`` forms ``(A P)_block`` and then
     ``P_block^T (A P)_block`` by expansion, and the partial coarse operators are summed
-    as they are produced, so peak memory is bounded by the block size.
+    as they are produced, so peak memory is bounded by the block size. A coarse row that
+    no later block reaches is final: it is set aside instead of being re-sorted with every
+    later block, so the work grows linearly with the number of blocks. Each coarse entry is
+    still the sum of the block partials in block order, as when every row stays open.
     """
     n = a.shape[0]
     size = p.shape[1]
@@ -288,10 +451,16 @@ def _galerkin(a: torch.Tensor, p: torch.Tensor, block_nnz: int = 1 << 20) -> tor
     blocks = max(1, -(-nnz // block_nnz))
     cuts = torch.searchsorted(a_crow, torch.linspace(0, nnz, blocks + 1, dtype=a_crow.dtype, device=a_crow.device))
     edges = sorted({0, n, *(min(int(e), n) for e in cuts.tolist())})
-    total: torch.Tensor | None = None
-    for start, stop in zip(edges[:-1], edges[1:]):
-        if stop <= start:
-            continue
+    spans = [(start, stop) for start, stop in zip(edges[:-1], edges[1:]) if stop > start]
+    # The last block whose prolongator rows reach each coarse row.
+    last = torch.full((size,), -1, dtype=torch.int64, device=p_cols.device)
+    for k, (start, stop) in enumerate(spans):
+        last.index_fill_(0, p_cols[int(p_crow[start]) : int(p_crow[stop])].to(torch.int64), k)
+    done_index: list[torch.Tensor] = []
+    done_values: list[torch.Tensor] = []
+    open_index = torch.zeros((2, 0), dtype=torch.int64, device=a_vals.device)
+    open_values = a_vals.new_zeros(0)
+    for k, (start, stop) in enumerate(spans):
         local = torch.arange(stop - start, device=a_crow.device)
         lo, hi = int(a_crow[start]), int(a_crow[stop])
         rows = torch.repeat_interleave(local, a_crow[start : stop + 1].diff())
@@ -300,9 +469,28 @@ def _galerkin(a: torch.Tensor, p: torch.Tensor, block_nnz: int = 1 << 20) -> tor
         rows = torch.repeat_interleave(local, p_crow[start : stop + 1].diff())
         part = _expand(p_cols[lo:hi], rows, p_vals[lo:hi], ap, (size, size))
         del ap, rows
-        total = part if total is None else (total + part).coalesce()
-    assert total is not None
-    return total
+        if open_values.numel():
+            # Open entries and the block partial are each unique per entry, so every sum
+            # here has two terms and does not depend on the order coalesce visits them.
+            part = _coalesce(
+                torch.sparse_coo_tensor(
+                    torch.cat([open_index, part.indices()], 1), torch.cat([open_values, part.values()]), (size, size)
+                )
+            )
+        index, values = part.indices(), part.values()
+        done = last[index[0]] <= k
+        done_index.append(index[:, done])
+        done_values.append(values[done])
+        open_index, open_values = index[:, ~done], values[~done]
+        del part, index, values, done
+    done_index.append(open_index)
+    done_values.append(open_values)
+    values = torch.cat(done_values)
+    if len(spans) > 1:
+        # Sparse addition starts every sum from +0, which turns a -0 entry into +0.
+        values = values + 0.0
+    # Every entry is final and appears once: coalescing only sorts them.
+    return _coalesce(torch.sparse_coo_tensor(torch.cat(done_index, 1), values, (size, size)))
 
 
 def _truncate(p: torch.Tensor, threshold: float) -> torch.Tensor:
@@ -323,7 +511,7 @@ def _truncate(p: torch.Tensor, threshold: float) -> torch.Tensor:
     index, vals = index[:, keep], vals[keep]
     after = zero.clone().index_add_(0, index[0], vals)
     ratio = torch.where(after != 0, before / after, torch.ones_like(after))
-    out = torch.sparse_coo_tensor(index, vals * ratio[index[0]], p.shape).coalesce()
+    out = _coalesce(torch.sparse_coo_tensor(index, vals * ratio[index[0]], p.shape))
     return out.to_sparse_csr()
 
 
@@ -367,16 +555,18 @@ def _torch_hierarchy(
         scale = 1.0 / _diagonal(current)
         omega = (4.0 / 3.0) / _spectral_bound(current, scale)
         nodes = torch.arange(n, device=aggregates.device)
-        tentative = torch.sparse_coo_tensor(
-            torch.stack([nodes, aggregates]), torch.ones(n, dtype=dtype, device=aggregates.device), (n, size)
-        ).coalesce()
+        tentative = _coalesce(
+            torch.sparse_coo_tensor(
+                torch.stack([nodes, aggregates]), torch.ones(n, dtype=dtype, device=aggregates.device), (n, size)
+            )
+        )
         # A @ P0 sums the columns of A within each aggregate: no sparse product needed.
         rows, cols, vals = _csr_rows(current)
         index = torch.stack([rows, aggregates[cols]])
-        product = torch.sparse_coo_tensor(index, vals, (n, size)).coalesce()
+        product = _coalesce(torch.sparse_coo_tensor(index, vals, (n, size)))
         index = product.indices()
         smoothed = torch.sparse_coo_tensor(index, product.values() * (omega * scale[index[0]]), product.shape)
-        prolong = _truncate((tentative - smoothed).coalesce(), truncate)
+        prolong = _truncate(_coalesce(tentative - smoothed), truncate)
         coarse = _galerkin(current, prolong)
         del product, smoothed, tentative, rows, cols, vals, index
         levels.append((current, prolong))
@@ -391,7 +581,9 @@ class AMGPreconditioner:
     ``matrix`` is the float64 CSR free-node operator (see :func:`assemble_free_operator`).
     Before and after each coarse correction the smoother runs ``smoothing`` steps: a
     degree-``smoothing`` Chebyshev polynomial in ``D^-1 A`` over ``[lmax / 30, lmax]``
-    (default), or that many l1-Jacobi sweeps.
+    (default), or that many l1-Jacobi sweeps. ``threads`` sets the host threads that
+    restrict ``matrix`` to free nodes (default: every CPU this process may use); a
+    hierarchy built on the host uses torch's thread count.
     """
 
     kind = "amg"
@@ -409,6 +601,7 @@ class AMGPreconditioner:
         setup: str = "torch",
         max_coarse: int = 1000,
         max_levels: int = 12,
+        threads: int | None = None,
     ) -> None:
         if setup not in ("torch", "pyamg"):
             raise ValueError("setup must be torch or pyamg")
@@ -431,7 +624,7 @@ class AMGPreconditioner:
         if fixed.any():
             keep = np.flatnonzero(~fixed)
             # An all-fixed block keeps a 1x1 placeholder hierarchy that apply never reaches.
-            matrix = matrix[keep][:, keep].tocsr() if len(keep) else sp.identity(1, format="csr")
+            matrix = _free_submatrix(matrix, keep, threads) if len(keep) else sp.identity(1, format="csr")
             self.free = torch.as_tensor(keep, device=device)
         if setup == "pyamg":
             try:
@@ -448,13 +641,18 @@ class AMGPreconditioner:
             coarsest = torch.as_tensor(hierarchy.levels[-1].A.toarray(), dtype=torch.float64, device=device)
             complexity = float(hierarchy.operator_complexity())
         else:
+            out_of_memory = False
             try:
                 built, coarsest, complexity = _torch_hierarchy(
                     matrix, device, max_coarse=max_coarse, max_levels=max_levels
                 )
             except torch.OutOfMemoryError:
+                out_of_memory = True
+            if out_of_memory:
                 # Sparse products need transient workspace well beyond the hierarchy;
-                # build on the host instead and move only the compact result.
+                # build on the host instead and move only the compact result. This runs
+                # after the except block: until then the traceback keeps the failed
+                # attempt's device tensors alive and the cache cannot release them.
                 torch.cuda.empty_cache()
                 built, coarsest, complexity = _torch_hierarchy(
                     matrix, "cpu", max_coarse=max_coarse, max_levels=max_levels
@@ -478,7 +676,7 @@ class AMGPreconditioner:
                 if not bool(torch.isfinite(l1).all()) or bool((l1 <= 0).any()):
                     raise ValueError("AMG level has a nonpositive l1 row norm")
                 scale = 1.0 / l1
-            pt = p.to_sparse_coo().t().coalesce().to_sparse_csr()
+            pt = _coalesce(p.to_sparse_coo().t()).to_sparse_csr()
             self.levels.append(
                 (
                     _compact(a, dtype, device),

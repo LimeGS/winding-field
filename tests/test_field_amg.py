@@ -1,5 +1,7 @@
 """AMG preconditioning changes iteration counts only, never the solved system."""
 
+import weakref
+
 import numpy as np
 import pytest
 import scipy.sparse as sp
@@ -189,3 +191,152 @@ def test_fixed_faces_are_eliminated_before_coarsening():
         field_amg.assemble_free_operator(weights, np.ones(shape, bool)), shape, torch.ones(shape, dtype=torch.bool)
     )
     assert bool((everything.apply(r) == 0).all())
+
+
+def _serial_reference(weights, mask, pairs=None, lam=0.0, constraints=None, reference_weight=0.0):
+    """The single-threaded assembly that the row-block assembly must reproduce bit for bit."""
+    w = np.asarray(weights, dtype=np.float64)
+    shape, n = w.shape, w.size
+    index = np.arange(n, dtype=np.int32).reshape(shape)
+    rows, cols, vals = [], [], []
+    diagonal = np.zeros(n)
+    for axis in range(3):
+        lo, hi = [slice(None)] * 3, [slice(None)] * 3
+        lo[axis], hi[axis] = slice(None, -1), slice(1, None)
+        a, b = index[tuple(lo)].ravel(), index[tuple(hi)].ravel()
+        edge = (0.5 * w[tuple(lo)] + 0.5 * w[tuple(hi)]).ravel()
+        rows += [a, b]
+        cols += [b, a]
+        vals += [-edge, -edge]
+        for ends in (a, b):
+            diagonal += np.bincount(ends, weights=edge, minlength=n)
+    if pairs is not None and lam:
+        p = np.asarray(pairs).reshape(-1, 2).astype(np.int32)
+        p = p[p[:, 0] != p[:, 1]]
+        coupling = np.full(len(p), float(lam))
+        rows += [p[:, 0], p[:, 1]]
+        cols += [p[:, 1], p[:, 0]]
+        vals += [-coupling, -coupling]
+        for ends in (p[:, 0], p[:, 1]):
+            diagonal += np.bincount(ends, weights=coupling, minlength=n)
+    rows.append(index.ravel())
+    cols.append(index.ravel())
+    vals.append(diagonal + np.broadcast_to(np.asarray(reference_weight, dtype=np.float64), shape).ravel())
+    matrix = sp.coo_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), (n, n)).tocsr()
+    if constraints is not None:
+        c = sp.csr_matrix(constraints.matrix, dtype=np.float64)
+        matrix = matrix + (c.T @ sp.diags(constraints.weights) @ c).tocsr()
+        if (constraints.groups >= 0).any():
+            means = (constraints.members @ c).tocsr()
+            inverse = np.divide(
+                1, constraints.group_sum, out=np.zeros_like(constraints.group_sum), where=constraints.group_sum > 0
+            )
+            matrix = matrix - (means.T @ sp.diags(inverse) @ means).tocsr()
+    fixed = np.asarray(mask, dtype=bool).ravel()
+    if fixed.any():
+        keep = sp.diags((~fixed).astype(np.float64))
+        matrix = (keep @ matrix @ keep + sp.diags(fixed.astype(np.float64))).tocsr()
+    matrix.sum_duplicates()
+    matrix.eliminate_zeros()
+    return matrix
+
+
+def _bitwise_equal(a, b):
+    return (
+        a.shape == b.shape
+        and np.array_equal(a.indptr, b.indptr)
+        and np.array_equal(a.indices, b.indices)
+        and np.array_equal(a.data.view(np.int64), b.data.view(np.int64))
+    )
+
+
+@pytest.mark.parametrize("groups", [False, True])
+@pytest.mark.parametrize("masked", [False, True])
+def test_threaded_assembly_is_bitwise_serial(groups, masked):
+    _, weights, pairs = _problem(12)
+    shape = weights.shape
+    constraints = _constraints(shape, groups=groups)
+    mask = np.zeros(shape, bool)
+    if masked:
+        mask[0] = mask[:, -1] = True
+    rw = np.random.default_rng(2).random(shape)
+    kwargs = dict(pairs=pairs, lam=1000.0, constraints=constraints, reference_weight=rw)
+    expected = _serial_reference(weights, mask, **kwargs)
+    for threads in (1, 2, 5):
+        got = field_amg.assemble_free_operator(weights, mask, threads=threads, **kwargs)
+        assert _bitwise_equal(got, expected)
+        keep = np.flatnonzero(~mask.ravel())
+        assert _bitwise_equal(field_amg._free_submatrix(got, keep, threads), expected[keep][:, keep].tocsr())
+    with pytest.raises(ValueError, match="threads must be positive"):
+        field_amg.assemble_free_operator(weights, mask, threads=0)
+
+
+def test_threaded_setup_gives_the_same_preconditioner():
+    _, weights, pairs = _problem(10)
+    mask = np.zeros(weights.shape, bool)
+    mask[0] = True
+    matrix = field_amg.assemble_free_operator(weights, mask, pairs=pairs, lam=1000.0)
+    one, four = (
+        field_amg.AMGPreconditioner(matrix, weights.shape, torch.tensor(mask), max_coarse=50, threads=t) for t in (1, 4)
+    )
+    v = torch.tensor(np.random.default_rng(4).standard_normal(weights.shape))
+    assert torch.equal(one.apply(v), four.apply(v))
+
+
+def test_galerkin_blocks_give_the_same_coarse_operator():
+    _, weights, pairs = _problem(12)
+    mask = np.zeros(weights.shape, bool)
+    mask[0] = True
+    matrix = field_amg.assemble_free_operator(weights, mask, pairs=pairs, lam=1000.0)
+    levels, _, _ = field_amg._torch_hierarchy(matrix, "cpu", max_coarse=50, max_levels=2, dense=False)
+    a, p = levels[0]
+    dense = (p.to_dense().T @ a.to_dense() @ p.to_dense()).numpy()
+    reference = None
+    for block_nnz in (1 << 30, 4096, 256):
+        coarse = field_amg._galerkin(a, p, block_nnz=block_nnz)
+        assert coarse.is_coalesced()
+        np.testing.assert_allclose(coarse.to_dense().numpy(), dense, rtol=1e-12, atol=1e-9)
+        if block_nnz == 4096:
+            reference = coarse
+    small = field_amg._galerkin(a, p, block_nnz=4096)
+    assert reference is not None and torch.equal(small.indices(), reference.indices())
+    assert torch.equal(small.values().view(torch.int64), reference.values().view(torch.int64))
+
+
+def test_out_of_memory_fallback_releases_the_failed_attempt(monkeypatch):
+    real = field_amg._torch_hierarchy
+    held: list = []
+
+    def flaky(matrix, device, **kwargs):
+        if not held:
+            workspace = torch.empty(16)  # stands in for the failed attempt's device tensors
+            held.append(weakref.ref(workspace))
+            raise torch.OutOfMemoryError("simulated")
+        assert held[0]() is None, "the failed attempt is still referenced during the host rebuild"
+        held.append(device)
+        return real(matrix, device, **kwargs)
+
+    monkeypatch.setattr(field_amg, "_torch_hierarchy", flaky)
+    _, weights, pairs = _problem(8)
+    mask = np.zeros(weights.shape, bool)
+    matrix = field_amg.assemble_free_operator(weights, mask, pairs=pairs, lam=10.0)
+    amg = field_amg.AMGPreconditioner(matrix, weights.shape, torch.tensor(mask), max_coarse=50)
+    assert held[1] == "cpu"
+    assert amg.metadata()["levels"] >= 2
+
+
+def test_host_coalesce_is_bitwise_torch_coalesce():
+    generator = torch.Generator().manual_seed(0)
+    size = 4 * field_amg._HOST_COALESCE_MIN
+    for rows, cols in ((40, 30), (5000, 4000)):  # long runs of duplicates, then mostly unique
+        index = torch.stack(
+            [torch.randint(0, rows, (size,), generator=generator), torch.randint(0, cols, (size,), generator=generator)]
+        )
+        scale = torch.pow(10.0, torch.randint(-8, 9, (size,), generator=generator).double())
+        values = torch.randn(size, generator=generator, dtype=torch.float64) * scale
+        values[::97] = -0.0
+        raw = torch.sparse_coo_tensor(index, values, (rows, cols))
+        expected, got = raw.coalesce(), field_amg._coalesce(raw)
+        assert got.is_coalesced()
+        assert torch.equal(got.indices(), expected.indices())
+        assert torch.equal(got.values().view(torch.int64), expected.values().view(torch.int64))

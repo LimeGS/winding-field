@@ -314,12 +314,15 @@ class StencilConstraints:
             candidate_nodes, candidate_coeff = self._nodes, self._coeff
         else:
             values, postings = self._postings
-            # A lexicographic ZYX interval is a superset; exact slot filtering follows.
-            first = np.ravel_multi_index(lo, self.shape)
-            last = np.ravel_multi_index(hi - 1, self.shape)
-            a = np.searchsorted(values, first, side="left")
-            b = np.searchsorted(values, last, side="right")
-            candidates = np.unique(postings[a:b])
+            # One sorted run of flat indices per (z, y) line of the box: the rows that can
+            # touch it, at a cost that does not grow with the rows elsewhere in the grid.
+            z, y = np.meshgrid(np.arange(lo[0], hi[0]), np.arange(lo[1], hi[1]), indexing="ij")
+            line = (z.ravel() * self.shape[1] + y.ravel()) * self.shape[2]
+            a = np.searchsorted(values, line + lo[2], side="left")
+            b = np.searchsorted(values, line + hi[2], side="left")
+            counts = b - a
+            starts = np.repeat(a - np.cumsum(counts) + counts, counts)
+            candidates = np.unique(postings[starts + np.arange(int(counts.sum()))])
             candidate_nodes, candidate_coeff = self._nodes[candidates], self._coeff[candidates]
         coords = np.array(np.unravel_index(candidate_nodes.ravel(), self.shape)).T.reshape(*candidate_nodes.shape, 3)
         inside = ((coords >= lo) & (coords < hi)).all(-1) & (candidate_coeff != 0)
@@ -334,7 +337,9 @@ class StencilConstraints:
             rows = np.flatnonzero(touched | ((groups >= 0) & np.isin(groups, selected_groups)))
             inside, coords = inside[rows], coords[rows]
         else:
-            rows = np.union1d(touched_rows, np.flatnonzero((groups >= 0) & np.isin(groups, selected_groups)))
+            rows = touched_rows
+            if selected_groups.size:
+                rows = np.union1d(rows, np.flatnonzero((groups >= 0) & np.isin(groups, selected_groups)))
             coords = np.array(np.unravel_index(self._nodes[rows].ravel(), self.shape)).T.reshape(
                 len(rows), self._nodes.shape[1], 3
             )

@@ -124,3 +124,32 @@ def test_empty_index_and_stable_admission_after_oversized_entry():
     for _ in range(2):
         assert rows.restrict([0, 0, 1], [1, 1, 2], lambda n: n) is None
     assert rows.stats == dict(bytes=4096, hits=1, misses=2, evictions=0)
+
+
+def test_indexed_pair_rows_match_the_scan_and_only_visit_rows_near_the_box(monkeypatch):
+    rng = np.random.default_rng(7)
+    shape = (24, 20, 28)
+    a = rng.uniform(0, np.array(shape[::-1]) - 1.001, (4000, 3))
+    b = np.clip(a + rng.normal(scale=3.0, size=a.shape), 0, np.array(shape[::-1]) - 1.001)
+    scan = StencilConstraints.pairs(a, b, (0, 0, 0), (1, 1, 1), shape, weight=2.0)
+    indexed = StencilConstraints.pairs(
+        a, b, (0, 0, 0), (1, 1, 1), shape, weight=2.0, spatial_index_bytes=4096 + 4000 * 16 * 64
+    )
+    assert indexed._postings is not None
+    values = rng.normal(size=int(np.prod(shape)))
+    for _ in range(40):
+        lo = rng.integers(0, np.array(shape) - 1)
+        hi = rng.integers(lo + 1, np.array(shape) + 1)
+        equal(scan.restrict(lo, hi, lambda n: values[n]), indexed.restrict(lo, hi, lambda n: values[n]))
+    # A small box far from most rows unravels few of them: the index is local in all axes.
+    visited = []
+    original = np.unravel_index
+
+    def counting(indices, grid):
+        visited.append(np.size(indices))
+        return original(indices, grid)
+
+    monkeypatch.setattr(np, "unravel_index", counting)
+    indexed.prepare([0, 0, 0], [4, 4, 4])
+    monkeypatch.undo()
+    assert max(visited) < 0.1 * scan._nodes.size

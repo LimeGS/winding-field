@@ -27,8 +27,7 @@ checkpoints are unchanged and resume byte-identically.
   memory available at start and maps it to the block solver's checkpoint mode.
 - `solve_field`/`solve_blocks(kernel="fused")` (`field_kernels.py`, opt-in): the PCG
   iterations run as three Triton GPU kernels (stencil + p.Ap, update + dots, direction)
-  instead of ~40 PyTorch ops, for Jacobi and the outer AMG iteration; CSR constraint rows
-  (fibres) are fused too (int32 gathers, group means without atomics, A^T inside the stencil). Same system and
+  instead of ~40 PyTorch ops, for Jacobi and the outer AMG iteration. Same system and
   stopping rules, deterministic reductions, final residual still measured with the eager
   operator. The receipt records `kernel` (`fused-v1`, or `eager` + `kernel_fallback` off
   CUDA, with discrete pairs or `spectral`); `solve_blocks` adds `kernel` to the identity

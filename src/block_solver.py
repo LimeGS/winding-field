@@ -687,12 +687,13 @@ def solve_blocks(
                     out[np.isfinite(declared)] = 0.0
                 return out
 
-            def corrected_nodes(block):
+            def corrected_nodes(block, nodes=None):
                 """A node reader that adds the pending correction outside committed chunks."""
+                nodes = store.nodes if nodes is None else nodes
 
                 def read(flat):
                     flat = np.asarray(flat, np.int64)
-                    values = np.array(store.nodes(flat), dtype=np.float64)
+                    values = np.array(nodes(flat), dtype=np.float64)
                     zyx = np.stack(np.unravel_index(flat.ravel(), shape), 1)
                     late = visit[tuple((zyx // chunk).T)] >= block
                     if late.any():
@@ -889,13 +890,17 @@ def solve_blocks(
                 if prefetch is not None and prefetch.available and block + 1 < len(ordered):
                     _, _, next_lo, next_hi = bounds(ordered[block + 1])
                     prefetch.submit(next_lo, next_hi)
-                current = store.read(lo, hi)
-                reader = store.nodes
+                # Restricting a static stencil (the costly template build) moves to the worker,
+                # with every store access of the batch behind one lock.
+                deferred = pool is not None and isinstance(constraints, StencilConstraints)
+                with store_lock:
+                    current = store.read(lo, hi)
+                reader = locked_nodes if deferred else store.nodes
                 if correction is not None:
                     current += pending_correction(lo, hi, stamp)
-                    reader = corrected_nodes(stamp)
+                    reader = corrected_nodes(stamp, reader)
                     coarse_status.update(stage="apply", next_block=block)
-                if constraints is None:
+                if constraints is None or deferred:
                     rows = None
                 elif isinstance(constraints, StencilConstraints):
                     rows = constraints.restrict(lo, hi, reader)
@@ -948,6 +953,8 @@ def solve_blocks(
                     key=key,
                     low=low,
                     lo=lo,
+                    hi=hi,
+                    rows_reader=reader if deferred else None,
                     owned=tuple(slice(int(a), int(b)) for a, b in zip(low - lo, high - lo)),
                     target=target,
                     weights=weights,
@@ -976,12 +983,15 @@ def solve_blocks(
                         streams[where] = torch.cuda.Stream(where)
                     context.enter_context(torch.cuda.device(where))
                     context.enter_context(torch.cuda.stream(streams[where]))
+                rows = job["rows"]
+                if job["rows_reader"] is not None:
+                    rows = constraints.restrict(job["lo"], job["hi"], job["rows_reader"])
                 with context:
                     result, solver = solve_field(
                         job["target"],
                         job["weights"],
                         spacing,
-                        constraints=job["rows"],
+                        constraints=rows,
                         fixed=job["fixed_values"],
                         initial=job["current"],
                         device=str(where) if local_devices else device,
@@ -1134,7 +1144,14 @@ def solve_blocks(
                         job = prepare_block(sweep, block, batch[block], gate=False)
                         solved[block] = solve_block(job)
                         jobs[block] = dict(
-                            job, target=None, weights=None, observed=None, current=None, rows=None, fixed_values=None
+                            job,
+                            target=None,
+                            weights=None,
+                            observed=None,
+                            current=None,
+                            rows=None,
+                            rows_reader=None,
+                            fixed_values=None,
                         )
                         del job
                 else:
@@ -1144,7 +1161,13 @@ def solve_blocks(
                         block, future = waiting.popleft()
                         solved[block] = future.result()
                         jobs[block].update(
-                            target=None, weights=None, observed=None, current=None, rows=None, fixed_values=None
+                            target=None,
+                            weights=None,
+                            observed=None,
+                            current=None,
+                            rows=None,
+                            rows_reader=None,
+                            fixed_values=None,
                         )
 
                     for block in range(start, end):
@@ -1161,6 +1184,12 @@ def solve_blocks(
                 for block in range(start, end):
                     commit_block(sweep, jobs.pop(block), solved.pop(block), None, boundary_s)
                 return None
+
+            store_lock = threading.Lock()
+
+            def locked_nodes(flat):
+                with store_lock:
+                    return store.nodes(flat)
 
             worker_state = threading.local()
             worker_slots = itertools.count()

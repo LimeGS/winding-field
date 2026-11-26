@@ -158,3 +158,30 @@ def test_default_receipt_is_unchanged_and_kernel_is_validated():
     assert "kernel" not in info and "kernel_fallback" not in info
     with pytest.raises(ValueError, match="kernel must be eager or fused"):
         solve_field(target, weights, kernel="triton")
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("grouped", [False, True])
+def test_fused_constraint_rows_match_the_eager_operator(dtype, grouped):
+    shape = (4, 5, 9)
+    rng = np.random.default_rng(11)
+    n = int(np.prod(shape))
+    rows = 30
+    cols = np.stack([rng.choice(n, 16, replace=False) for _ in range(rows)])
+    matrix = csr_matrix((rng.normal(size=rows * 16), (np.repeat(np.arange(rows), 16), cols.ravel())), shape=(rows, n))
+    groups = np.where(np.arange(rows) % 3 == 0, -1, np.arange(rows) // 4) if grouped else None
+    constraints = QuadraticConstraints(matrix, rng.uniform(1, 1000, rows), rng.normal(size=rows), groups)
+    np_dtype = np.float64 if dtype == "float64" else np.float32
+    extra = constraints.operator(DEVICE, np_dtype, layout="csr")
+    torch_dtype = DTYPES[dtype]
+    weights = torch.tensor(rng.uniform(0.5, 2.0, shape), dtype=torch_dtype, device=DEVICE)
+    p = torch.tensor(rng.normal(size=shape), dtype=torch_dtype, device=DEVICE)
+    mask = torch.zeros(shape, dtype=torch.bool, device=DEVICE)
+    expected = _FieldOperator(weights, None, 0).matvec(p) + extra.matvec(p)
+    fused_rows = field_kernels.FusedRows.of(extra)
+    assert field_kernels.FusedRows.of(extra) is fused_rows and fused_rows.grouped is grouped
+    out = torch.empty_like(p)
+    field_kernels.FusedOperator(weights, mask, 0.0).apply(p, out, rows=fused_rows)
+    tolerance = 1e-12 if dtype == "float64" else 1e-5
+    assert float((out - expected).abs().max()) <= tolerance * float(expected.abs().max())
+    assert not field_kernels.FusedRows.supported(constraints.operator(DEVICE, np_dtype))  # COO stays eager

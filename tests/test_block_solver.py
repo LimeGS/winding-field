@@ -514,7 +514,7 @@ def test_fused_block_run_matches_eager_and_is_part_of_identity(tmp_path):
     eager = runner()(tmp_path / "eager", **dict(case(tmp_path), device=device))
     result = runner()(tmp_path / "fused", **dict(case(tmp_path), kernel="fused", device=device))
     assert result["local_solves_converged"] is True
-    assert set(result["solver_kernels"]) == {"fused-v1"} and "solver_kernels" not in eager
+    assert set(result["solver_kernels"]) == {"fused-v2"} and "solver_kernels" not in eager
     eager_meta, eager_field, observed = state(tmp_path / "eager")
     fused_meta, fused_field, fused_observed = state(tmp_path / "fused")
     np.testing.assert_allclose(fused_field, eager_field, atol=1e-6)

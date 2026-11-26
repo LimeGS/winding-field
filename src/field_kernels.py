@@ -5,8 +5,10 @@ float64; the solve is memory-bandwidth bound on every GPU measured (GTX 1660, A1
 kernels replace them:
 
 - K1 ``_stencil``: the 7-point weighted Laplacian with on-the-fly edge weights, plus the
-  reference penalty, an optional precomputed extra term (continuous constraint rows) and the
-  fixed-node mask, writing ``ap`` and one partial ``p.ap`` sum per program.
+  reference penalty, the continuous constraint rows and the fixed-node mask, writing ``ap``
+  and one partial ``p.ap`` sum per program. CSR rows (fibres) are gathered in K1 as A^T v,
+  with v = center_weight(A p) formed by the ``_gather`` kernel; other operators come in as a
+  precomputed term.
 - K2 ``_update``: ``x += alpha p``, ``r -= alpha ap`` and, for Jacobi, ``z = r * inv`` without
   storing it, with partial ``r.z`` and ``r.r`` sums.
 - K3 ``_direction``: ``p = p * beta + z`` (``z`` recomputed as ``r * inv`` for Jacobi).
@@ -29,7 +31,7 @@ from typing import Any
 
 import torch
 
-KERNEL_VERSION = "fused-v1"
+KERNEL_VERSION = "fused-v2"
 KERNELS = ("eager", "fused")
 
 # Program tiles. K1 covers BLOCK_Y x BLOCK_X nodes of one z-plane: x rows stay coalesced and
@@ -74,6 +76,10 @@ def _kernels() -> dict[str, Any]:
         w_ptr,
         rw_ptr,
         extra_ptr,
+        at_rowptr_ptr,
+        at_cols_ptr,
+        at_vals_ptr,
+        v_ptr,
         mask_ptr,
         ap_ptr,
         part_ptr,
@@ -82,6 +88,7 @@ def _kernels() -> dict[str, Any]:
         X,
         RW_MODE: tl.constexpr,  # 0 none, 1 scalar (rw_ptr[0], float64), 2 nodal
         HAS_EXTRA: tl.constexpr,
+        HAS_ROWS: tl.constexpr,
         BY: tl.constexpr,
         BX: tl.constexpr,
     ):
@@ -128,6 +135,19 @@ def _kernels() -> dict[str, Any]:
         out = tl.where(down, out + (pc - pn) * (0.5 * wn + 0.5 * wc), out)
         if HAS_EXTRA:
             out = out + tl.load(extra_ptr + idx, mask=inside, other=0.0)
+        if HAS_ROWS:
+            # Constraint rows: (A^T v)[node], gathered from the int32 CSR of A^T in a fixed order.
+            start = tl.load(at_rowptr_ptr + idx, mask=inside, other=0)
+            stop = tl.load(at_rowptr_ptr + idx + 1, mask=inside, other=0)
+            rows = tl.zeros([BY, BX], dtype=p_ptr.dtype.element_ty)
+            for k in range(0, tl.max(tl.max(stop - start, axis=1), axis=0)):
+                j = start + k
+                live = inside & (j < stop)
+                col = tl.load(at_cols_ptr + j, mask=live, other=0)
+                rows = rows + tl.load(at_vals_ptr + j, mask=live, other=0.0) * tl.load(
+                    v_ptr + col, mask=live, other=0.0
+                )
+            out = out + rows
         if RW_MODE == 1:
             out = out + pc * tl.load(rw_ptr).to(p_ptr.dtype.element_ty)
         if RW_MODE == 2:
@@ -193,8 +213,114 @@ def _kernels() -> dict[str, Any]:
         p = tl.load(p_ptr + offs, mask=inside, other=0.0)
         tl.store(p_ptr + offs, p * beta + zv, mask=inside)
 
-    _compiled = dict(stencil=_stencil, update=_update, direction=_direction, triton=triton)
+    @triton.jit
+    def _gather(
+        rowptr_ptr, cols_ptr, vals_ptr, x_ptr, scale_ptr, out_ptr, R, HAS_SCALE: tl.constexpr, BLOCK: tl.constexpr
+    ):
+        # out[i] = scale[i] * sum_j vals[j] * x[cols[j]] over row i of an int32 CSR, in order.
+        rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        inside = rows < R
+        start = tl.load(rowptr_ptr + rows, mask=inside, other=0)
+        stop = tl.load(rowptr_ptr + rows + 1, mask=inside, other=0)
+        acc = tl.zeros([BLOCK], dtype=out_ptr.dtype.element_ty)
+        for k in range(0, tl.max(stop - start, axis=0)):
+            j = start + k
+            live = inside & (j < stop)
+            col = tl.load(cols_ptr + j, mask=live, other=0)
+            acc = acc + tl.load(vals_ptr + j, mask=live, other=0.0) * tl.load(x_ptr + col, mask=live, other=0.0)
+        if HAS_SCALE:
+            acc = tl.load(scale_ptr + rows, mask=inside, other=0.0) * acc
+        tl.store(out_ptr + rows, acc, mask=inside)
+
+    _compiled = dict(stencil=_stencil, update=_update, direction=_direction, gather=_gather, triton=triton)
     return _compiled
+
+
+def _csr32(matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        matrix.crow_indices().to(torch.int32),
+        matrix.col_indices().to(torch.int32),
+        matrix.values().contiguous(),
+    )
+
+
+class FusedRows:
+    """Continuous constraint rows (field_constraints._QuadraticOperator, CSR layout) for K1.
+
+    v = center_weight(A p) is formed by int32 CSR gathers (no atomics; group means through
+    a group-by-row CSR), and K1 gathers A^T v per node. Built once per operator and cached
+    on it, so a PreparedField reuses it across sweeps.
+    """
+
+    def __init__(self, extra: Any) -> None:
+        self._k = _kernels()
+        self.a = _csr32(extra.a)
+        self.at = _csr32(extra.at)
+        self.w = extra.w.contiguous()
+        self.rows = int(self.w.numel())
+        self.v = torch.empty_like(self.w)
+        self.grouped = bool(len(extra.sum))
+        if self.grouped:
+            use = extra.groups >= 0
+            active = torch.nonzero(use, as_tuple=True)[0]
+            groups = extra.groups.index_select(0, active)
+            order = torch.sort(groups, stable=True).indices
+            counts = torch.bincount(groups, minlength=len(extra.sum))
+            self.g = (
+                torch.cat([counts.new_zeros(1), torch.cumsum(counts, 0)]).to(torch.int32),
+                active.index_select(0, order).to(torch.int32),
+                torch.ones(len(active), dtype=self.w.dtype, device=self.w.device),
+            )
+            self.use = use
+            self.group_of = extra.groups.clamp_min(0)
+            self.denominator = extra.sum.clamp_min(torch.finfo(self.w.dtype).tiny)
+            self.total = torch.empty_like(extra.sum)
+
+    @staticmethod
+    def supported(extra: Any) -> bool:
+        a = getattr(extra, "a", None)
+        return (
+            isinstance(a, torch.Tensor)
+            and a.layout == torch.sparse_csr
+            and getattr(extra, "at", None) is not None
+            and extra.at.layout == torch.sparse_csr
+            and a.shape[1] < 2**31
+            and a.values().numel() < 2**31
+        )
+
+    @classmethod
+    def of(cls, extra: Any) -> FusedRows:
+        cached = getattr(extra, "_fused_rows", None)
+        if cached is None:
+            cached = cls(extra)
+            extra._fused_rows = cached
+        return cached
+
+    def _gather(self, csr, x, out, scale=None):
+        rowptr, cols, vals = csr
+        n = len(rowptr) - 1
+        if n:
+            self._k["gather"][((n + BLOCK_FLAT - 1) // BLOCK_FLAT,)](
+                rowptr,
+                cols,
+                vals,
+                x,
+                x if scale is None else scale,
+                out,
+                n,
+                HAS_SCALE=scale is not None,
+                BLOCK=BLOCK_FLAT,
+                enable_fp_fusion=False,
+            )
+        return out
+
+    def center_weighted(self, p: torch.Tensor) -> torch.Tensor:
+        """v = center_weight(A p), as _QuadraticOperator.matvec forms it before A^T."""
+        v = self._gather(self.a, p.view(-1), self.v, self.w)
+        if self.grouped:
+            mean = self._gather(self.g, v, self.total) / self.denominator
+            torch.where(self.use, v - self.w * mean.index_select(0, self.group_of), v, out=v)
+        return v
 
 
 class FusedOperator:
@@ -219,14 +345,29 @@ class FusedOperator:
             self.grid[0] * self.grid[1] * self.grid[2], dtype=torch.float64, device=weights.device
         )
 
-    def apply(self, p: torch.Tensor, out: torch.Tensor, extra: torch.Tensor | None = None) -> torch.Tensor:
-        """Write A p to ``out`` (fixed rows zero) and return p.(A p) as a 0-d float64 tensor."""
+    def apply(
+        self, p: torch.Tensor, out: torch.Tensor, extra: torch.Tensor | None = None, rows: FusedRows | None = None
+    ) -> torch.Tensor:
+        """Write A p to ``out`` (fixed rows zero) and return p.(A p) as a 0-d float64 tensor.
+
+        ``extra`` is a precomputed term added after the stencil; ``rows`` adds A^T v of
+        fused constraint rows instead (v from ``rows.center_weighted(p)``).
+        """
         z, y, x = self.shape
+        if rows is not None:
+            v = rows.center_weighted(p)
+            at_rowptr, at_cols, at_vals = rows.at
+        else:
+            v = at_rowptr = at_cols = at_vals = p
         self._k["stencil"][self.grid](
             p,
             self.weights,
             self.rw,
             p if extra is None else extra.contiguous(),
+            at_rowptr,
+            at_cols,
+            at_vals,
+            v,
             self.mask,
             out,
             self.partials,
@@ -235,6 +376,7 @@ class FusedOperator:
             x,
             RW_MODE=self.rw_mode,
             HAS_EXTRA=extra is not None,
+            HAS_ROWS=rows is not None,
             BY=BLOCK_Y,
             BX=BLOCK_X,
             enable_fp_fusion=False,
@@ -259,7 +401,7 @@ def pcg(
     weights: torch.Tensor,
     mask: torch.Tensor,
     rw: torch.Tensor | float,
-    extra: Callable[[torch.Tensor], torch.Tensor] | None,
+    extra: Any,
     preconditioner: Any,
     eager_matvec: Callable[[torch.Tensor], torch.Tensor],
     norm: Callable[[torch.Tensor], float],
@@ -269,12 +411,15 @@ def pcg(
 ) -> tuple[int, str]:
     """Run the PCG iterations of solve_field with fused kernels; same stopping rules.
 
-    Expects r, z, p and rz initialised as the eager loop does. Returns (iterations, reason);
-    the caller recomputes the final residual with the eager operator.
+    Expects r, z, p and rz initialised as the eager loop does. ``extra`` is the continuous
+    constraint operator (or None): CSR operators are fused (FusedRows), others are applied
+    eagerly and added by K1. Returns (iterations, reason); the caller recomputes the final
+    residual with the eager operator.
     """
     k = _kernels()
     jacobi = preconditioner is None
     op = FusedOperator(weights, mask, rw)
+    rows = FusedRows.of(extra) if extra is not None and FusedRows.supported(extra) else None
     n = x.numel()
     grid = _flat_grid(n)
     partials = torch.empty(2 * grid[0], dtype=torch.float64, device=x.device)
@@ -290,7 +435,7 @@ def pcg(
             break
         if current <= rtol * scale:
             break
-        curvature_t = op.apply(p, ap, None if extra is None else extra(p))
+        curvature_t = op.apply(p, ap, None if extra is None or rows is not None else extra.matvec(p), rows)
         curvature = float(curvature_t)
         if not math.isfinite(curvature) or not math.isfinite(rz):
             reason = "nonfinite_curvature"

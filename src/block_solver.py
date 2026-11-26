@@ -1,11 +1,13 @@
 """Opt-in, single-writer block solves with durable progress and immutable prefetch."""
 
+import contextlib
 import hashlib
 import itertools
 import json
 import math
 import os
 import re
+import threading
 import time
 import warnings
 from collections import deque
@@ -208,6 +210,9 @@ def solve_blocks(
     coarse_workers: int | None = None,
     checkpoint: Literal["block", "sweep"] = "block",
     memory_report: dict[str, Any] | None = None,
+    colours: int = 0,
+    local_workers: int = 1,
+    local_devices: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Solve each explicit owned core, persisting its exact next-block cursor.
 
@@ -284,6 +289,20 @@ def solve_blocks(
     (see :mod:`field_memory`); ``cache_bytes`` should cover it too, or published chunks
     are read back from disk. Not available with an observer. ``memory_report`` is shown
     verbatim as ``STATUS.json["memory"]``. Neither is part of the run identity.
+
+    ``colours=8`` (opt-in; 0 keeps the caller's sequential order) solves the blocks in eight
+    colour batches by the parity of their chunk key along each axis (2 x 2 x 2), keeping the
+    caller's order inside a batch. Blocks of one colour never read each other's cores through a
+    crop (``halo`` must not exceed ``chunk``), so every block of a batch reads the field as it
+    was before the batch, pairs and coarse correction included, and the batch commits in block
+    order afterwards. Between colours the sweep stays multiplicative. The colouring changes the
+    iteration and is part of the run identity; it may need more sweeps than the sequential
+    order. It requires ``checkpoint='sweep'`` (a crash resumes from the last published sweep,
+    a stop takes effect between batches) and holds one owned core per block of the open batch.
+    ``local_workers`` runs that many local solves of a batch at once on threads, each with its
+    own CUDA stream, while the main thread prepares the next blocks; ``local_devices`` (for
+    example ``["cuda:0", "cuda:1"]``) assigns workers to devices round robin. Neither is part
+    of the run identity: the field does not depend on them beyond the device's own rounding.
     """
     if observer is not None and not all(
         callable(getattr(observer, name, None)) for name in ("restore", "prepare", "complete")
@@ -361,6 +380,19 @@ def solve_blocks(
                 raise ValueError("coarse correction needs the full block order")
         if checkpoint not in ("block", "sweep"):
             raise ValueError("checkpoint must be block or sweep")
+        if type(colours) is not int or colours not in (0, 8):
+            raise ValueError("colours must be 0 (sequential order) or 8")
+        local_workers = _integer(local_workers, 1)
+        if local_devices is not None:
+            local_devices = [str(torch.device(d)) for d in local_devices]
+            if not local_devices:
+                raise ValueError("local_devices must name at least one device")
+        if colours and checkpoint != "sweep":
+            raise ValueError("colour batches require checkpoint='sweep'")
+        if colours and halo > chunk:
+            raise ValueError("colour batches require halo <= chunk")
+        if not colours and (local_workers > 1 or local_devices):
+            raise ValueError("parallel local solves require colour batches (colours=8)")
         if checkpoint == "sweep" and observer_requested:
             raise ValueError("sweep checkpoints do not support a field observer")
         if memory_report is not None:
@@ -402,8 +434,17 @@ def solve_blocks(
             # Fused kernels round differently, so a run never resumes across kernels.
             **({} if kernel == "eager" else {"kernel": kernel}),
             **({} if coarse_factor is None else {"coarse": dict(kind="trilinear", factor=coarse_factor)}),
+            **({"colours": colours} if colours else {}),
         )
         json.dumps(problem, allow_nan=False)
+        if colours:
+            colour = (ordered[:, 0] % 2) * 4 + (ordered[:, 1] % 2) * 2 + ordered[:, 2] % 2
+            ordered = ordered[np.argsort(colour, kind="stable")]
+            batch = np.unique(np.sort(colour), return_inverse=True)[1].astype(np.int64)
+            batch_starts = [*np.flatnonzero(np.diff(batch, prepend=-1)).tolist(), len(ordered)]
+        else:
+            batch = np.arange(len(ordered), dtype=np.int64)
+            batch_starts = list(range(len(ordered) + 1))
         root, started = Path(root), time.perf_counter()
         prefetched, parity = 0, False
         with BlockStore(
@@ -431,6 +472,8 @@ def solve_blocks(
             first_block = _integer(progress.get("next_block"))
             if first_sweep > sweeps or first_block > len(ordered):
                 raise ValueError("checkpoint cursor exceeds run budget")
+            if first_block not in batch_starts:
+                raise ValueError("checkpoint cursor lies inside a colour batch")
             maximum = progress.get("sweep_max_update")
             completed, seen = progress.get("completed_sweeps"), progress.get("source_receipts")
             if (
@@ -622,10 +665,13 @@ def solve_blocks(
             correction = None
             grid_shape = tuple(int(n) for n in (np.asarray(shape) + chunk - 1) // chunk)
             visit = np.full(grid_shape, -1, np.int64)
-            visit[tuple(ordered.T)] = np.arange(len(ordered))
+            visit[tuple(ordered.T)] = batch  # The block, or its colour batch.
 
             def pending_correction(lo, hi, block):
-                """``P e`` on the crop nodes whose chunk this sweep has not committed yet (else 0)."""
+                """``P e`` on the crop nodes whose chunk this sweep has not committed yet (else 0).
+
+                ``block`` is the visit index of the reading block: its position, or its colour batch.
+                """
                 out = np.zeros(tuple(map(int, hi - lo)))
                 declared = global_fixed(lo, hi, out.shape)
                 pending = False
@@ -641,12 +687,13 @@ def solve_blocks(
                     out[np.isfinite(declared)] = 0.0
                 return out
 
-            def corrected_nodes(block):
+            def corrected_nodes(block, nodes=None):
                 """A node reader that adds the pending correction outside committed chunks."""
+                nodes = store.nodes if nodes is None else nodes
 
                 def read(flat):
                     flat = np.asarray(flat, np.int64)
-                    values = np.array(store.nodes(flat), dtype=np.float64)
+                    values = np.array(nodes(flat), dtype=np.float64)
                     zyx = np.stack(np.unravel_index(flat.ravel(), shape), 1)
                     late = visit[tuple((zyx // chunk).T)] >= block
                     if late.any():
@@ -800,6 +847,361 @@ def solve_blocks(
                     segment_prefix + time.perf_counter() - segment_started - (boundary_s - segment_boundary_start)
                 )
 
+            def local_device(slot):
+                """The device of local solve worker ``slot`` (round robin over ``local_devices``)."""
+                return device if not local_devices else local_devices[slot % len(local_devices)]
+
+            def prepare_block(sweep, block, stamp, gate):
+                """Read everything one local solve needs (main thread); a returned str is a stop.
+
+                ``stamp`` is the visit index the coarse correction compares against: the block itself,
+                or its colour batch, whose blocks all read the field as it was before the batch.
+                ``gate`` checks stop requests here; colour batches check them between batches only.
+                """
+                nonlocal prefetched, parity, prepared
+                if gate and stopped():
+                    return "stop"
+                admitted()
+                key = ordered[block]
+                low, high, lo, hi = bounds(key)
+                crop_shape = tuple(map(int, hi - lo))
+                emit("RUNNING", phase="observations", active_sweep=sweep, active_block=block)
+                fetched = None
+                if prefetch is not None and prefetch.available:
+                    if prefetch.pending is None:
+                        prefetch.submit(lo, hi)
+                    fetched = prefetch.receive(lo, hi)
+                if fetched is None:
+                    values = _observations(load_observations(lo, hi), crop_shape)
+                else:
+                    values = _observations(fetched, crop_shape)
+                    if not parity:
+                        primary = _observations(load_observations(lo, hi), crop_shape)
+                        if (
+                            any(not np.array_equal(_numpy(a), _numpy(b)) for a, b in zip(values[:3], primary[:3]))
+                            or values[3] != primary[3]
+                        ):
+                            raise ValueError("primary/secondary observation parity failed")
+                        parity = True
+                        del primary
+                    prefetched += 1
+                target, weights, observed, receipts = values
+                _record_sources(seen, receipts)
+                if prefetch is not None and prefetch.available and block + 1 < len(ordered):
+                    _, _, next_lo, next_hi = bounds(ordered[block + 1])
+                    prefetch.submit(next_lo, next_hi)
+                # Restricting a static stencil (the costly template build) moves to the worker,
+                # with every store access of the batch behind one lock.
+                deferred = pool is not None and isinstance(constraints, StencilConstraints)
+                with store_lock:
+                    current = store.read(lo, hi)
+                reader = locked_nodes if deferred else store.nodes
+                if correction is not None:
+                    current += pending_correction(lo, hi, stamp)
+                    reader = corrected_nodes(stamp, reader)
+                    coarse_status.update(stage="apply", next_block=block)
+                if constraints is None or deferred:
+                    rows = None
+                elif isinstance(constraints, StencilConstraints):
+                    rows = constraints.restrict(lo, hi, reader)
+                else:
+                    rows = constraints(lo, hi, reader)
+                if rows is not None and not isinstance(rows, QuadraticConstraints):
+                    raise ValueError("constraint provider must return local QuadraticConstraints")
+                fixed_values = np.full(crop_shape, np.nan)
+                for axis in range(3):
+                    for side, internal in ((0, lo[axis] > 0), (-1, hi[axis] < shape[axis])):
+                        if internal:
+                            plane: list[slice | int] = [slice(None)] * 3
+                            plane[axis] = side
+                            fixed_values[tuple(plane)] = current[tuple(plane)]
+                if fixed is None:
+                    if not lo.any():
+                        fixed_values[0, 0, 0] = 0.0
+                else:
+                    declared = np.asarray(fixed(lo, hi))
+                    if declared.shape != crop_shape or declared.dtype.kind not in "iuf" or np.isinf(declared).any():
+                        raise ValueError("invalid fixed-value observation")
+                    declared = declared.astype(np.float64)
+                    label = "fixed:" + ",".join(map(str, (*lo, *hi)))
+                    _record_sources(seen, {label: hashlib.sha256(declared.tobytes()).hexdigest()})
+                    valid = np.isfinite(declared)
+                    fixed_values[valid] = declared[valid]
+                if gate and stopped():
+                    return "stop"
+                admitted()
+                emit("RUNNING", phase="solving", active_sweep=sweep, active_block=block)
+                token = "static" if constraints is None or isinstance(constraints, StencilConstraints) else None
+                key_provider = getattr(constraints, "prepared_key", None)
+                if prepared_cache_bytes and callable(key_provider):
+                    token = key_provider(lo, hi)
+                    if token is not None and (not isinstance(token, str) or len(token) > 256):
+                        raise ValueError("prepared_key must return a string of at most 256 characters or None")
+                prepared_key = (*map(int, (*lo, *hi)), token)
+                prepared = prepared_cache.get(prepared_key)
+                if prepared is not None:
+                    prepared_stats["hits"] += 1
+                else:
+                    prepared_stats["builds"] += 1
+                    if prepared_cache_bytes and token is not None:
+                        if prepared_key in denied_keys:
+                            prepared_stats["skipped_snapshots"] += 1
+                        else:
+                            prepared = PreparedField()
+                job = dict(
+                    block=block,
+                    key=key,
+                    low=low,
+                    lo=lo,
+                    hi=hi,
+                    rows_reader=reader if deferred else None,
+                    owned=tuple(slice(int(a), int(b)) for a, b in zip(low - lo, high - lo)),
+                    target=target,
+                    weights=weights,
+                    observed=observed,
+                    current=current,
+                    rows=rows,
+                    fixed_values=fixed_values,
+                    prepared=prepared,
+                    prepared_key=prepared_key,
+                )
+                prepared = None
+                return job
+
+            def solve_block(job, slot=0):
+                """The local solve of a prepared block; safe on a worker thread (own CUDA stream).
+
+                Returns the owned core and everything the commit needs, so the crop arrays can go.
+                """
+                where = torch.device(local_device(slot))
+                context = contextlib.ExitStack()
+                if where.type == "cuda" and (local_workers > 1 or local_devices):
+                    streams = getattr(worker_state, "streams", None)
+                    if streams is None:
+                        streams = worker_state.streams = {}
+                    if where not in streams:
+                        streams[where] = torch.cuda.Stream(where)
+                    context.enter_context(torch.cuda.device(where))
+                    context.enter_context(torch.cuda.stream(streams[where]))
+                rows = job["rows"]
+                if job["rows_reader"] is not None:
+                    rows = constraints.restrict(job["lo"], job["hi"], job["rows_reader"])
+                with context:
+                    result, solver = solve_field(
+                        job["target"],
+                        job["weights"],
+                        spacing,
+                        constraints=rows,
+                        fixed=job["fixed_values"],
+                        initial=job["current"],
+                        device=str(where) if local_devices else device,
+                        dtype=dtype,
+                        preconditioner=preconditioner,
+                        kernel=kernel,
+                        rtol=rtol,
+                        maxiter=maxiter,
+                        return_tensor=True,
+                        prepared=job["prepared"],
+                    )
+                    owned = job["owned"]
+                    core = _numpy(result[owned])
+                del result
+                delta = core - job["current"][owned]
+                return dict(
+                    core=core,
+                    delta=delta if observer is not None else None,
+                    change=float(np.max(abs(delta))),
+                    solver=solver,
+                    owned_observed=_numpy(job["observed"][owned]),
+                    fixed_error=_decoded_anchor_error(core, job["fixed_values"][owned]),
+                )
+
+            def commit_block(sweep, job, solved, block_started, block_boundary_start):
+                """Account for and commit one solved block (main thread, in block order)."""
+                nonlocal maximum, progress, completed, nonconverged, stored_bytes, observer, advice_state
+                block, key, prepared_key = job["block"], job["key"], job["prepared_key"]
+                prepared_job, solver = job["prepared"], solved["solver"]
+                if prepared_job is not None and prepared_key not in prepared_cache:
+                    retained = prepared_job.retained_bytes + 4096  # Bounds key and cache-container overhead.
+                    if retained <= prepared_cache_bytes - prepared_stats["retained_bytes"]:
+                        prepared_cache[prepared_key] = prepared_job
+                        prepared_stats["retained_bytes"] += retained
+                        prepared_stats["entries"] = len(prepared_cache)
+                        prepared_stats["peak_bytes"] = prepared_stats["retained_bytes"]
+                        prepared_stats["peak_entries"] = len(prepared_cache)
+                    elif 4096 <= prepared_cache_bytes - prepared_stats["retained_bytes"]:
+                        denied_keys.add(prepared_key)
+                        prepared_stats["denied_entries"] = len(denied_keys)
+                        prepared_stats["denied_bytes"] += 4096
+                        prepared_stats["retained_bytes"] += 4096
+                        prepared_stats["peak_denied_entries"] = len(denied_keys)
+                        prepared_stats["peak_denied_bytes"] = prepared_stats["denied_bytes"]
+                        prepared_stats["peak_bytes"] = prepared_stats["retained_bytes"]
+                job["prepared"] = None
+                if kernel != "eager":
+                    used = solver.get("kernel", "eager")
+                    kernel_counts[used] = kernel_counts.get(used, 0) + 1
+                block_converged = bool(solver["converged"])
+                if not block_converged and (nonconvergence_policy != "continue" or solver.get("reason") != "maxiter"):
+                    raise RuntimeError("conditional block did not converge")
+                core, change, owned_observed = solved["core"], solved["change"], solved["owned_observed"]
+                maximum = max(maximum, change)
+                if observer is not None:
+                    telemetry_started = time.perf_counter()
+                    delta, selected = solved.pop("delta"), None
+                    try:
+                        assert advice_state is not None and block_started is not None
+                        selected = delta[owned_observed]
+                        square_sum = float(np.sum(selected * selected, dtype=np.float64))
+                        cumulative = advice_state["observed_sum_sq"] + square_sum
+                        if not math.isfinite(cumulative):
+                            raise ArithmeticError("nonfinite advisory sum of squares")
+                        advice_state["observed_sum_sq"] = cumulative
+                        advice_state["observed_count"] += int(selected.size)
+                        if selected.size:
+                            local_max = float(np.max(abs(selected)))
+                            advice_state["observed_max_update"] = max(
+                                advice_state["observed_max_update"] or 0.0, local_max
+                            )
+                            # One representative per block, bounded deterministic rank.
+                            ij = np.asarray(np.unravel_index(int(owned_observed.argmax()), core.shape)) + job["low"]
+                            rank = hashlib.sha256(key.astype("<i8").tobytes()).hexdigest()
+                            candidate = dict(node=int(np.ravel_multi_index(tuple(ij), shape)), rank=rank)
+                            advice_state["candidates"] = sorted(
+                                advice_state["candidates"] + [candidate], key=lambda value: value["rank"]
+                            )[:32]
+                        advice_state["next_block"] = block + 1
+                        advice_state["control_s"] += time.perf_counter() - telemetry_started
+                        advice_state["work_s"] += (
+                            time.perf_counter() - block_started - (boundary_s - block_boundary_start)
+                        )
+                    except Exception as error:
+                        observer_error(error)
+                        advice_state = None
+                        observer = None
+                    finally:
+                        del selected, delta
+                next_completed = list(completed)
+                if block + 1 == len(ordered):
+                    stats = dict(sweep=sweep, cores=len(ordered), max_core_update=maximum)
+                    if coarse_factor is not None:
+                        opened = progress.get("coarse") or {}
+                        stats.update(relative_residual=opened.get("relative_residual"), coarse_s=opened.get("seconds"))
+                    next_completed.append(stats)
+                # Report precision loss separately from the pre-encoding local gate.
+                pending = dict(
+                    sweep=sweep,
+                    next_block=block + 1,
+                    sweep_max_update=maximum,
+                    completed_sweeps=next_completed,
+                    source_receipts=seen,
+                    nonconverged_solves=nonconverged + (not block_converged),
+                    solver=dict(solver, scope="pre_encoding_local_solve"),
+                    core_max_update=change,
+                    decoded_fixed_value_error_max=solved["fixed_error"],
+                    global_converged=False,
+                    physical_acceptance=False,
+                    **{k: progress[k] for k in ("coarse", "coarse_operator") if k in progress},
+                )
+                admitted()
+                if observer is None:
+                    commit = store.commit(key, core, pending, owned_observed)
+                else:
+
+                    def prepare(event):
+                        observed_at = time.perf_counter()
+                        try:
+                            observer.prepare(event, deepcopy(advice_state))
+                        finally:
+                            advice_state["control_s"] += time.perf_counter() - observed_at
+
+                    commit = store.commit(key, core, pending, owned_observed, prepare=prepare)
+                    if commit["prepare_error"]:
+                        observer_error(RuntimeError(commit["prepare_error"]))
+                stored_bytes = commit["stored_bytes"]
+                progress, completed = pending, next_completed
+                nonconverged = pending["nonconverged_solves"]
+                if block + 1 == len(ordered):
+                    completed_advice()
+                    if coarse_factor is not None:
+                        coarse_status.update(stage="done", next_block=len(ordered))
+                    # Publish the finished sweep while the next one starts from memory.
+                    store.flush(wait=False)
+                emit("RUNNING", phase="checkpointed")
+
+            def colour_batch(sweep, start, end):
+                """Solve blocks ``start:end`` (one colour) against the field as it was before them.
+
+                Every read of the batch happens before its first commit, and commits follow block
+                order, so the field does not depend on how many workers ran or in which order the
+                solves finished. Up to ``2 * local_workers`` prepared blocks wait for a worker.
+                """
+                nonlocal warm
+                solved: dict[int, dict[str, Any]] = {}
+                jobs: dict[int, dict[str, Any]] = {}
+                if local_workers == 1:
+                    for block in range(start, end):
+                        job = prepare_block(sweep, block, batch[block], gate=False)
+                        solved[block] = solve_block(job)
+                        jobs[block] = dict(
+                            job,
+                            target=None,
+                            weights=None,
+                            observed=None,
+                            current=None,
+                            rows=None,
+                            rows_reader=None,
+                            fixed_values=None,
+                        )
+                        del job
+                else:
+                    waiting: deque = deque()
+
+                    def collect():
+                        block, future = waiting.popleft()
+                        solved[block] = future.result()
+                        jobs[block].update(
+                            target=None,
+                            weights=None,
+                            observed=None,
+                            current=None,
+                            rows=None,
+                            rows_reader=None,
+                            fixed_values=None,
+                        )
+
+                    for block in range(start, end):
+                        job = prepare_block(sweep, block, batch[block], gate=False)
+                        jobs[block] = job
+                        waiting.append((block, pool.submit(worker, job)))
+                        del job
+                        # The first solve of a process runs alone: kernels and probes initialise once.
+                        while waiting and (not warm or len(waiting) >= 2 * local_workers):
+                            collect()
+                            warm = True
+                    while waiting:
+                        collect()
+                for block in range(start, end):
+                    commit_block(sweep, jobs.pop(block), solved.pop(block), None, boundary_s)
+                return None
+
+            store_lock = threading.Lock()
+
+            def locked_nodes(flat):
+                with store_lock:
+                    return store.nodes(flat)
+
+            worker_state = threading.local()
+            worker_slots = itertools.count()
+            warm = False
+            pool = ThreadPoolExecutor(local_workers, thread_name_prefix="block-solve") if local_workers > 1 else None
+
+            def worker(job):
+                slot = getattr(worker_state, "slot", None)
+                if slot is None:
+                    slot = worker_state.slot = next(worker_slots)
+                return solve_block(job, slot)
+
             try:
                 if first_block == len(ordered):
                     completed_advice()
@@ -818,253 +1220,33 @@ def solve_blocks(
                         finished = coarse_phase(sweep)
                         if finished is not None:
                             return finished
-                    for block in range(first_block if sweep == first_sweep else 0, len(ordered)):
+                    begin = first_block if sweep == first_sweep else 0
+                    if colours:
+                        for start, end in zip(batch_starts[:-1], batch_starts[1:]):
+                            if end <= begin:
+                                continue
+                            if stopped():
+                                return emit("CHECKPOINTED_STOP")
+                            colour_batch(sweep, start, end)
+                        continue
+                    for block in range(begin, len(ordered)):
                         block_started = time.perf_counter() if observer is not None else None
                         block_boundary_start = boundary_s
-                        if stopped():
+                        job = prepare_block(sweep, block, block, gate=True)
+                        if isinstance(job, str):
                             return emit("CHECKPOINTED_STOP")
-                        admitted()
-                        key = ordered[block]
-                        low, high, lo, hi = bounds(key)
-                        crop_shape = tuple(map(int, hi - lo))
-                        emit("RUNNING", phase="observations", active_sweep=sweep, active_block=block)
-                        fetched = None
-                        if prefetch is not None and prefetch.available:
-                            if prefetch.pending is None:
-                                prefetch.submit(lo, hi)
-                            fetched = prefetch.receive(lo, hi)
-                        if fetched is None:
-                            values = _observations(load_observations(lo, hi), crop_shape)
-                        else:
-                            values = _observations(fetched, crop_shape)
-                            if not parity:
-                                primary = _observations(load_observations(lo, hi), crop_shape)
-                                if (
-                                    any(
-                                        not np.array_equal(_numpy(a), _numpy(b))
-                                        for a, b in zip(values[:3], primary[:3])
-                                    )
-                                    or values[3] != primary[3]
-                                ):
-                                    raise ValueError("primary/secondary observation parity failed")
-                                parity = True
-                                del primary
-                            prefetched += 1
-                        target, weights, observed, receipts = values
-                        _record_sources(seen, receipts)
-                        if prefetch is not None and prefetch.available and block + 1 < len(ordered):
-                            _, _, next_lo, next_hi = bounds(ordered[block + 1])
-                            prefetch.submit(next_lo, next_hi)
-                        current = store.read(lo, hi)
-                        reader = store.nodes
-                        if correction is not None:
-                            current += pending_correction(lo, hi, block)
-                            reader = corrected_nodes(block)
-                            coarse_status.update(stage="apply", next_block=block)
-                        if constraints is None:
-                            rows = None
-                        elif isinstance(constraints, StencilConstraints):
-                            rows = constraints.restrict(lo, hi, reader)
-                        else:
-                            rows = constraints(lo, hi, reader)
-                        if rows is not None and not isinstance(rows, QuadraticConstraints):
-                            raise ValueError("constraint provider must return local QuadraticConstraints")
-                        fixed_values = np.full(crop_shape, np.nan)
-                        for axis in range(3):
-                            for side, internal in ((0, lo[axis] > 0), (-1, hi[axis] < shape[axis])):
-                                if internal:
-                                    plane: list[slice | int] = [slice(None)] * 3
-                                    plane[axis] = side
-                                    fixed_values[tuple(plane)] = current[tuple(plane)]
-                        if fixed is None:
-                            if not lo.any():
-                                fixed_values[0, 0, 0] = 0.0
-                        else:
-                            declared = np.asarray(fixed(lo, hi))
-                            if (
-                                declared.shape != crop_shape
-                                or declared.dtype.kind not in "iuf"
-                                or np.isinf(declared).any()
-                            ):
-                                raise ValueError("invalid fixed-value observation")
-                            declared = declared.astype(np.float64)
-                            label = "fixed:" + ",".join(map(str, (*lo, *hi)))
-                            _record_sources(seen, {label: hashlib.sha256(declared.tobytes()).hexdigest()})
-                            valid = np.isfinite(declared)
-                            fixed_values[valid] = declared[valid]
-                        if stopped():
-                            return emit("CHECKPOINTED_STOP")
-                        admitted()
-                        emit("RUNNING", phase="solving", active_sweep=sweep, active_block=block)
-                        token = "static" if constraints is None or isinstance(constraints, StencilConstraints) else None
-                        key_provider = getattr(constraints, "prepared_key", None)
-                        if prepared_cache_bytes and callable(key_provider):
-                            token = key_provider(lo, hi)
-                            if token is not None and (not isinstance(token, str) or len(token) > 256):
-                                raise ValueError("prepared_key must return a string of at most 256 characters or None")
-                        prepared_key = (*map(int, (*lo, *hi)), token)
-                        prepared = prepared_cache.get(prepared_key)
-                        if prepared is not None:
-                            prepared_stats["hits"] += 1
-                        else:
-                            prepared_stats["builds"] += 1
-                            if prepared_cache_bytes and token is not None:
-                                if prepared_key in denied_keys:
-                                    prepared_stats["skipped_snapshots"] += 1
-                                else:
-                                    prepared = PreparedField()
-                        result, solver = solve_field(
-                            target,
-                            weights,
-                            spacing,
-                            constraints=rows,
-                            fixed=fixed_values,
-                            initial=current,
-                            device=device,
-                            dtype=dtype,
-                            preconditioner=preconditioner,
-                            kernel=kernel,
-                            rtol=rtol,
-                            maxiter=maxiter,
-                            return_tensor=True,
-                            prepared=prepared,
-                        )
-                        if prepared is not None and prepared_key not in prepared_cache:
-                            retained = prepared.retained_bytes + 4096  # Bounds key and cache-container overhead.
-                            if retained <= prepared_cache_bytes - prepared_stats["retained_bytes"]:
-                                prepared_cache[prepared_key] = prepared
-                                prepared_stats["retained_bytes"] += retained
-                                prepared_stats["entries"] = len(prepared_cache)
-                                prepared_stats["peak_bytes"] = prepared_stats["retained_bytes"]
-                                prepared_stats["peak_entries"] = len(prepared_cache)
-                            elif 4096 <= prepared_cache_bytes - prepared_stats["retained_bytes"]:
-                                denied_keys.add(prepared_key)
-                                prepared_stats["denied_entries"] = len(denied_keys)
-                                prepared_stats["denied_bytes"] += 4096
-                                prepared_stats["retained_bytes"] += 4096
-                                prepared_stats["peak_denied_entries"] = len(denied_keys)
-                                prepared_stats["peak_denied_bytes"] = prepared_stats["denied_bytes"]
-                                prepared_stats["peak_bytes"] = prepared_stats["retained_bytes"]
-                        prepared = None
-                        if kernel != "eager":
-                            used = solver.get("kernel", "eager")
-                            kernel_counts[used] = kernel_counts.get(used, 0) + 1
-                        block_converged = bool(solver["converged"])
-                        if not block_converged and (
-                            nonconvergence_policy != "continue" or solver.get("reason") != "maxiter"
-                        ):
-                            raise RuntimeError("conditional block did not converge")
-                        owned = tuple(slice(int(a), int(b)) for a, b in zip(low - lo, high - lo))
-                        core = _numpy(result[owned])
-                        delta = core - current[owned]
-                        change = float(np.max(abs(delta)))
-                        if observer is None:
-                            del delta
-                        maximum = max(maximum, change)
-                        owned_observed = _numpy(observed[owned])
-                        if observer is not None:
-                            telemetry_started = time.perf_counter()
-                            selected = None
-                            try:
-                                assert advice_state is not None and block_started is not None
-                                selected = delta[owned_observed]
-                                square_sum = float(np.sum(selected * selected, dtype=np.float64))
-                                cumulative = advice_state["observed_sum_sq"] + square_sum
-                                if not math.isfinite(cumulative):
-                                    raise ArithmeticError("nonfinite advisory sum of squares")
-                                advice_state["observed_sum_sq"] = cumulative
-                                advice_state["observed_count"] += int(selected.size)
-                                if selected.size:
-                                    local_max = float(np.max(abs(selected)))
-                                    advice_state["observed_max_update"] = max(
-                                        advice_state["observed_max_update"] or 0.0, local_max
-                                    )
-                                    # One representative per block, bounded deterministic rank.
-                                    ij = np.asarray(np.unravel_index(int(owned_observed.argmax()), core.shape)) + low
-                                    rank = hashlib.sha256(key.astype("<i8").tobytes()).hexdigest()
-                                    candidate = dict(node=int(np.ravel_multi_index(tuple(ij), shape)), rank=rank)
-                                    advice_state["candidates"] = sorted(
-                                        advice_state["candidates"] + [candidate], key=lambda value: value["rank"]
-                                    )[:32]
-                                advice_state["next_block"] = block + 1
-                                advice_state["control_s"] += time.perf_counter() - telemetry_started
-                                advice_state["work_s"] += (
-                                    time.perf_counter() - block_started - (boundary_s - block_boundary_start)
-                                )
-                            except Exception as error:
-                                observer_error(error)
-                                advice_state = None
-                                observer = None
-                            finally:
-                                del selected, delta
-                        next_completed = list(completed)
-                        if block + 1 == len(ordered):
-                            stats = dict(sweep=sweep, cores=len(ordered), max_core_update=maximum)
-                            if coarse_factor is not None:
-                                opened = progress.get("coarse") or {}
-                                stats.update(
-                                    relative_residual=opened.get("relative_residual"),
-                                    coarse_s=opened.get("seconds"),
-                                )
-                            next_completed.append(stats)
-                        # Report precision loss separately from the pre-encoding local gate.
-                        fixed_error = _decoded_anchor_error(core, fixed_values[owned])
-                        pending = dict(
-                            sweep=sweep,
-                            next_block=block + 1,
-                            sweep_max_update=maximum,
-                            completed_sweeps=next_completed,
-                            source_receipts=seen,
-                            nonconverged_solves=nonconverged + (not block_converged),
-                            solver=dict(solver, scope="pre_encoding_local_solve"),
-                            core_max_update=change,
-                            decoded_fixed_value_error_max=fixed_error,
-                            global_converged=False,
-                            physical_acceptance=False,
-                            **{k: progress[k] for k in ("coarse", "coarse_operator") if k in progress},
-                        )
-                        admitted()
-                        if observer is None:
-                            commit = store.commit(key, core, pending, owned_observed)
-                        else:
-
-                            def prepare(event):
-                                observed_at = time.perf_counter()
-                                try:
-                                    observer.prepare(event, deepcopy(advice_state))
-                                finally:
-                                    advice_state["control_s"] += time.perf_counter() - observed_at
-
-                            commit = store.commit(key, core, pending, owned_observed, prepare=prepare)
-                            if commit["prepare_error"]:
-                                observer_error(RuntimeError(commit["prepare_error"]))
-                        stored_bytes = commit["stored_bytes"]
-                        progress, completed = pending, next_completed
-                        nonconverged = pending["nonconverged_solves"]
-                        if block + 1 == len(ordered):
-                            completed_advice()
-                            if coarse_factor is not None:
-                                coarse_status.update(stage="done", next_block=len(ordered))
-                            # Publish the finished sweep while the next one starts from memory.
-                            store.flush(wait=False)
-                        emit("RUNNING", phase="checkpointed")
-                        del (
-                            target,
-                            weights,
-                            observed,
-                            values,
-                            fetched,
-                            current,
-                            rows,
-                            result,
-                            core,
-                            fixed_values,
-                            owned_observed,
-                        )
+                        solved = solve_block(job)
+                        commit_block(sweep, job, solved, block_started, block_boundary_start)
+                        del job, solved
                 return emit("SWEEP_BUDGET_REACHED")
             except Exception as error:
+                if pool is not None:
+                    pool.shutdown(wait=True, cancel_futures=True)  # No solve outlives the failure.
                 emit("RESOURCE_UNAVAILABLE" if isinstance(error, ResourceUnavailable) else "FAILED", error=str(error))
                 raise
+            finally:
+                if pool is not None:
+                    pool.shutdown(wait=True, cancel_futures=True)
     finally:
         release_prepared()
         if prefetch is not None:

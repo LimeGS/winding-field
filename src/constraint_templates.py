@@ -2,6 +2,7 @@
 
 import hashlib
 import math
+import threading
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -181,9 +182,21 @@ class StencilConstraints:
             self._postings = (_owned(values[order]), _owned(slots[order] // self._nodes.shape[1]))
             self.spatial_index_nbytes = 4096 + sum(a.nbytes for a in self._postings)
         self.stats = dict(bytes=0, hits=0, misses=0, evictions=0)
+        # Guards the template cache only; templates are built outside it, so several threads
+        # can build templates of different boxes at once.
+        self._lock = threading.Lock()
         self._entries: OrderedDict[tuple[tuple[int, ...], tuple[int, ...]], tuple[_Template | None, int]] = (
             OrderedDict()
         )
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        del state["_lock"]
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
 
     def save(self, path: str | Path) -> None:
         """Write immutable row snapshots to a new NPZ at exactly ``path``.
@@ -392,20 +405,20 @@ class StencilConstraints:
         ):
             raise ValueError("restriction bounds outside grid")
         key = (tuple(map(int, low)), tuple(map(int, high)))
-        if key in self._entries:
-            self.stats["hits"] += 1
-            template, _ = self._entries[key]
-            self._entries.move_to_end(key)
-        else:
+        with self._lock:
+            if key in self._entries:
+                self.stats["hits"] += 1
+                template, _ = self._entries[key]
+                self._entries.move_to_end(key)
+                return template
             self.stats["misses"] += 1
-            template = self._build(low, high)
-            if (
-                template is not None
-                and template.nodes.size
-                and getattr(read_nodes, "__func__", None) is BlockStore.nodes
-            ):
-                template.gather_plan = getattr(read_nodes, "__self__").prepare_nodes(template.nodes)
-                template.nbytes += template.gather_plan.nbytes
+        template = self._build(low, high)
+        if template is not None and template.nodes.size and getattr(read_nodes, "__func__", None) is BlockStore.nodes:
+            template.gather_plan = getattr(read_nodes, "__self__").prepare_nodes(template.nodes)
+            template.nbytes += template.gather_plan.nbytes
+        with self._lock:
+            if key in self._entries:  # Another thread built the same box meanwhile.
+                return self._entries[key][0]
             size = 4096 if template is None else template.nbytes
             if size <= self.max_cache_bytes and (
                 self.template_cache_policy == "lru" or self.stats["bytes"] + size <= self.max_cache_bytes

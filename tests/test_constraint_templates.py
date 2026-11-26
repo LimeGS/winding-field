@@ -338,3 +338,43 @@ def test_stencil_archive_rejects_invalid_cache_budget(tmp_path, budget):
     np.savez(path, **stencil_archive_arrays())
     with pytest.raises(ValueError, match="budget"):
         implementation().load(path, cache_bytes=budget)
+
+
+def test_templates_built_on_several_threads_match_serial_ones_and_pickle():
+    import itertools
+    import pickle
+    from concurrent.futures import ThreadPoolExecutor
+
+    stencils = implementation()
+    rng = np.random.default_rng(7)
+    shape = (12, 10, 14)
+    a = rng.uniform(0, 1, (300, 3)) * (np.array(shape[::-1]) - 1)
+    b = rng.uniform(0, 1, (300, 3)) * (np.array(shape[::-1]) - 1)
+
+    def make():
+        return stencils.pairs(a, b, np.zeros(3), np.ones(3), shape, weight=2.0, cache_bytes=10**8)
+
+    boxes = [
+        (np.array(k) * 4, np.minimum(np.array(k) * 4 + 6, shape))
+        for k in itertools.product(range(3), range(3), range(4))
+    ]
+    values = np.arange(np.prod(shape), dtype=float)
+
+    def read(flat):
+        return values[np.asarray(flat)]
+
+    def dense(rows):
+        return None if rows is None else (rows.matrix.toarray(), np.asarray(rows.targets))
+
+    serial = [dense(make().restrict(lo, hi, read)) for lo, hi in boxes]
+    shared = make()
+    with ThreadPoolExecutor(6) as pool:
+        threaded = list(pool.map(lambda box: dense(shared.restrict(*box, read)), boxes * 2))
+    for got, want in zip(threaded, serial * 2):
+        assert (got is None) == (want is None)
+        if got is not None:
+            np.testing.assert_array_equal(got[0], want[0])
+            np.testing.assert_array_equal(got[1], want[1])
+    assert shared.stats["misses"] + shared.stats["hits"] == 2 * len(boxes)
+    clone = pickle.loads(pickle.dumps(make()))  # The lock is not state: a fresh one per copy.
+    assert clone.digest == shared.digest and dense(clone.restrict(*boxes[0], read)) is not None

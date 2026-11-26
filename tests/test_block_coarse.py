@@ -17,7 +17,7 @@ from field_sources import NpyObservations
 from field_store import BlockStore
 
 
-def problem(tmp_path, shape=(20, 16, 16), seed=0, pairs=True):
+def problem(tmp_path, shape=(20, 16, 16), seed=0, pairs=True, reach=3):
     rng = np.random.default_rng(seed)
     z, y, x = np.indices(shape)
     r = np.hypot(y - shape[1] / 2 + 0.5, x - shape[2] / 2 + 0.5)
@@ -38,7 +38,7 @@ def problem(tmp_path, shape=(20, 16, 16), seed=0, pairs=True):
     if pairs:
         start = rng.choice(np.flatnonzero(sheets), size=40, replace=False)
         a = np.stack(np.unravel_index(start, shape), 1)
-        b = np.clip(a + rng.integers(-3, 4, size=a.shape), 0, np.array(shape) - 1)
+        b = np.clip(a + rng.integers(-reach, reach + 1, size=a.shape), 0, np.array(shape) - 1)
         constraints = StencilConstraints.pairs(
             a[:, ::-1].astype(float), b[:, ::-1].astype(float), origin, spacing, shape, weight=5.0, cache_bytes=10**6
         )
@@ -248,3 +248,70 @@ def test_threaded_residual_pass_leaves_sparse_invariant_checks_off(tmp_path):
         base = problem(tmp_path / str(seed), seed=seed)
         run(tmp_path / f"run{seed}", base, 8, halo=2, sweeps=1, coarse_factor=4, coarse_workers=8)
         assert not torch.sparse.check_sparse_tensor_invariants.is_enabled()
+
+
+COLOURED = dict(halo=2, coarse_factor=4, checkpoint="sweep", cache_bytes=10**8, colours=8)
+
+
+def chunks(root):
+    return {k: v["sha256"] for k, v in field(root)[1]["chunks"].items()}
+
+
+def test_colour_batches_do_not_depend_on_the_worker_count(tmp_path):
+    # Long pairs couple blocks of one colour: they must read the field as it was before the batch.
+    base = problem(tmp_path, reach=12)
+    for name, workers in (("one", 1), ("three", 3)):
+        result = run(tmp_path / name, base, 8, sweeps=3, local_workers=workers, **COLOURED)
+        assert result["status"] == "SWEEP_BUDGET_REACHED"
+    assert chunks(tmp_path / "one") == chunks(tmp_path / "three")
+    np.testing.assert_array_equal(field(tmp_path / "one")[0], field(tmp_path / "three")[0])
+    meta = field(tmp_path / "one")[1]
+    assert meta["identity"]["colours"] == 8
+    run(tmp_path / "plain", base, 8, sweeps=1, halo=2, coarse_factor=4)
+    plain = field(tmp_path / "plain")[1]["identity"]
+    assert "colours" not in plain and plain["order_sha256"] == meta["identity"]["order_sha256"]
+
+
+def test_colour_batches_reach_the_single_block_solution(tmp_path):
+    base = problem(tmp_path, reach=12)
+    run(tmp_path / "exact", base, 32, halo=0, sweeps=1)
+    exact, _ = field(tmp_path / "exact")
+    errors = {}
+    for name, options in (("sequential", dict(halo=2, coarse_factor=4)), ("colours", dict(COLOURED, local_workers=2))):
+        run(tmp_path / name, base, 8, sweeps=10, **options)
+        errors[name] = float(np.abs(field(tmp_path / name)[0] - exact).max())
+    # Same order of accuracy as the sequential sweep after the same number of sweeps.
+    assert errors["sequential"] < 0.01 and errors["colours"] < 1.5 * errors["sequential"], errors
+
+
+def test_stop_between_colour_batches_resumes_to_the_same_field(tmp_path):
+    base = problem(tmp_path, reach=12)
+    run(tmp_path / "straight", base, 8, sweeps=2, local_workers=2, **COLOURED)
+    calls = {"n": 0}
+
+    def stop():
+        calls["n"] += 1
+        return calls["n"] in (3, 30, 41)
+
+    root, stops = tmp_path / "stopped", 0
+    result = run(root, base, 8, sweeps=2, local_workers=2, stop=stop, **COLOURED)
+    while result["status"] == "CHECKPOINTED_STOP":
+        stops += 1
+        result = run(root, base, 8, sweeps=2, local_workers=2, stop=stop, resume=True, **COLOURED)
+    assert stops == 3 and result["status"] == "SWEEP_BUDGET_REACHED"
+    assert chunks(root) == chunks(tmp_path / "straight")
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [
+        (dict(COLOURED, checkpoint="block"), "checkpoint='sweep'"),
+        (dict(COLOURED, halo=9), "halo <= chunk"),
+        (dict(COLOURED, colours=4), "colours must be"),
+        (dict(halo=2, local_workers=2), "colour batches"),
+        (dict(halo=2, local_devices=["cpu"]), "colour batches"),
+    ],
+)
+def test_invalid_colour_options_are_rejected(tmp_path, options, message):
+    with pytest.raises(ValueError, match=message):
+        run(tmp_path / "bad", problem(tmp_path, pairs=False), 8, **options)

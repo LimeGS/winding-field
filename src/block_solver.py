@@ -604,15 +604,17 @@ def solve_blocks(
                 """``P e`` on the crop nodes whose chunk this sweep has not committed yet (else 0)."""
                 out = np.zeros(tuple(map(int, hi - lo)))
                 declared = global_fixed(lo, hi, out.shape)
+                pending = False
                 for key in itertools.product(*(range(a // chunk, (b - 1) // chunk + 1) for a, b in zip(lo, hi))):
                     if visit[key] < block:
                         continue
                     a = np.maximum(np.array(key) * chunk, lo)
                     b = np.minimum((np.array(key) + 1) * chunk, hi)
-                    zyx = np.stack([g.ravel() for g in np.meshgrid(*map(np.arange, a, b), indexing="ij")], 1)
-                    region = tuple(slice(int(x - o), int(y - o)) for x, y, o in zip(a, b, lo))
-                    free = ~np.isfinite(declared[region])
-                    out[region] = (space.rows(zyx, free.ravel()) @ correction).reshape(free.shape)
+                    out[tuple(slice(int(x - o), int(y - o)) for x, y, o in zip(a, b, lo))] = 1.0
+                    pending = True
+                if pending:
+                    out *= space.prolong_box(lo, hi, correction)
+                    out[np.isfinite(declared)] = 0.0
                 return out
 
             def corrected_nodes(block):
@@ -677,8 +679,7 @@ def solve_blocks(
                     r_core, r0_core = r[owned], r0[owned]
                     norm_sq += float(np.sum(r_core * r_core))
                     norm0_sq += float(np.sum(r0_core * r0_core))
-                    zyx = np.stack([g.ravel() for g in np.meshgrid(*map(np.arange, low, high), indexing="ij")], 1)
-                    rhs += space.rows(zyx, ~mask[owned].ravel()).T @ r_core.ravel()
+                    space.restrict_box(low, high, r_core, ~mask[owned], rhs)
                     if assemble:
                         space.add_block(lo, low, high, weights, ~mask, rows, exterior=exterior_terms(lo, hi, rows))
                     del target, weights, values, rows, r, r0

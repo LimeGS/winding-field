@@ -5,6 +5,15 @@ versions follow the GitHub releases.
 
 ## [Unreleased]
 
+### Added
+- `solve_blocks(colours=8)` (opt-in): colour-batched sweeps. Blocks are grouped by the
+  parity of their chunk key (2 x 2 x 2); every block of a batch reads the field as it was
+  before the batch (pairs and coarse correction included) and the batch commits in block
+  order. `local_workers=N` solves N blocks of a batch at once on threads with their own
+  CUDA streams while the main thread prepares the next ones; `local_devices` spreads them
+  over GPUs. The colouring is part of the run identity; the worker count and devices are
+  not and do not change the field. Requires `checkpoint='sweep'` and `halo <= chunk`.
+
 ### Changed
 - AMG CPU setup is multithreaded: `assemble_free_operator` and the free-node restriction
   build row blocks on all available CPUs (`threads=` on `assemble_free_operator` and

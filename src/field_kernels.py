@@ -62,7 +62,45 @@ def unavailable_reason(device: torch.device, preconditioner: str, has_pairs: boo
         _kernels()
     except ImportError:
         return "triton is not installed"
-    return None
+    return _probe(device)
+
+
+_probed: dict[str, str | None] = {}
+
+
+def _probe(device: torch.device) -> str | None:
+    """Compile and launch the three kernels once per device type; a failure is a fallback.
+
+    Triton compiles on first launch, so a host without a compiler or with an unsupported
+    Triton release would otherwise fail in the middle of the first solve.
+    """
+    if device.type not in _probed:
+        try:
+            one = torch.ones((2, 2, 2), dtype=torch.float64, device=device)
+            pcg(
+                x=torch.zeros_like(one),
+                b=one.clone(),
+                r=one.clone(),
+                z=one.clone(),
+                p=one.clone(),
+                ap=torch.zeros_like(one),
+                rz=8.0,
+                inverse=one.clone(),
+                weights=one.clone(),
+                mask=torch.zeros((2, 2, 2), dtype=torch.bool, device=device),
+                rw=0.0,
+                extra=None,
+                preconditioner=None,
+                eager_matvec=lambda v: v,
+                norm=lambda r: float(torch.linalg.vector_norm(r)),
+                scale=1.0,
+                rtol=0.0,
+                maxiter=1,
+            )
+            _probed[device.type] = None
+        except Exception as error:  # Any compiler or runtime failure means "not available here".
+            _probed[device.type] = f"fused kernels failed to compile ({type(error).__name__})"
+    return _probed[device.type]
 
 
 def _kernels() -> dict[str, Any]:

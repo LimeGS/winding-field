@@ -60,6 +60,7 @@ class CoarseSpace:
         self._pending_nnz = 0
         self.assembled = False
         self.solve: Callable[[np.ndarray], np.ndarray] | None = None
+        self.last: dict | None = None  # Iterations and convergence of the last iterative solve.
         self.info: dict | None = None
 
     @property
@@ -308,7 +309,16 @@ class CoarseSpace:
             )
 
             def inner(rhs):
-                out, _ = spla.cg(reduced, rhs, M=op, rtol=1e-8, maxiter=500)
+                count = [0]
+
+                def step(_):
+                    count[0] += 1
+
+                out, code = spla.cg(reduced, rhs, M=op, rtol=1e-8, maxiter=500, callback=step)
+                if code < 0 or not np.isfinite(out).all():
+                    raise RuntimeError("coarse solve broke down")
+                # A correction short of the tolerance still reduces the error; report it.
+                self.last = dict(iterations=count[0], converged=code == 0)
                 return out
 
         def solve(rhs: np.ndarray) -> np.ndarray:

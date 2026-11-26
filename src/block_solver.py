@@ -179,6 +179,7 @@ def solve_blocks(
     preconditioner: Literal["jacobi", "amg"] = "jacobi",
     nonconvergence_policy: Literal["fail", "continue"] = "fail",
     device: str = "cpu",
+    kernel: Literal["eager", "fused"] = "eager",
     cache_bytes: int = 0,
     prepared_cache_bytes: int = 0,
     status_policy: Literal["all", "checkpoints"] = "all",
@@ -273,6 +274,7 @@ def solve_blocks(
     prepared_cache: dict[tuple, PreparedField] = {}
     denied_keys: set[tuple] = set()
     prepared = None
+    kernel_counts: dict[str, int] = {}  # Solves per kernel actually used (counted this process).
     prepared_stats = dict(
         budget=0,
         retained_bytes=0,
@@ -302,6 +304,8 @@ def solve_blocks(
             )
         if nonconvergence_policy not in ("fail", "continue"):
             raise ValueError("nonconvergence_policy must be fail or continue")
+        if kernel not in ("eager", "fused"):
+            raise ValueError("kernel must be eager or fused")
         if status_policy not in ("all", "checkpoints"):
             raise ValueError("status_policy must be all or checkpoints")
         prepared_cache_bytes = _integer(prepared_cache_bytes)
@@ -371,6 +375,8 @@ def solve_blocks(
             device=str(device),
             # Jacobi stays implicit so v1 identities (and their checkpoints) are unchanged.
             **({} if preconditioner == "jacobi" else {"preconditioner": preconditioner}),
+            # Fused kernels round differently, so a run never resumes across kernels.
+            **({} if kernel == "eager" else {"kernel": kernel}),
             **({} if coarse_factor is None else {"coarse": dict(kind="trilinear", factor=coarse_factor)}),
         )
         json.dumps(problem, allow_nan=False)
@@ -494,6 +500,7 @@ def solve_blocks(
                     stored_bytes=stored_bytes,
                     cache_stats=dict(store.stats),
                     prepared_cache_stats=dict(prepared_stats),
+                    **({} if kernel == "eager" else {"solver_kernels": dict(kernel_counts)}),
                     prefetched_blocks=prefetched,
                     prefetch_parity=parity,
                     nonconvergence_policy=nonconvergence_policy,
@@ -860,6 +867,7 @@ def solve_blocks(
                             device=device,
                             dtype=dtype,
                             preconditioner=preconditioner,
+                            kernel=kernel,
                             rtol=rtol,
                             maxiter=maxiter,
                             return_tensor=True,
@@ -882,6 +890,9 @@ def solve_blocks(
                                 prepared_stats["peak_denied_bytes"] = prepared_stats["denied_bytes"]
                                 prepared_stats["peak_bytes"] = prepared_stats["retained_bytes"]
                         prepared = None
+                        if kernel != "eager":
+                            used = solver.get("kernel", "eager")
+                            kernel_counts[used] = kernel_counts.get(used, 0) + 1
                         block_converged = bool(solver["converged"])
                         if not block_converged and (
                             nonconvergence_policy != "continue" or solver.get("reason") != "maxiter"

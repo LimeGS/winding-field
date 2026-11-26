@@ -11,6 +11,8 @@ import torch
 from numpy.typing import ArrayLike, NDArray
 from scipy.fft import dctn, dstn, idctn, idstn
 
+import field_kernels
+
 
 class _SpectralPreconditioner:
     """Inverse constant-weight index-space Laplacian on supported free nodes."""
@@ -305,6 +307,7 @@ def solve_field(
     prepared: PreparedField | None = None,
     return_tensor: Literal[False] = False,
     preconditioner: Literal["jacobi", "spectral", "amg"] = "jacobi",
+    kernel: Literal["eager", "fused"] = "eager",
 ) -> tuple[NDArray[np.float32], dict[str, Any]]: ...
 
 
@@ -328,6 +331,7 @@ def solve_field(
     prepared: PreparedField | None = None,
     return_tensor: Literal[False] = False,
     preconditioner: Literal["jacobi", "spectral", "amg"] = "jacobi",
+    kernel: Literal["eager", "fused"] = "eager",
 ) -> tuple[NDArray[np.float64], dict[str, Any]]: ...
 
 
@@ -351,6 +355,7 @@ def solve_field(
     prepared: PreparedField | None = None,
     return_tensor: Literal[True],
     preconditioner: Literal["jacobi", "spectral", "amg"] = "jacobi",
+    kernel: Literal["eager", "fused"] = "eager",
 ) -> tuple[torch.Tensor, dict[str, Any]]: ...
 
 
@@ -374,6 +379,7 @@ def solve_field(
     prepared: PreparedField | None = None,
     return_tensor: bool = False,
     preconditioner: Literal["jacobi", "spectral", "amg"] = "jacobi",
+    kernel: Literal["eager", "fused"] = "eager",
 ) -> tuple[NDArray[np.float32] | NDArray[np.float64] | torch.Tensor, dict[str, Any]]: ...
 
 
@@ -397,6 +403,7 @@ def solve_field(
     prepared: PreparedField | None = None,
     return_tensor: bool = False,
     preconditioner: Literal["jacobi", "spectral", "amg"] = "jacobi",
+    kernel: Literal["eager", "fused"] = "eager",
 ) -> tuple[NDArray[np.float32] | NDArray[np.float64] | torch.Tensor, dict[str, Any]]:
     """Return a ZYX field and a JSON-compatible solver receipt (float32 by default).
 
@@ -435,6 +442,12 @@ def solve_field(
     or a zero correction for all-fixed grids. Other masks are rejected. Its
     weight is the float64 nodal mean; it changes neither the system nor spacing.
     Prepared reuse requires the same policy and full effective spectral mask.
+
+    kernel='fused' runs the PCG iterations with the Triton kernels of field_kernels
+    (CUDA; Jacobi or AMG; no discrete pairs) and records kernel='fused-v1' in the receipt.
+    It solves the same system with the same stopping rules; iterates differ from eager at
+    round-off level. Unsupported solves fall back to eager and record kernel='eager' with
+    kernel_fallback. The final residual is always measured with the eager operator.
     """
     start = time.perf_counter()
     if dtype not in ("float32", "float64"):
@@ -445,6 +458,8 @@ def solve_field(
         raise ValueError("spectral preconditioning requires CPU float64")
     if type(return_tensor) is not bool:
         raise ValueError("return_tensor must be boolean")
+    if kernel not in field_kernels.KERNELS:
+        raise ValueError("kernel must be eager or fused")
     scalar = torch.float64 if dtype == "float64" else torch.float32
     array = partial(_array, dtype=scalar)
     lam = _scalar(lam, "lam")
@@ -549,9 +564,24 @@ def solve_field(
         spectral = _amg_preconditioner(weight, mask, pairs_t, lam, constraints, rw)
     elif preconditioner == "spectral":
         spectral = _SpectralPreconditioner(weight, mask)
+    fused_fallback = None
+    if kernel == "fused":
+        fused_fallback = field_kernels.unavailable_reason(
+            torch.device(device), preconditioner, operator.pairs is not None
+        )
+    fused = kernel == "fused" and fused_fallback is None
+    # K1 reads nodal weights; reuse the prepared snapshot instead of keeping another copy.
+    fused_weight = (weight if prepared is None else prepared.weights) if fused else None
     del target, weight, ref, diagonal
 
-    ap, scratch, r, z, p = tuple(torch.empty_like(x) for _ in range(5)) if prepared is None else prepared.work
+    if prepared is not None:
+        ap, scratch, r, z, p = prepared.work
+    elif fused:
+        # The fused loop needs no flux scratch; the eager residuals allocate theirs transiently.
+        ap, r, z, p = tuple(torch.empty_like(x) for _ in range(4))
+        scratch = None
+    else:
+        ap, scratch, r, z, p = tuple(torch.empty_like(x) for _ in range(5))
 
     def matvec(value):
         out = operator.matvec(value, out=ap, scratch=scratch)
@@ -576,45 +606,68 @@ def solve_field(
         z.copy_(spectral.apply(r))
     p.copy_(z)
     rz = float(torch.dot(r.view(-1), z.view(-1)))
-    iterations = 0
-    reason = "maxiter"
-    norm = None
-    for _ in range(maxiter):
-        if norm is None:
+    if fused:
+        assert fused_weight is not None
+        iterations, reason = field_kernels.pcg(
+            x=x,
+            b=b,
+            r=r,
+            z=z,
+            p=p,
+            ap=ap,
+            rz=rz,
+            inverse=inverse,
+            weights=fused_weight,
+            mask=mask,
+            rw=rw if has_reference else 0.0,
+            extra=None if extra is None else extra.matvec,
+            preconditioner=spectral,
+            eager_matvec=matvec,
+            norm=_norm,
+            scale=scale,
+            rtol=rtol,
+            maxiter=int(maxiter),
+        )
+    else:
+        iterations = 0
+        reason = "maxiter"
+        norm = None
+        for _ in range(maxiter):
+            if norm is None:
+                norm = _norm(r)
+            if not math.isfinite(norm):
+                reason = "nonfinite_residual"
+                break
+            if norm <= rtol * scale:
+                break
+            matvec(p)
+            curvature = float(torch.dot(p.view(-1), ap.view(-1)))
+            if not math.isfinite(curvature) or not math.isfinite(rz):
+                reason = "nonfinite_curvature"
+                break
+            if curvature <= 0 or rz <= 0:
+                reason = "nonpositive_curvature"
+                break
+            alpha = rz / curvature
+            x.add_(p, alpha=alpha)
+            r.add_(ap, alpha=-alpha)
+            iterations += 1
+            # Recurrence residuals drift in float32: verify, and restart if needed.
             norm = _norm(r)
-        if not math.isfinite(norm):
-            reason = "nonfinite_residual"
-            break
-        if norm <= rtol * scale:
-            break
-        matvec(p)
-        curvature = float(torch.dot(p.view(-1), ap.view(-1)))
-        if not math.isfinite(curvature) or not math.isfinite(rz):
-            reason = "nonfinite_curvature"
-            break
-        if curvature <= 0 or rz <= 0:
-            reason = "nonpositive_curvature"
-            break
-        alpha = rz / curvature
-        x.add_(p, alpha=alpha)
-        r.add_(ap, alpha=-alpha)
-        iterations += 1
-        # Recurrence residuals drift in float32: verify, and restart if needed.
-        norm = _norm(r)
-        restart = norm <= rtol * scale
-        if restart:
-            torch.sub(b, matvec(x), out=r)
-            norm = None
-        if spectral is None:
-            torch.mul(r, inverse, out=z)
-        else:
-            z.copy_(spectral.apply(r))
-        next_rz = float(torch.dot(r.view(-1), z.view(-1)))
-        if restart:
-            p.copy_(z)
-        else:
-            p.mul_(next_rz / rz).add_(z)
-        rz = next_rz
+            restart = norm <= rtol * scale
+            if restart:
+                torch.sub(b, matvec(x), out=r)
+                norm = None
+            if spectral is None:
+                torch.mul(r, inverse, out=z)
+            else:
+                z.copy_(spectral.apply(r))
+            next_rz = float(torch.dot(r.view(-1), z.view(-1)))
+            if restart:
+                p.copy_(z)
+            else:
+                p.mul_(next_rz / rz).add_(z)
+            rz = next_rz
     torch.sub(b, matvec(x), out=r)
     residual = _norm(r) / scale
     converged = math.isfinite(residual) and residual <= rtol
@@ -639,4 +692,8 @@ def solve_field(
             else dict(kind=spectral.kind, alpha=spectral.alpha)
         ),
     )
+    if kernel != "eager":
+        info["kernel"] = field_kernels.KERNEL_VERSION if fused else "eager"
+        if fused_fallback is not None:
+            info["kernel_fallback"] = fused_fallback
     return field, info

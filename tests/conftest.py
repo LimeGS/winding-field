@@ -1,6 +1,7 @@
 """Tiny synthetic observations; only the external Zarr transport is replaced."""
 
 import json
+import os
 import sqlite3
 import sys
 from contextlib import closing
@@ -8,6 +9,11 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
+
+# Without a GPU, the fused solver kernels run in Triton's CPU interpreter (tests only).
+if not torch.cuda.is_available():
+    os.environ.setdefault("TRITON_INTERPRET", "1")
 
 FRAME = "PHercParis4/20260411134726:L2"  # Explicit historical-parameter fixture, never a runtime default.
 CTB = "memory://ct"

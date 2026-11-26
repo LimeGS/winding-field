@@ -25,6 +25,14 @@ checkpoints are unchanged and resume byte-identically.
   once per sweep; the default `"block"` is unchanged.
 - `field_memory.plan_memory`: picks a host-memory tier (`disk`, `field`, `all`) from the
   memory available at start and maps it to the block solver's checkpoint mode.
+- `solve_field`/`solve_blocks(kernel="fused")` (`field_kernels.py`, opt-in): the PCG
+  iterations run as three Triton GPU kernels (stencil + p.Ap, update + dots, direction)
+  instead of ~40 PyTorch ops, for Jacobi and the outer AMG iteration. Same system and
+  stopping rules, deterministic reductions, final residual still measured with the eager
+  operator. The receipt records `kernel` (`fused-v1`, or `eager` + `kernel_fallback` off
+  CUDA, with discrete pairs or `spectral`); `solve_blocks` adds `kernel` to the identity
+  only when fused and reports `solver_kernels`. Eager receipts, identities and checkpoints
+  are unchanged. New optional extra `fused` (Triton; bundled with Linux CUDA PyTorch).
 
 ### Changed
 - AMG Chebyshev smoother: the upper eigenvalue bound is min(scaled row-sum norm,

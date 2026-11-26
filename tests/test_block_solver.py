@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from constraint_templates import StencilConstraints
 from field_prefetch import ObservationPrefetch
@@ -506,3 +507,21 @@ def test_amg_block_run_matches_jacobi_and_is_part_of_identity(tmp_path):
 def test_spectral_block_runs_are_still_rejected(tmp_path):
     with pytest.raises(ValueError, match="'jacobi' or 'amg'"):
         runner()(tmp_path / "spectral", **dict(case(tmp_path), preconditioner="spectral"))
+
+
+def test_fused_block_run_matches_eager_and_is_part_of_identity(tmp_path):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    eager = runner()(tmp_path / "eager", **dict(case(tmp_path), device=device))
+    result = runner()(tmp_path / "fused", **dict(case(tmp_path), kernel="fused", device=device))
+    assert result["local_solves_converged"] is True
+    assert set(result["solver_kernels"]) == {"fused-v1"} and "solver_kernels" not in eager
+    eager_meta, eager_field, observed = state(tmp_path / "eager")
+    fused_meta, fused_field, fused_observed = state(tmp_path / "fused")
+    np.testing.assert_allclose(fused_field, eager_field, atol=1e-6)
+    np.testing.assert_array_equal(fused_observed, observed)
+    assert "kernel" not in eager_meta["identity"]
+    assert fused_meta["identity"]["kernel"] == "fused"
+    with pytest.raises(ValueError):
+        runner()(tmp_path / "fused", resume=True, **dict(case(tmp_path), device=device))
+    with pytest.raises(ValueError, match="kernel must be eager or fused"):
+        runner()(tmp_path / "bad", **dict(case(tmp_path), kernel="triton"))

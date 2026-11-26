@@ -180,14 +180,14 @@ def assemble_free_operator(
                 vals.append(-edge[s:e])
             for ends in (a, b):
                 s, e = np.searchsorted(ends, (lo, hi))
-                diagonal += np.bincount(ends[s:e] - lo, weights=edge[s:e], minlength=hi - lo)
+                diagonal += np.bincount((ends[s:e] - lo).astype(np.intp), weights=edge[s:e], minlength=hi - lo)
         inside = [(ends >= lo) & (ends < hi) for ends, _, _ in couplings]
         for (ends, other, value), selected in zip(couplings, inside):
             rows.append(ends[selected] - lo)
             cols.append(other[selected])
             vals.append(-value[selected])
         for (ends, _, value), selected in zip(couplings, inside):
-            diagonal += np.bincount(ends[selected] - lo, weights=value[selected], minlength=hi - lo)
+            diagonal += np.bincount((ends[selected] - lo).astype(np.intp), weights=value[selected], minlength=hi - lo)
         local = np.arange(hi - lo, dtype=itype)
         rows.append(local)
         cols.append(local + lo)

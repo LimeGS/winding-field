@@ -283,6 +283,20 @@ def test_threaded_setup_gives_the_same_preconditioner():
     assert torch.equal(one.apply(v), four.apply(v))
 
 
+def _csr_bitwise_equal(a, b):
+    return (
+        a.shape == b.shape
+        and torch.equal(a.crow_indices(), b.crow_indices())
+        and torch.equal(a.col_indices(), b.col_indices())
+        and a.values().dtype == b.values().dtype
+        and torch.equal(_bits(a.values()), _bits(b.values()))
+    )
+
+
+def _bits(values):
+    return values.view(torch.int64 if values.element_size() == 8 else torch.int32)
+
+
 def test_galerkin_blocks_give_the_same_coarse_operator():
     _, weights, pairs = _problem(12)
     mask = np.zeros(weights.shape, bool)
@@ -294,13 +308,152 @@ def test_galerkin_blocks_give_the_same_coarse_operator():
     reference = None
     for block_nnz in (1 << 30, 4096, 256):
         coarse = field_amg._galerkin(a, p, block_nnz=block_nnz)
-        assert coarse.is_coalesced()
+        assert coarse.layout == torch.sparse_csr
+        rows = torch.repeat_interleave(torch.arange(coarse.shape[0]), coarse.crow_indices().diff())
+        keys = rows * coarse.shape[1] + coarse.col_indices()
+        assert bool((keys[1:] > keys[:-1]).all())  # sorted and unique, as a coalesced product
         np.testing.assert_allclose(coarse.to_dense().numpy(), dense, rtol=1e-12, atol=1e-9)
         if block_nnz == 4096:
             reference = coarse
-    small = field_amg._galerkin(a, p, block_nnz=4096)
-    assert reference is not None and torch.equal(small.indices(), reference.indices())
-    assert torch.equal(small.values().view(torch.int64), reference.values().view(torch.int64))
+    assert reference is not None and _csr_bitwise_equal(field_amg._galerkin(a, p, block_nnz=4096), reference)
+
+
+@pytest.mark.parametrize("block", [97, 1000, 4096])
+def test_row_blocks_build_the_one_block_hierarchy_bit_for_bit(monkeypatch, block):
+    # torch's own coalesce uses an unstable sort below ~32k entries; with every coalesce on
+    # the stable host path, each entry of a blocked build must be the same left-to-right sum.
+    monkeypatch.setattr(field_amg, "_HOST_COALESCE_MIN", 0)
+    _, weights, pairs = _problem(12)
+    mask = np.zeros(weights.shape, bool)
+    mask[0] = True
+    matrix = field_amg._free_submatrix(
+        field_amg.assemble_free_operator(
+            weights, mask, pairs=pairs, lam=1000.0, constraints=_constraints(weights.shape)
+        ),
+        np.flatnonzero(~mask.ravel()),
+    )
+    kwargs = dict(max_coarse=20, max_levels=5, dense=False)
+    levels, coarsest, complexity = field_amg._torch_hierarchy(matrix, "cpu", block=1 << 30, **kwargs)
+    blocked, coarsest_b, complexity_b = field_amg._torch_hierarchy(matrix, "cpu", block=block, **kwargs)
+    assert len(levels) == len(blocked) >= 2 and complexity == complexity_b
+    assert _csr_bitwise_equal(coarsest, coarsest_b)
+    for (a, p), (a_b, p_b) in zip(levels, blocked):
+        assert _csr_bitwise_equal(a, a_b) and _csr_bitwise_equal(p, p_b)
+
+
+def test_blocked_sums_run_left_to_right_at_any_block_size(monkeypatch):
+    # One coalesce of a whole large operator sums every entry left to right in storage order
+    # (stable host path). Small blocks must do the same, although torch's own coalesce of
+    # fewer than ~32k entries sorts unstably.
+    _, weights, pairs = _problem(12)
+    matrix = field_amg.assemble_free_operator(
+        weights, np.zeros(weights.shape, bool), pairs=pairs, lam=1000.0, constraints=_constraints(weights.shape)
+    )
+    a = field_amg._torch_csr(matrix, "cpu", torch.float64)
+    aggregates = field_amg._aggregate(a, 0.25, 2, seed=0)
+    size = int(aggregates.max()) + 1
+    default = field_amg._HOST_COALESCE_MIN
+    monkeypatch.setattr(field_amg, "_HOST_COALESCE_MIN", 0)
+    reduced = field_amg._galerkin_aggregate(a, aggregates, size, block=1 << 30)
+    prolong = field_amg._smoothed_prolongator(a, aggregates, size, 0.2, block=1 << 30)
+    monkeypatch.setattr(field_amg, "_HOST_COALESCE_MIN", default)
+    for block in (97, 1000):
+        assert _csr_bitwise_equal(field_amg._galerkin_aggregate(a, aggregates, size, block=block), reduced)
+        assert _csr_bitwise_equal(field_amg._smoothed_prolongator(a, aggregates, size, 0.2, block=block), prolong)
+
+
+def _reference_matching(a, theta, seed, rounds=6):
+    """The one-shot matching that the blocked one must reproduce, run on one thread."""
+    n = a.shape[0]
+    crow = a.crow_indices()
+    rows = torch.repeat_interleave(torch.arange(n), crow.diff())
+    cols, vals = a.col_indices(), a.values()
+    diagonal = torch.zeros(n, dtype=vals.dtype).index_add_(0, rows[rows == cols], vals[rows == cols])
+    keep = (rows != cols) & (vals < 0)
+    rows, cols = rows[keep], cols[keep]
+    strength = -vals[keep] / torch.sqrt(diagonal[rows] * diagonal[cols])
+    rowmax = torch.zeros(n, dtype=strength.dtype).scatter_reduce_(0, rows, strength, "amax")
+    keep = strength >= theta * rowmax[rows]
+    rows, cols, strength = rows[keep], cols[keep], strength[keep]
+    jitter = (torch.minimum(rows, cols) * 2654435761 + torch.maximum(rows, cols) * 97531 + seed * 7919) % 1000003
+    score = (1.0 + jitter.to(strength.dtype) * (0.1 / 1000003.0)) * strength
+    nodes = torch.arange(n)
+    partner = torch.full((n,), -1)
+    for _ in range(rounds):
+        free = partner < 0
+        active = free[rows] & free[cols]
+        if not bool(active.any()):
+            break
+        r, c, sc = rows[active], cols[active], score[active]
+        best = torch.full((n,), -1.0, dtype=sc.dtype).scatter_reduce_(0, r, sc, "amax")
+        pick = sc == best[r]
+        choice = torch.full((n,), -1)
+        choice[r[pick]] = c[pick]  # serial: the last pick of a row wins
+        chosen = torch.nonzero(choice >= 0).squeeze(1)
+        chosen = chosen[choice[choice[chosen]] == chosen]
+        partner[chosen] = choice[chosen]
+    root = torch.where(partner >= 0, torch.minimum(nodes, partner), nodes)
+    single = partner < 0
+    edge = single[rows] & ~single[cols]
+    r, c, sc = rows[edge], cols[edge], strength[edge]
+    best = torch.full((n,), -1.0, dtype=sc.dtype).scatter_reduce_(0, r, sc, "amax")
+    pick = sc == best[r]
+    root[r[pick]] = root[c[pick]]
+    return torch.unique(root, return_inverse=True)[1]
+
+
+@pytest.mark.parametrize("uniform", [False, True])
+def test_blocked_matching_is_the_serial_one_shot_matching(uniform):
+    # Uniform weights make every coupling of a row equally strong: ties go to the last entry.
+    _, weights, pairs = _problem(12)
+    if uniform:
+        weights = np.ones_like(weights)
+    matrix = field_amg.assemble_free_operator(weights, np.zeros(weights.shape, bool), pairs=pairs, lam=3.0)
+    a = field_amg._torch_csr(matrix, "cpu", torch.float64)
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        expected = [_reference_matching(a, 0.25, seed) for seed in (0, 7)]
+    finally:
+        torch.set_num_threads(threads)
+    for block in (1 << 30, 500, 61):
+        for seed, reference in zip((0, 7), expected):
+            assert torch.equal(field_amg._pairwise_aggregates(a, 0.25, seed, block=block), reference)
+
+
+def test_compact_transpose_is_the_coalesced_transpose():
+    rng = np.random.default_rng(8)
+    p = field_amg._torch_csr(sp.random(300, 70, density=0.05, random_state=rng, format="csr"), "cpu", torch.float64)
+    expected = field_amg._compact(field_amg._coalesce(p.to_sparse_coo().t()).to_sparse_csr(), torch.float32, "cpu")
+    for block in (1 << 30, 50, 7):
+        got = field_amg._compact_transpose(p, torch.float32, "cpu", block=block)
+        assert got.crow_indices().dtype == torch.int32 and _csr_bitwise_equal(got, expected)
+
+
+@pytest.mark.parametrize("smoother", ["chebyshev", "l1-jacobi"])
+def test_levels_handed_over_during_setup_match_the_kept_hierarchy(smoother):
+    _, weights, pairs = _problem(12)
+    mask = np.zeros(weights.shape, bool)
+    mask[0] = True
+    matrix = field_amg.assemble_free_operator(weights, mask, pairs=pairs, lam=1000.0)
+    amg = field_amg.AMGPreconditioner(
+        matrix, weights.shape, torch.tensor(mask), max_coarse=50, dtype=torch.float32, smoother=smoother
+    )
+    free = field_amg._free_submatrix(matrix, np.flatnonzero(~mask.ravel()))
+    levels, coarsest, complexity = field_amg._torch_hierarchy(free, "cpu", max_coarse=50, max_levels=12)
+    assert len(amg.levels) == len(levels) >= 2 and amg.complexity == complexity
+    for k, ((a, p), (a_c, p_c, pt_c, scale_c)) in enumerate(zip(levels, amg.levels)):
+        pt = field_amg._coalesce(p.to_sparse_coo().t()).to_sparse_csr()
+        for full, compact in ((a, a_c), (p, p_c), (pt, pt_c)):
+            assert _csr_bitwise_equal(field_amg._compact(full, torch.float32, "cpu"), compact)
+        if smoother == "chebyshev":
+            scale = 1.0 / field_amg._diagonal(a)
+            lmax = field_amg._chebyshev_bound(a, scale)
+            assert amg.bounds[k] == (lmax / 30.0, lmax)
+        else:
+            scale = 1.0 / field_amg._absolute_row_sums(a)
+        assert torch.equal(_bits(scale.float()), _bits(scale_c))
+    assert torch.equal(amg.coarse, torch.linalg.pinv(0.5 * (coarsest + coarsest.T), hermitian=True).float())
 
 
 def test_out_of_memory_fallback_releases_the_failed_attempt(monkeypatch):

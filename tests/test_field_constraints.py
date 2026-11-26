@@ -207,3 +207,29 @@ def test_constraint_serialization_roundtrip_rejects_object_payload(tmp_path):
     )
     with pytest.raises(ValueError):
         m.QuadraticConstraints.load(tmp_path / "bad.npz")
+
+
+def test_operator_checks_csr_invariants_without_the_global_torch_flag():
+    import scipy.sparse as sp
+    import torch
+
+    from field_constraints import _check_csr
+
+    good = sp.random(50, 40, density=0.2, format="csr", random_state=0)
+    good.sort_indices()
+    _check_csr(good.indptr, good.indices, good.shape)
+    empty = sp.csr_matrix((3, 3))
+    _check_csr(empty.indptr, empty.indices, empty.shape)
+    row = int(np.flatnonzero(np.diff(good.indptr) >= 2)[0])
+    start = good.indptr[row]
+    for swap in (True, False):
+        bad = good.copy()
+        if swap:
+            bad.indices[[start, start + 1]] = bad.indices[[start + 1, start]]
+        else:
+            bad.indices[start + 1] = bad.indices[start]
+        with pytest.raises(RuntimeError, match="sorted and distinct"):
+            _check_csr(bad.indptr, bad.indices, bad.shape)
+    with pytest.raises(RuntimeError, match="out of bounds"):
+        _check_csr(good.indptr, good.indices, (50, 10))
+    assert not torch.sparse.check_sparse_tensor_invariants.is_enabled()

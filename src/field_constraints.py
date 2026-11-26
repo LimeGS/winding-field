@@ -182,6 +182,21 @@ class QuadraticConstraints:
         return _QuadraticOperator(self, device, dtype, layout=layout)
 
 
+def _check_csr(indptr, indices, shape) -> None:
+    """The invariants ``torch.sparse_csr_tensor(check_invariants=True)`` checks, in NumPy."""
+    indptr, indices = np.asarray(indptr), np.asarray(indices)
+    n = len(indices)
+    if len(indptr) != shape[0] + 1 or indptr[0] != 0 or indptr[-1] != n or (np.diff(indptr) < 0).any():
+        raise RuntimeError("constraint operator row pointers are invalid")
+    if n and (indices.min() < 0 or indices.max() >= shape[1]):
+        raise RuntimeError("constraint operator column index out of bounds")
+    inside = np.ones(max(n - 1, 0), bool)
+    starts = indptr[1:-1]
+    inside[starts[(starts > 0) & (starts < n)] - 1] = False  # Steps across a row boundary.
+    if (np.diff(indices)[inside] <= 0).any():
+        raise RuntimeError("constraint operator columns are not sorted and distinct within a row")
+
+
 class _QuadraticOperator:
     def __init__(self, c, device, dtype=np.float32, *, layout="coo"):
         try:
@@ -200,20 +215,27 @@ class _QuadraticOperator:
                 a = a.tocsr()
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", message="Sparse CSR tensor support is in beta state.*")
+                    _check_csr(a.indptr, a.indices, a.shape)
                     return torch.sparse_csr_tensor(
                         tensor(a.indptr, torch.long),
                         tensor(a.indices, torch.long),
                         tensor(a.data),
                         size=a.shape,
-                        check_invariants=True,
+                        check_invariants=False,
                     )
             a = a.tocoo()
+            if len(a.row) and (
+                min(a.row.min(), a.col.min()) < 0 or a.row.max() >= a.shape[0] or a.col.max() >= a.shape[1]
+            ):
+                raise RuntimeError("constraint operator index out of bounds")
             indices = torch.as_tensor(np.stack([a.row, a.col]), dtype=torch.long, device=device)
-            return torch.sparse_coo_tensor(indices, tensor(a.data), a.shape, check_invariants=True).coalesce()
+            return torch.sparse_coo_tensor(indices, tensor(a.data), a.shape, check_invariants=False).coalesce()
 
-        with torch.sparse.check_sparse_tensor_invariants(True):
-            self.a = sparse(c.matrix)
-            self.at = sparse(c.matrix.T) if layout == "csr" else self.a.transpose(0, 1).coalesce()
+        # Invariants are checked in NumPy, not by torch: torch's check (the constructor argument
+        # or the context manager) sets a process-wide flag while it runs, so threads building
+        # operators at once (the coarse residual pass) could leave it on for the process.
+        self.a = sparse(c.matrix)
+        self.at = sparse(c.matrix.T) if layout == "csr" else self.a.transpose(0, 1).coalesce()
         self.w = tensor(c.weights)
         self.target = tensor(c.targets)
         self.groups = tensor(c.groups, torch.long)

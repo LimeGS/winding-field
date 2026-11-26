@@ -52,10 +52,90 @@ class CoarseSpace:
         self.axes = coarse_axes(self.shape, self.factor)
         self.coarse_shape = tuple(len(a) for a in self.axes)
         self.size = int(np.prod(self.coarse_shape))
-        self.matrix = sp.csr_matrix((self.size, self.size))
+        self._matrix = sp.csr_matrix((self.size, self.size))
+        # Grid part of the operator as a 27-point stencil (row node, column offset + 1 per axis)
+        # and constraint parts waiting to be summed; both are folded into ``matrix`` on read.
+        self._stencil: np.ndarray | None = None
+        self._pending: list[sp.coo_matrix] = []
+        self._pending_nnz = 0
         self.assembled = False
         self.solve: Callable[[np.ndarray], np.ndarray] | None = None
         self.info: dict | None = None
+
+    @property
+    def matrix(self) -> sp.csr_matrix:
+        """The accumulated coarse operator."""
+        self._fold_pairs()
+        if self._stencil is not None:
+            flat = self._stencil.reshape(self.size, 27)
+            self._stencil = None
+            _, cy, cx = self.coarse_shape
+            by_offset: dict[int, np.ndarray] = {}
+            for index, (oz, oy, ox) in enumerate(np.ndindex(3, 3, 3)):
+                offset = ((oz - 1) * cy + (oy - 1)) * cx + (ox - 1)
+                values = flat[:, index]
+                if abs(offset) >= self.size or not values.any():
+                    continue
+                diagonal = values[: self.size - offset] if offset >= 0 else values[-offset:]
+                # Offsets coincide when an axis has few coarse nodes.
+                by_offset[offset] = by_offset[offset] + diagonal if offset in by_offset else diagonal
+            offsets = sorted(by_offset)
+            diagonals = [by_offset[k] for k in offsets]
+            if diagonals:
+                grid = sp.diags(diagonals, offsets, shape=(self.size, self.size), format="csr")
+                grid.eliminate_zeros()
+                self._matrix = (self._matrix + grid).tocsr()
+        return self._matrix
+
+    @matrix.setter
+    def matrix(self, value) -> None:
+        self._matrix, self._stencil, self._pending, self._pending_nnz = value, None, [], 0
+
+    def _fold_pairs(self) -> None:
+        if self._pending:
+            total = self._matrix
+            for part in self._pending:
+                total = total + part
+            self._matrix, self._pending, self._pending_nnz = total.tocsr(), [], 0
+
+    def _pair_table(self, d: int, lo: int, hi: int, shift: int) -> tuple[np.ndarray, int]:
+        """Per-axis products of interpolation weights for the nodes ``[lo, hi)`` of axis ``d``.
+
+        Entry ``[i - lo, 3 * (a - first) + (b - a + 1)]`` is ``phi_a(i) * phi_b(i + shift)``: the
+        weight of coarse node ``a`` at fine node ``i`` times that of coarse node ``b`` at its
+        neighbour. A node and its neighbour lie in one closed coarse cell, so ``b - a`` is -1, 0
+        or 1. Rows whose neighbour is outside the axis are zero.
+        """
+        i = np.arange(int(lo), int(hi))
+        j = i + shift
+        valid = (j >= 0) & (j < self.shape[d])
+        ka0, ka1, ta = _axis_weights(self.axes[d], i)
+        kb0, kb1, tb = _axis_weights(self.axes[d], np.clip(j, 0, self.shape[d] - 1))
+        first = int(ka0.min())
+        table = np.zeros((len(i), 3 * (int(ka1.max()) + 1 - first)))
+        r = np.arange(len(i))
+        for ka, wa in ((ka0, 1 - ta), (ka1, ta)):
+            for kb, wb in ((kb0, 1 - tb), (kb1, tb)):
+                value = wa * wb * valid
+                use = value != 0
+                if (abs(kb[use] - ka[use]) > 1).any():
+                    raise AssertionError("coarse neighbours are more than one node apart")
+                np.add.at(table, (r[use], 3 * (ka[use] - first) + (kb[use] - ka[use] + 1)), value[use])
+        return table, first
+
+    def _add_stencil(self, window, values: np.ndarray, tables, sign: float) -> None:
+        """Add ``sign * sum_i values[i] p_i^T p_j`` over a box to the stencil of its window."""
+        (tz, _), (ty, _), (tx, _) = tables
+        v = np.tensordot(tz.T, values, axes=(1, 0))
+        v = np.tensordot(v, ty, axes=(1, 0))  # (z pairs, x, y pairs)
+        v = np.tensordot(v, tx, axes=(1, 0))  # (z pairs, y pairs, x pairs)
+        nz, ny, nx = (t[0].shape[1] // 3 for t in tables)
+        v = v.reshape(nz, 3, ny, 3, nx, 3).transpose(0, 2, 4, 1, 3, 5)
+        assert self._stencil is not None
+        if sign > 0:
+            self._stencil[window] += v
+        else:
+            self._stencil[window] -= v
 
     def rows(self, zyx: np.ndarray, free: np.ndarray | None = None) -> sp.csr_matrix:
         """Prolongation rows for global ZYX nodes ``zyx`` (N x 3); rows of fixed nodes are zero."""
@@ -81,6 +161,49 @@ class CoarseSpace:
         out.eliminate_zeros()
         return out
 
+    def _axis_matrices(self, lo, hi) -> tuple[list[np.ndarray], tuple[slice, ...]]:
+        """Dense per-axis interpolation matrices of the box ``[lo, hi)`` and its coarse window.
+
+        The trilinear prolongation is a tensor product, so a box needs three small matrices
+        (fine nodes x coarse nodes of the window) instead of one sparse row per node.
+        """
+        mats, window = [], []
+        for d in range(3):
+            i = np.arange(int(lo[d]), int(hi[d]))
+            k0, k1, t = _axis_weights(self.axes[d], i)
+            first, stop = int(k0.min()), int(k1.max()) + 1
+            m = np.zeros((len(i), stop - first))
+            r = np.arange(len(i))
+            np.add.at(m, (r, k0 - first), 1 - t)
+            np.add.at(m, (r, k1 - first), t)
+            mats.append(m)
+            window.append(slice(first, stop))
+        return mats, tuple(window)
+
+    def restrict_box(self, lo, hi, values: np.ndarray, free: np.ndarray, out: np.ndarray) -> None:
+        """Add ``P^T values`` of the box ``[lo, hi)`` to the flat coarse vector ``out``.
+
+        Equal to ``rows(nodes, free).T @ values`` for the nodes of the box, up to rounding.
+        """
+        (mz, my, mx), window = self._axis_matrices(lo, hi)
+        v = np.where(free, values, 0.0)
+        v = np.tensordot(mz.T, v, axes=(1, 0))
+        v = np.tensordot(v, my, axes=(1, 0))  # axes are now (cz, x, cy)
+        v = np.tensordot(v, mx, axes=(1, 0))  # (cz, cy, cx)
+        out.reshape(self.coarse_shape)[window] += v
+
+    def prolong_box(self, lo, hi, coarse: np.ndarray) -> np.ndarray:
+        """Return ``P coarse`` on the box ``[lo, hi)``; the caller zeroes fixed nodes.
+
+        Equal to ``rows(nodes) @ coarse`` for the nodes of the box, up to rounding.
+        """
+        (mz, my, mx), window = self._axis_matrices(lo, hi)
+        v = coarse.reshape(self.coarse_shape)[window]
+        v = np.tensordot(mz, v, axes=(1, 0))  # (z, cy, cx)
+        v = np.tensordot(v, my.T, axes=(1, 0))  # (z, cx, y)
+        v = np.tensordot(v, mx.T, axes=(1, 0))  # (z, y, x)
+        return v
+
     def add_block(
         self,
         lo: np.ndarray,
@@ -98,39 +221,37 @@ class CoarseSpace:
         ``exterior`` the ``(row, global flat node, free, coefficient)`` terms the provider moved
         into their targets. With them the constraint rows are exact; without, cut rows lose their
         coupling across the crop face.
-        Edge rows are processed in z-slabs of the core so memory stays bounded by the slab.
+        The grid part is accumulated as a 27-point stencil with per-axis weight tables (the
+        prolongation is a tensor product); ``slab`` is unused and kept for callers.
         """
         crop_shape = weights.shape
         core = [slice(int(a - b), int(c - b)) for a, b, c in zip(low, lo, high)]
         w = weights.astype(np.float64)
-        acc = sp.csr_matrix((self.size, self.size))
-        z_start, z_stop = core[0].start, core[0].stop
-        for z0 in range(z_start, z_stop, slab):
-            z1 = min(z0 + slab, z_stop)
-            zz, yy, xx = np.meshgrid(
-                np.arange(z0, z1),
-                np.arange(core[1].start, core[1].stop),
-                np.arange(core[2].start, core[2].stop),
-                indexing="ij",
-            )
-            local = np.stack([zz.ravel(), yy.ravel(), xx.ravel()], 1)
-            keep = free[tuple(local.T)]
-            local = local[keep]
-            if not len(local):
-                continue
-            p_i = self.rows(local + lo)
-            for axis in range(3):
-                for step in (-1, 1):
-                    nb = local.copy()
-                    nb[:, axis] += step
-                    inside = (nb[:, axis] >= 0) & (nb[:, axis] < crop_shape[axis])
-                    if not inside.any():
-                        continue
-                    src, dst = local[inside], nb[inside]
-                    edge = 0.5 * w[tuple(src.T)] + 0.5 * w[tuple(dst.T)]
-                    pi = p_i[np.flatnonzero(inside)]
-                    pj = self.rows(dst + lo, free[tuple(dst.T)])
-                    acc += pi.T @ sp.diags(edge) @ (pi - pj)
+        owned_free = free[tuple(core)]
+        if self._stencil is None:
+            self._stencil = np.zeros((*self.coarse_shape, 3, 3, 3))
+        same = [self._pair_table(d, low[d], high[d], 0) for d in range(3)]
+        window = tuple(slice(t[1], t[1] + t[0].shape[1] // 3) for t in same)
+        diagonal = np.zeros(owned_free.shape)
+        for axis in range(3):
+            for step in (-1, 1):
+                # Neighbour j = i + step along axis, for every core node i whose j is in the crop.
+                near = [slice(c.start, c.stop) for c in core]
+                first, stop = near[axis].start + step, near[axis].stop + step
+                clip = (max(-first, 0), max(stop - crop_shape[axis], 0))
+                near[axis] = slice(first + clip[0], stop - clip[1])
+                span = [slice(None)] * 3
+                span[axis] = slice(clip[0], owned_free.shape[axis] - clip[1])
+                part = tuple(span)
+                edge = np.zeros(owned_free.shape)
+                edge[part] = (0.5 * w[tuple(core)][part] + 0.5 * w[tuple(near)]) * owned_free[part]
+                diagonal += edge
+                edge[part] *= free[tuple(near)]
+                tables = list(same)
+                tables[axis] = self._pair_table(axis, low[axis], high[axis], step)
+                self._add_stencil(window, edge, tables, -1.0)
+        self._add_stencil(window, diagonal, same, 1.0)
+        acc = None
         if rows is not None:
             matrix = rows.matrix.tocsr()
             members = rows.members
@@ -157,8 +278,12 @@ class CoarseSpace:
                 # Rows of M^T C M P that belong to free core nodes: (M D_owned P)^T C M P.
                 owned = np.all((zyx >= [c.start for c in core]) & (zyx < [c.stop for c in core]), axis=1)
                 mpo = m @ (sp.diags(owned.astype(np.float64)) @ p_touched)
-                acc += mpo.T @ centered
-        self.matrix = (self.matrix + acc).tocsr()
+                acc = (mpo.T @ centered).tocoo()
+        if acc is not None and acc.nnz:
+            self._pending.append(acc)
+            self._pending_nnz += acc.nnz
+            if self._pending_nnz > 50_000_000:
+                self._fold_pairs()
 
     def solver(self, direct_limit: int) -> tuple[Callable[[np.ndarray], np.ndarray], dict]:
         """Factor (or AMG-precondition) the symmetrized operator on its nonempty columns."""

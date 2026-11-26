@@ -164,3 +164,18 @@ def test_tampered_coarse_correction_is_rejected_on_resume(tmp_path):
 def test_invalid_coarse_factor_is_rejected(tmp_path, factor):
     with pytest.raises(ValueError):
         run(tmp_path / "bad", problem(tmp_path, pairs=False), 8, halo=2, coarse_factor=factor)
+
+
+@pytest.mark.parametrize("box", [((0, 0, 0), (9, 7, 10)), ((2, 1, 3), (7, 6, 10)), ((4, 3, 9), (5, 4, 10))])
+def test_box_transfers_match_the_prolongation_rows(box):
+    rng = np.random.default_rng(2)
+    space = CoarseSpace((9, 7, 10), 3)
+    lo, hi = (np.array(v) for v in box)
+    size = tuple(hi - lo)
+    zyx = np.stack([g.ravel() for g in np.meshgrid(*map(np.arange, lo, hi), indexing="ij")], 1)
+    values, free = rng.standard_normal(size), rng.random(size) > 0.3
+    coarse = rng.standard_normal(space.size)
+    out = coarse.copy()
+    space.restrict_box(lo, hi, values, free, out)
+    np.testing.assert_allclose(out, coarse + space.rows(zyx, free.ravel()).T @ values.ravel(), atol=1e-13)
+    np.testing.assert_allclose(space.prolong_box(lo, hi, coarse).ravel(), space.rows(zyx) @ coarse, atol=1e-13)

@@ -16,6 +16,15 @@ versions follow the GitHub releases.
   torch threads. Both keep every sum's terms and order, so the hierarchy is unchanged.
 - When the device build runs out of memory, the failed attempt is released before the host
   rebuild instead of being held by the exception for its whole duration.
+- AMG hierarchy build memory: the strong graph, matching, aggregation products, smoothed
+  prolongator, Galerkin coarse operators and `P^T` are formed on row blocks of about 4M
+  entries, finished coarse rows leave the working set at once, and each level is compacted
+  for the solve device as soon as the next one is built (the finest one from the host
+  matrix). Peak device memory during setup drops from about 86 to about 30 bytes per fine
+  nonzero (host measurement on a synthetic 128³ tile): about 43 GB instead of 124 GB for a
+  448³ block (1.4e9 nonzeros), which then no longer falls back to the host on an 80 GB GPU.
+  On the CPU the hierarchy is bitwise unchanged. Tied matching choices go to the row's last
+  entry on every device and thread count; the parallel scatter left them unspecified.
 
 ## [2.0.0] - unreleased
 

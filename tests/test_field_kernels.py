@@ -142,6 +142,19 @@ def test_unsupported_solves_fall_back_to_eager_with_a_receipt():
     assert (info["kernel"], info["kernel_fallback"]) == ("eager", "preconditioner=spectral is not fused")
 
 
+def test_kernels_find_triton_in_their_module_globals():
+    """Triton 3.3 resolves a kernel's names (its tl.constexpr annotations too) in the module
+    globals only: with tl local to _kernels() every kernel failed to compile there ("tl is not
+    defined", RTX 5090, torch 2.7.1). Triton 3.4+ also sees closures, so this checks the cause."""
+    import triton.language
+
+    kernels = field_kernels._kernels()
+    for name in ("stencil", "update", "direction"):
+        fn = getattr(kernels[name], "fn", kernels[name])
+        assert fn.__globals__ is vars(field_kernels), name
+        assert fn.__globals__.get("tl") is triton.language, name
+
+
 def test_missing_triton_or_gpu_is_a_fallback(monkeypatch):
     def missing():
         raise ImportError("triton")

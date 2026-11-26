@@ -39,6 +39,11 @@ BLOCK_X = 32
 BLOCK_FLAT = 1024
 
 _compiled: dict[str, Any] | None = None
+# Set by _kernels(). Triton looks up the names a kernel uses, including the tl.constexpr
+# annotations, in the kernel's module globals: with tl local to _kernels(), Triton 3.3
+# failed to compile the stencil ("tl is not defined"). Newer releases also see closures.
+triton: Any = None
+tl: Any = None
 
 
 def _interpreted() -> bool:
@@ -62,11 +67,13 @@ def unavailable_reason(device: torch.device, preconditioner: str, has_pairs: boo
 
 def _kernels() -> dict[str, Any]:
     """Define the Triton kernels once (lazily, so importing this module never needs Triton)."""
-    global _compiled
+    global _compiled, tl, triton
     if _compiled is not None:
         return _compiled
-    import triton
-    import triton.language as tl
+    import triton as _triton
+    import triton.language as _tl
+
+    triton, tl = _triton, _tl
 
     @triton.jit
     def _stencil(

@@ -7,10 +7,8 @@ weights, 0.045 fibre rows per node (two trilinear stencils of 8 nodes each, weig
 and a fixed bottom face. Times, on one GPU:
 
 - parts of one eager iteration: gradient stencil, fibre rows (extra.matvec), vector ops;
-- the fused kernels K1 (stencil + p.Ap), K2 (update + dots), K3 (direction), with K1 taking
-  the fibres both ways: torch.sparse rows added as a precomputed term (the fused-v1 path)
-  and the rows gathered by the fused loop itself (fused-v2);
-- whole solves of exactly --iterations iterations: eager, and fused with each fibre path.
+- the fused kernels K1 (stencil + p.Ap), K2 (update + dots), K3 (direction);
+- whole solves of exactly --iterations iterations with each kernel (rtol below reach).
 
 Bytes per node-iteration are counted from the code (float64: 8 B per array access) so the
 effective bandwidth can be compared with a device copy. Phase 0 of the fused-kernel plan
@@ -18,12 +16,10 @@ uses the fibre share of the eager iteration to bound the speedup of fusing the r
 """
 
 import argparse
-import contextlib
 import json
 import sys
 import time
 from pathlib import Path
-from unittest import mock
 
 import numpy as np
 import torch
@@ -132,7 +128,6 @@ def main(argv=None):
         out[mask] = 0
 
     fused = field_kernels.FusedOperator(w, mask, 0.0)
-    rows = field_kernels.FusedRows.of(extra)  # Constraint rows as the fused loop applies them.
     alpha = torch.tensor(1e-3, dtype=torch.float64, device=device)
     k = field_kernels._kernels()
     grid = field_kernels._flat_grid(n)
@@ -165,18 +160,16 @@ def main(argv=None):
         eager_fibres=timed(lambda: extra.matvec(p), args.repeat, device),
         eager_vectors=timed(eager_vectors, args.repeat, device),
         fused_k1=timed(lambda: float(fused.apply(p, out)), args.repeat, device),
-        fused_k1_sparse_fibres=timed(lambda: float(fused.apply(p, out, extra.matvec(p))), args.repeat, device),
-        fused_k1_fused_fibres=timed(lambda: float(fused.apply(p, out, rows=rows)), args.repeat, device),
+        fused_k1_with_fibres=timed(lambda: float(fused.apply(p, out, extra.matvec(p))), args.repeat, device),
         fused_k2=timed(k2, args.repeat, device),
         fused_k3=timed(k3, args.repeat, device),
     )
     report["parts_ms"] = {key: value * 1e3 for key, value in parts.items()}
     eager_total = parts["eager_stencil"] + parts["eager_fibres"] + parts["eager_vectors"]
     report["fibre_share_of_eager_iteration"] = parts["eager_fibres"] / eager_total
-    report["fused_ceiling_speedup"] = {
-        fibres: eager_total / (parts[f"fused_k1_{fibres}_fibres"] + parts["fused_k2"] + parts["fused_k3"])
-        for fibres in ("sparse", "fused")
-    }
+    report["fused_ceiling_speedup"] = eager_total / (
+        parts["fused_k1_with_fibres"] + parts["fused_k2"] + parts["fused_k3"]
+    )
     # Accesses per node counted from the code (see the plan): eager ~62, fused ~15.
     report["bytes_per_node_iteration"] = dict(eager_nonfibre=62 * size, fused_nonfibre=15 * size)
     report["effective_gbps"] = dict(
@@ -184,39 +177,30 @@ def main(argv=None):
         fused_nonfibre=15 * size * n / (parts["fused_k1"] + parts["fused_k2"] + parts["fused_k3"]) / 1e9,
     )
 
-    def solve(kernel, maxiter, fuse_fibres):
-        # fuse_fibres=False keeps the fibres on torch.sparse inside the fused loop (fused-v1).
-        sparse = mock.patch.object(field_kernels.FusedRows, "supported", staticmethod(lambda extra: False))
-        with contextlib.nullcontext() if fuse_fibres else sparse:
-            torch.cuda.synchronize(device)
-            torch.cuda.reset_peak_memory_stats(device)
-            start = time.perf_counter()
-            _, info = solve_field(
-                target,
-                weights,
-                fixed=fixed,
-                constraints=constraints,
-                dtype=args.dtype,
-                device=device,
-                rtol=1e-30,
-                maxiter=maxiter,
-                return_tensor=True,
-                kernel=kernel,
-            )
-            torch.cuda.synchronize(device)
-            return time.perf_counter() - start, info
+    def solve(kernel, maxiter):
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        start = time.perf_counter()
+        _, info = solve_field(
+            target,
+            weights,
+            fixed=fixed,
+            constraints=constraints,
+            dtype=args.dtype,
+            device=device,
+            rtol=1e-30,
+            maxiter=maxiter,
+            return_tensor=True,
+            kernel=kernel,
+        )
+        torch.cuda.synchronize(device)
+        return time.perf_counter() - start, info
 
-    variants = dict(
-        eager=("eager", False),
-        fused_sparse_fibres=("fused", False),
-        fused_fused_fibres=("fused", True),
-    )
     solves = {}
-    for name, (kernel, fuse_fibres) in variants.items():
-        # Assembly, transfers and the eager residuals only (plus the fibre CSR for fused-v2).
-        setup, _ = solve(kernel, 0, fuse_fibres)
-        elapsed, info = solve(kernel, args.iterations, fuse_fibres)
-        solves[name] = dict(
+    for kernel in ("eager", "fused"):
+        setup, _ = solve(kernel, 0)  # Assembly, transfers and the eager residuals only.
+        elapsed, info = solve(kernel, args.iterations)
+        solves[kernel] = dict(
             seconds=elapsed,
             loop_seconds=elapsed - setup,
             iterations=info["iterations"],
@@ -228,11 +212,7 @@ def main(argv=None):
     for value in solves.values():
         value["ns_per_node_iteration"] = value["loop_seconds"] / max(value["iterations"], 1) / n * 1e9
     report["solves"] = solves
-    report["loop_speedup"] = {
-        name: solves["eager"]["loop_seconds"] / value["loop_seconds"]
-        for name, value in solves.items()
-        if name != "eager"
-    }
+    report["loop_speedup"] = solves["eager"]["loop_seconds"] / solves["fused"]["loop_seconds"]
     text = json.dumps(report, indent=2)
     print(text)
     if args.output:

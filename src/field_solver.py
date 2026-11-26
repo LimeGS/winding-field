@@ -444,7 +444,7 @@ def solve_field(
     Prepared reuse requires the same policy and full effective spectral mask.
 
     kernel='fused' runs the PCG iterations with the Triton kernels of field_kernels
-    (CUDA; Jacobi or AMG; no discrete pairs) and records kernel='fused-v2' in the receipt.
+    (CUDA; Jacobi or AMG; no discrete pairs) and records kernel='fused-v1' in the receipt.
     It solves the same system with the same stopping rules; iterates differ from eager at
     round-off level. Unsupported solves fall back to eager and record kernel='eager' with
     kernel_fallback. The final residual is always measured with the eager operator.
@@ -620,7 +620,7 @@ def solve_field(
             weights=fused_weight,
             mask=mask,
             rw=rw if has_reference else 0.0,
-            extra=extra,
+            extra=None if extra is None else extra.matvec,
             preconditioner=spectral,
             eager_matvec=matvec,
             norm=_norm,

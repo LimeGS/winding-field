@@ -208,6 +208,10 @@ def solve_blocks(
     coarse_factor: int | None = None,
     coarse_direct_limit: int = 20_000,
     coarse_workers: int | None = None,
+    coarse_floor: float = 1e-3,
+    coarse_step: bool = True,
+    coarse_divergence_sweeps: int = 2,
+    local_step: bool | Literal["auto"] = "auto",
     checkpoint: Literal["block", "sweep"] = "block",
     memory_report: dict[str, Any] | None = None,
     colours: int = 0,
@@ -274,6 +278,31 @@ def solve_blocks(
     three quarters of the CPUs, at most 8); parts are added in block order, so the coarse
     right-hand side has the same bytes for any worker count. An execution choice, not part of
     the identity.
+
+    Three safeguards keep the coarse correction from feeding a divergence (PHerc0175A, 34.56 um,
+    November 2026: the relative residual fell to 6.8 by sweep 5, then rose 1.35x and 1.49x per
+    sweep while the correction grew at unsupported nodes on the ROI edge). ``coarse_floor``
+    leaves coarse nodes whose diagonal is below that fraction of the median out of the coarse
+    system (see :meth:`field_block_coarse.CoarseSpace.solver`). ``coarse_step`` scales the
+    correction by the energy-optimal step ``alpha = (P^T r)^T e / e^T M e`` clipped to [0, 1]
+    with the assembled operator ``M``; with an exact Galerkin operator and solve it is 1, so it
+    only acts when the coarse system is inconsistent with the block solves. Both are part of
+    the identity. ``coarse_divergence_sweeps`` (an execution choice; 0 disables it) stops with an
+    error when the relative residual has risen that many sweeps in a row. Exterior constraint
+    terms of fixed nodes leave the coarse operator, so it is the Galerkin product of the free
+    problem with a ``fixed`` provider too.
+
+    ``local_step`` (part of the identity when ``halo > 1``) scales each committed core
+    update that would raise the energy by its energy-optimal length (updates that lower it are
+    committed whole). A crop is solved with its halo free but
+    only its core is committed, and that truncated update is not an energy step: with stiff pairs
+    across the core face it can raise the energy, which near-free unsupported regions amplify
+    sweep after sweep. Two crop residuals per block give the length; a halo of 1 skips it. The
+    shortening also slows sweeps that converge without it, so the
+    default ``"auto"`` (two-level runs only; off without ``coarse_factor``) turns it on from the
+    first sweep whose coarse relative residual exceeds the previous sweep's and keeps it on;
+    ``True`` applies it from the first sweep. Each completed sweep records ``local_step_active``,
+    ``min_local_step`` and ``damped_local_steps``.
 
     ``nonconvergence_policy='fail'`` (default) stops at the first local solve that
     does not reach ``rtol``. ``'continue'`` commits a local solve that only exhausted
@@ -376,8 +405,18 @@ def solve_blocks(
             if coarse_workers is None:
                 coarse_workers = default_coarse_workers()
             coarse_workers = _integer(coarse_workers, 1)
+            coarse_divergence_sweeps = _integer(coarse_divergence_sweeps)
+            if type(coarse_floor) not in (int, float) or not 0 <= coarse_floor < 1:
+                raise ValueError("coarse_floor must be a number in [0, 1)")
+            coarse_floor = float(coarse_floor)
+            if type(coarse_step) is not bool:
+                raise ValueError("coarse_step must be a bool")
             if partial_order:
                 raise ValueError("coarse correction needs the full block order")
+        if type(local_step) is not bool and local_step != "auto":
+            raise ValueError("local_step must be a bool or 'auto'")
+        if local_step == "auto" and coarse_factor is None:
+            local_step = False  # "auto" watches the coarse residual, which needs a coarse level.
         if checkpoint not in ("block", "sweep"):
             raise ValueError("checkpoint must be block or sweep")
         if type(colours) is not int or colours not in (0, 8):
@@ -433,8 +472,23 @@ def solve_blocks(
             **({} if preconditioner == "jacobi" else {"preconditioner": preconditioner}),
             # Fused kernels round differently, so a run never resumes across kernels.
             **({} if kernel == "eager" else {"kernel": kernel}),
-            **({} if coarse_factor is None else {"coarse": dict(kind="trilinear", factor=coarse_factor)}),
+            **(
+                {}
+                if coarse_factor is None
+                else {
+                    "coarse": dict(
+                        kind="trilinear",
+                        factor=coarse_factor,
+                        # Revision 2: fixed exterior nodes leave the operator, support floor, step.
+                        revision=2,
+                        floor=coarse_floor,
+                        step="energy" if coarse_step else "unit",
+                    )
+                }
+            ),
             **({"colours": colours} if colours else {}),
+            # A crop solved with a halo but committed on its core alone is not an energy step.
+            **({"local_step": "energy" if local_step is True else "auto"} if local_step and halo > 1 else {}),
         )
         json.dumps(problem, allow_nan=False)
         if colours:
@@ -650,9 +704,36 @@ def solve_blocks(
                 if terms is None:
                     return None
                 row, node, coeff = (np.asarray(a) for a in terms)
-                # Exterior fixed values are known only for the zero gauge; others count as free.
-                node_free = node != 0 if fixed is None else np.ones(len(node), bool)
-                return row, node, node_free, coeff
+                return row, node, exterior_free(node), coeff
+
+            fixed_chunks: dict[tuple[int, ...], np.ndarray] = {}
+
+            def exterior_free(node):
+                """Which exterior nodes are free: the zero gauge without a provider, else asked per chunk.
+
+                Counting fixed exterior nodes as free (the behaviour before revision 2) adds coarse
+                couplings that no free row returns, so the assembled operator is not symmetric."""
+                node = np.asarray(node, np.int64)
+                if fixed is None:
+                    return node != 0
+                zyx = np.stack(np.unravel_index(node, shape), 1)
+                keys = zyx // chunk
+                free = np.ones(len(node), bool)
+                for key in np.unique(keys, axis=0):
+                    k = tuple(int(v) for v in key)
+                    if k not in fixed_chunks:
+                        if len(fixed_chunks) >= 64:
+                            fixed_chunks.pop(next(iter(fixed_chunks)))
+                        lo = np.asarray(k) * chunk
+                        hi = np.minimum(lo + chunk, shape)
+                        declared = np.asarray(fixed(lo, hi), np.float64)
+                        if declared.shape != tuple(int(v) for v in hi - lo):
+                            raise ValueError("invalid fixed-value observation")
+                        fixed_chunks[k] = np.isfinite(declared)
+                    sel = np.all(keys == key, axis=1)
+                    local = zyx[sel] - np.asarray(k) * chunk
+                    free[sel] = ~fixed_chunks[k][tuple(local.T)]
+                return free
 
             space = None
             coarse_status: dict[str, Any] = {}
@@ -792,20 +873,55 @@ def solve_blocks(
                 if space.solve is None:
                     coarse_status.update(stage="solve")
                     emit("RUNNING", phase="coarse-solve", active_sweep=sweep)
-                    space.solve, space.info = space.solver(coarse_direct_limit)
+                    space.solve, space.info = space.solver(coarse_direct_limit, coarse_floor)
                 if stopped():
                     return emit("CHECKPOINTED_STOP")
+                norm, norm0 = math.sqrt(norm_sq), math.sqrt(norm0_sq)
+                relative = norm / norm0 if norm0 else None
+                if coarse_divergence_sweeps and relative is not None:
+                    history = [s.get("relative_residual") for s in progress.get("completed_sweeps") or []]
+                    tail = history[-coarse_divergence_sweeps:] + [relative]
+                    if (
+                        len(tail) == coarse_divergence_sweeps + 1
+                        and None not in tail
+                        and all(b > a for a, b in zip(tail, tail[1:]))
+                    ):
+                        raise RuntimeError(
+                            f"coarse Schwarz diverging: relative residual rose {coarse_divergence_sweeps} sweeps "
+                            f"in a row ({', '.join(f'{v:.4g}' for v in tail)}); the checkpoint keeps the last sweep"
+                        )
+                history = [s.get("relative_residual") for s in progress.get("completed_sweeps") or []]
+                local_active = local_step is True or (
+                    local_step == "auto"
+                    and (
+                        any(s.get("local_step_active") for s in progress.get("completed_sweeps") or [])
+                        or (
+                            relative is not None
+                            and bool(history)
+                            and history[-1] is not None
+                            and relative > history[-1]
+                        )
+                    )
+                )
                 solve_started = time.perf_counter()
                 correction = space.solve(rhs)
+                step = 1.0
+                if coarse_step:
+                    # Energy-optimal step along P e with the assembled operator; 1 for an exact solve.
+                    curvature = float(correction @ (space.matrix @ correction))
+                    slope = float(rhs @ correction)
+                    step = min(max(slope / curvature, 0.0), 1.0) if curvature > 0 else 0.0
+                    correction = correction * step
                 solve_s = time.perf_counter() - solve_started
                 np.save(correction_path, correction)
-                norm, norm0 = math.sqrt(norm_sq), math.sqrt(norm0_sq)
                 state = dict(
                     sweep=sweep,
                     stage="apply",
                     correction_sha256=file_sha(correction_path),
                     residual_norm=norm,
-                    relative_residual=norm / norm0 if norm0 else None,
+                    relative_residual=relative,
+                    local_step_active=local_active,
+                    step=step,
                     solve_s=solve_s,
                     seconds=time.perf_counter() - phase_started,
                     **(space.last or {}),
@@ -968,6 +1084,37 @@ def solve_blocks(
                 prepared = None
                 return job
 
+            local_steps = dict(minimum=1.0, damped=0, active=local_step is True)
+
+            def energy_step(job, rows, delta, where):
+                """The energy-optimal length, clipped to [0, 1], of the committed core update.
+
+                The crop is solved with its halo free, but only the core is committed: the halo
+                part of the minimiser is dropped. With stiff pair rows across the core face that
+                truncated update can raise the energy (PHerc0175A, November 2026: the residual of
+                a 34.56 um field rose from sweep 6 on). Along the committed direction ``d`` the
+                energy changes by ``-a r.d + a^2/2 d.Ad``; ``a = r.d / d.Ad`` minimises it, and
+                ``a <= 1`` keeps the step inside the solve. Two crop residuals give ``r`` and ``Ad``.
+                A full step that lowers the energy (``a >= 1/2``) is kept as is: only blocks whose
+                committed update would raise the energy are shortened.
+                """
+                owned, current = job["owned"], job["current"]
+                mask = np.isfinite(job["fixed_values"])
+                values = np.where(mask, job["fixed_values"], current)
+                moved = values.copy()
+                moved[owned] += delta
+                r, _ = block_residual(job["target"], job["weights"], spacing, rows, values, mask, str(where))
+                r_moved, _ = block_residual(job["target"], job["weights"], spacing, rows, moved, mask, str(where))
+                d = delta.astype(np.float64)
+                slope = float(np.sum(r[owned] * d))
+                curvature = float(np.sum((r - r_moved)[owned] * d))
+
+                if not (curvature > 0 and math.isfinite(slope)):
+                    return 0.0
+                if 2.0 * slope >= curvature:  # The full update lowers the energy: keep it.
+                    return 1.0
+                return max(slope / curvature, 0.0)
+
             def solve_block(job, slot=0):
                 """The local solve of a prepared block; safe on a worker thread (own CUDA stream).
 
@@ -1007,8 +1154,21 @@ def solve_blocks(
                     core = _numpy(result[owned])
                 del result
                 delta = core - job["current"][owned]
+                step = 1.0
+                if local_steps["active"] and halo > 1 and delta.any():
+                    # The step is measured from the start values with anchors applied, so an
+                    # anchor's own jump to its fixed value is never scaled.
+                    fixed_owned = job["fixed_values"][owned]
+                    start = np.where(np.isfinite(fixed_owned), fixed_owned, job["current"][owned])
+                    move = core - start
+                    if move.any():
+                        step = energy_step(job, rows, move, where if local_devices else device)
+                    if step != 1.0:
+                        core = (start + step * move).astype(core.dtype, copy=False)
+                        delta = core - job["current"][owned]
                 return dict(
                     core=core,
+                    step=step,
                     delta=delta if observer is not None else None,
                     change=float(np.max(abs(delta))),
                     solver=solver,
@@ -1046,6 +1206,10 @@ def solve_blocks(
                     raise RuntimeError("conditional block did not converge")
                 core, change, owned_observed = solved["core"], solved["change"], solved["owned_observed"]
                 maximum = max(maximum, change)
+                if block == 0:
+                    local_steps.update(minimum=1.0, damped=0)
+                local_steps["minimum"] = min(local_steps["minimum"], solved["step"])
+                local_steps["damped"] += solved["step"] < 1.0
                 if observer is not None:
                     telemetry_started = time.perf_counter()
                     delta, selected = solved.pop("delta"), None
@@ -1084,6 +1248,12 @@ def solve_blocks(
                 next_completed = list(completed)
                 if block + 1 == len(ordered):
                     stats = dict(sweep=sweep, cores=len(ordered), max_core_update=maximum)
+                    if local_step and halo > 1:  # Advisory: a resume inside the sweep restarts the count.
+                        stats.update(
+                            local_step_active=local_steps["active"],
+                            min_local_step=local_steps["minimum"],
+                            damped_local_steps=local_steps["damped"],
+                        )
                     if coarse_factor is not None:
                         opened = progress.get("coarse") or {}
                         stats.update(relative_residual=opened.get("relative_residual"), coarse_s=opened.get("seconds"))
@@ -1220,6 +1390,8 @@ def solve_blocks(
                         finished = coarse_phase(sweep)
                         if finished is not None:
                             return finished
+                        if local_step == "auto":
+                            local_steps["active"] = bool((progress.get("coarse") or {}).get("local_step_active"))
                     begin = first_block if sweep == first_sweep else 0
                     if colours:
                         for start, end in zip(batch_starts[:-1], batch_starts[1:]):

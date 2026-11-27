@@ -112,7 +112,7 @@ def test_coarse_sweeps_reach_the_single_block_solution_faster(tmp_path):
         errors[name] = float(np.abs(field(tmp_path / name)[0] - exact).max())
     assert errors["two"] < 0.01 * errors["one"], errors
     meta = field(tmp_path / "two")[1]
-    assert meta["identity"]["coarse"] == dict(kind="trilinear", factor=4)
+    assert meta["identity"]["coarse"] == dict(kind="trilinear", factor=4, revision=2, floor=1e-3, step="energy")
     assert "coarse" not in field(tmp_path / "one")[1]["identity"]
     sweeps = meta["progress"]["completed_sweeps"]
     residuals = [s["relative_residual"] for s in sweeps]
@@ -315,3 +315,152 @@ def test_stop_between_colour_batches_resumes_to_the_same_field(tmp_path):
 def test_invalid_colour_options_are_rejected(tmp_path, options, message):
     with pytest.raises(ValueError, match=message):
         run(tmp_path / "bad", problem(tmp_path, pairs=False), 8, **options)
+
+
+def test_exact_coarse_solve_takes_the_full_step(tmp_path):
+    base = problem(tmp_path)
+    run(tmp_path / "two", base, 8, halo=2, sweeps=3, coarse_factor=4)
+    status = json.loads((tmp_path / "two/STATUS.json").read_text())
+    assert status["coarse"]["step"] == pytest.approx(1.0, abs=1e-6)
+    assert status["coarse"]["floor"] == 1e-3 and status["coarse"]["dropped"] >= 0
+
+
+def sabotaged(monkeypatch, scale):
+    """Make every coarse solve return ``scale`` times the exact correction."""
+    original = CoarseSpace.solver
+
+    def solver(self, *args):
+        solve, info = original(self, *args)
+        return (lambda rhs: scale * solve(rhs)), info
+
+    monkeypatch.setattr(CoarseSpace, "solver", solver)
+
+
+def test_energy_step_neutralises_a_harmful_coarse_correction(tmp_path, monkeypatch):
+    base = problem(tmp_path)
+    sabotaged(monkeypatch, -20.0)
+    result = run(tmp_path / "two", base, 8, halo=2, sweeps=6, coarse_factor=4)
+    assert result["status"] == "SWEEP_BUDGET_REACHED"
+    meta = field(tmp_path / "two")[1]
+    residuals = [s["relative_residual"] for s in meta["progress"]["completed_sweeps"]]
+    assert all(b <= a * (1 + 1e-9) for a, b in zip(residuals, residuals[1:])), residuals
+    assert json.loads((tmp_path / "two/STATUS.json").read_text())["coarse"]["step"] == 0.0
+
+
+def test_divergence_guard_stops_a_rising_residual(tmp_path, monkeypatch):
+    import block_solver
+
+    base = problem(tmp_path)
+    count = len(blocks(base["shape"], 8))
+    calls = [0]
+    original = block_solver.block_residual
+
+    def rising(*args):  # residual norms that grow 1.5x per sweep from the third sweep on
+        r, r0 = original(*args)
+        sweep = calls[0] // count
+        calls[0] += 1
+        return r * (1.5 ** max(sweep - 1, 0) * 1e3 if sweep >= 2 else 1.0), r0
+
+    monkeypatch.setattr(block_solver, "block_residual", rising)
+    with pytest.raises(RuntimeError, match="coarse Schwarz diverging: relative residual rose 2 sweeps"):
+        run(tmp_path / "two", base, 8, halo=2, sweeps=8, coarse_factor=4, coarse_workers=1, local_step=False)
+    meta = field(tmp_path / "two")[1]
+    assert len(meta["progress"]["completed_sweeps"]) == 3  # sweeps 3 and 4 rose above sweep 2; sweep 4 stops
+
+
+def test_divergence_guard_can_be_disabled(tmp_path, monkeypatch):
+    import block_solver
+
+    base = problem(tmp_path)
+    count = len(blocks(base["shape"], 8))
+    calls = [0]
+    original = block_solver.block_residual
+
+    def rising(*args):
+        r, r0 = original(*args)
+        sweep = calls[0] // count
+        calls[0] += 1
+        return r * (1e3 * 1.5**sweep), r0
+
+    monkeypatch.setattr(block_solver, "block_residual", rising)
+    result = run(
+        tmp_path / "two", base, 8, halo=2, sweeps=4, coarse_factor=4, coarse_workers=1, coarse_divergence_sweeps=0
+    )
+    assert result["status"] == "SWEEP_BUDGET_REACHED"
+
+
+def test_fixed_exterior_nodes_keep_the_coarse_operator_symmetric(tmp_path):
+    base = problem(tmp_path, pairs=False)
+    shape = base["shape"]
+    rng = np.random.default_rng(3)
+    # Pairs from free nodes at x >= 9 to the fixed face x <= 1: every one leaves its block's crop.
+    a = np.stack([rng.integers(0, shape[0], 60), rng.integers(0, shape[1], 60), rng.integers(9, shape[2], 60)], 1)
+    b = np.stack([a[:, 0], a[:, 1], rng.integers(0, 2, 60)], 1)
+    base["constraints"] = StencilConstraints.pairs(
+        a[:, ::-1].astype(float),
+        b[:, ::-1].astype(float),
+        np.zeros(3),
+        np.ones(3),
+        shape,
+        weight=5.0,
+        cache_bytes=10**6,
+    )
+
+    def fixed(lo, hi):
+        values = np.full(tuple(int(q - p) for p, q in zip(lo, hi)), np.nan)
+        values[:, :, : max(0, 2 - int(lo[2]))] = 0.0  # the x <= 1 slab is fixed
+        return values
+
+    run(tmp_path / "two", base, 8, halo=1, sweeps=1, coarse_factor=4, fixed=fixed, coarse_floor=0.0)
+    m = sp.load_npz(tmp_path / "two/COARSE_OPERATOR.npz").tocsr()
+    asym = abs(m - m.T)
+    assert asym.max() <= 1e-9 * abs(m).max(), float(asym.max() / abs(m).max())
+
+
+def test_floor_leaves_unsupported_coarse_nodes_out():
+    space = CoarseSpace((9, 9, 9), 4)
+    n = space.size
+    diagonal = np.ones(n)
+    diagonal[:3] = 1e-9  # three nearly unsupported coarse nodes
+    space.matrix = sp.diags(diagonal).tocsr()
+    solve, info = space.solver(10**6, 1e-3)
+    out = solve(np.ones(n))
+    assert info["dropped"] == 3 and np.all(out[:3] == 0) and np.allclose(out[3:], 1.0)
+    solve, info = space.solver(10**6, 0.0)
+    assert info["dropped"] == 0 and solve(np.ones(n))[0] == pytest.approx(1e9)
+
+
+@pytest.mark.parametrize("options", [dict(coarse_floor=1.0), dict(coarse_floor=-0.1), dict(coarse_step=1)])
+def test_invalid_coarse_safeguards_are_rejected(tmp_path, options):
+    with pytest.raises(ValueError, match="coarse_"):
+        run(tmp_path / "x", problem(tmp_path), 8, halo=2, sweeps=1, coarse_factor=4, **options)
+
+
+def test_auto_local_step_turns_on_after_the_coarse_residual_rises(tmp_path, monkeypatch):
+    import inspect
+
+    import block_solver
+
+    base = problem(tmp_path)
+    count = len(blocks(base["shape"], 8))
+    calls = [0]
+    original = block_solver.block_residual
+
+    def rising(*args):  # coarse residual norms that grow from the third sweep on
+        r, r0 = original(*args)
+        if any(frame.function == "energy_step" for frame in inspect.stack()[1:4]):
+            return r, r0
+        sweep = calls[0] // count
+        calls[0] += 1
+        return r * (1e3 * 1.5**sweep if sweep >= 2 else 1.0), r0
+
+    falling = run(tmp_path / "falling", base, 8, halo=2, sweeps=3, coarse_factor=4, coarse_workers=1)
+    plain = run(tmp_path / "plain", base, 8, halo=2, sweeps=3, coarse_factor=4, coarse_workers=1, local_step=False)
+    assert falling["status"] == plain["status"] == "SWEEP_BUDGET_REACHED"
+    np.testing.assert_array_equal(field(tmp_path / "falling")[0], field(tmp_path / "plain")[0])
+    done = field(tmp_path / "falling")[1]["progress"]["completed_sweeps"]
+    assert [s["local_step_active"] for s in done] == [False, False, False]
+    monkeypatch.setattr(block_solver, "block_residual", rising)
+    run(tmp_path / "rising", base, 8, halo=2, sweeps=4, coarse_factor=4, coarse_workers=1, coarse_divergence_sweeps=0)
+    done = field(tmp_path / "rising")[1]["progress"]["completed_sweeps"]
+    assert [s["local_step_active"] for s in done] == [False, False, True, True]

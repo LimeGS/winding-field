@@ -295,11 +295,21 @@ class CoarseSpace:
             if self._pending_nnz > 50_000_000:
                 self._fold_pairs()
 
-    def solver(self, direct_limit: int) -> tuple[Callable[[np.ndarray], np.ndarray], dict]:
-        """Factor (or AMG-precondition) the symmetrized operator on its nonempty columns."""
+    def solver(self, direct_limit: int, floor: float = 0.0) -> tuple[Callable[[np.ndarray], np.ndarray], dict]:
+        """Factor (or AMG-precondition) the symmetrized operator on its supported columns.
+
+        A coarse node whose cell holds almost no weighted fine nodes has a tiny positive diagonal:
+        a nearly singular row whose solution can be thousands of windings (PHerc0175A, November
+        2026: 2,408 at a node with 0.3 % observed fine nodes, growing 1.5x per sweep). ``floor``
+        drops the nodes whose diagonal is below ``floor`` times the median positive diagonal;
+        their correction is zero and the block solves alone handle them. ``floor=0`` keeps every
+        node with a positive diagonal (the behaviour before the floor existed)."""
         started = time.perf_counter()
         a = (0.5 * (self.matrix + self.matrix.T)).tocsr()
-        active = np.flatnonzero(a.diagonal() > 0)
+        diagonal = a.diagonal()
+        positive = diagonal > 0
+        cut = float(floor) * float(np.median(diagonal[positive])) if floor > 0 and positive.any() else 0.0
+        active = np.flatnonzero(diagonal > cut)
         reduced = a[active][:, active].tocsc()
         if len(active) <= direct_limit:
             factor = spla.factorized(reduced)
@@ -336,7 +346,14 @@ class CoarseSpace:
                 out[active] = inner(rhs[active])
             return out
 
-        info = dict(size=int(len(active)), nnz=int(reduced.nnz), method=method, setup_s=time.perf_counter() - started)
+        info = dict(
+            size=int(len(active)),
+            nnz=int(reduced.nnz),
+            method=method,
+            setup_s=time.perf_counter() - started,
+            floor=float(floor),
+            dropped=int(positive.sum() - len(active)),
+        )
         return solve, info
 
 

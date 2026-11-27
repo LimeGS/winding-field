@@ -208,6 +208,9 @@ def solve_blocks(
     coarse_factor: int | None = None,
     coarse_direct_limit: int = 20_000,
     coarse_workers: int | None = None,
+    coarse_floor: float = 1e-3,
+    coarse_step: bool = True,
+    coarse_divergence_sweeps: int = 2,
     checkpoint: Literal["block", "sweep"] = "block",
     memory_report: dict[str, Any] | None = None,
     colours: int = 0,
@@ -274,6 +277,19 @@ def solve_blocks(
     three quarters of the CPUs, at most 8); parts are added in block order, so the coarse
     right-hand side has the same bytes for any worker count. An execution choice, not part of
     the identity.
+
+    Three safeguards keep the coarse correction from feeding a divergence (PHerc0175A, 34.56 um,
+    November 2026: the relative residual fell to 6.8 by sweep 5, then rose 1.35x and 1.49x per
+    sweep while the correction grew at unsupported nodes on the ROI edge). ``coarse_floor``
+    leaves coarse nodes whose diagonal is below that fraction of the median out of the coarse
+    system (see :meth:`field_block_coarse.CoarseSpace.solver`). ``coarse_step`` scales the
+    correction by the energy-optimal step ``alpha = (P^T r)^T e / e^T M e`` clipped to [0, 1]
+    with the assembled operator ``M``; with an exact Galerkin operator and solve it is 1, so it
+    only acts when the coarse system is inconsistent with the block solves. Both are part of
+    the identity. ``coarse_divergence_sweeps`` (an execution choice; 0 disables it) stops with an
+    error when the relative residual has risen that many sweeps in a row. Exterior constraint
+    terms of fixed nodes leave the coarse operator, so it is the Galerkin product of the free
+    problem with a ``fixed`` provider too.
 
     ``nonconvergence_policy='fail'`` (default) stops at the first local solve that
     does not reach ``rtol``. ``'continue'`` commits a local solve that only exhausted
@@ -376,6 +392,12 @@ def solve_blocks(
             if coarse_workers is None:
                 coarse_workers = default_coarse_workers()
             coarse_workers = _integer(coarse_workers, 1)
+            coarse_divergence_sweeps = _integer(coarse_divergence_sweeps)
+            if type(coarse_floor) not in (int, float) or not 0 <= coarse_floor < 1:
+                raise ValueError("coarse_floor must be a number in [0, 1)")
+            coarse_floor = float(coarse_floor)
+            if type(coarse_step) is not bool:
+                raise ValueError("coarse_step must be a bool")
             if partial_order:
                 raise ValueError("coarse correction needs the full block order")
         if checkpoint not in ("block", "sweep"):
@@ -433,7 +455,20 @@ def solve_blocks(
             **({} if preconditioner == "jacobi" else {"preconditioner": preconditioner}),
             # Fused kernels round differently, so a run never resumes across kernels.
             **({} if kernel == "eager" else {"kernel": kernel}),
-            **({} if coarse_factor is None else {"coarse": dict(kind="trilinear", factor=coarse_factor)}),
+            **(
+                {}
+                if coarse_factor is None
+                else {
+                    "coarse": dict(
+                        kind="trilinear",
+                        factor=coarse_factor,
+                        # Revision 2: fixed exterior nodes leave the operator, support floor, step.
+                        revision=2,
+                        floor=coarse_floor,
+                        step="energy" if coarse_step else "unit",
+                    )
+                }
+            ),
             **({"colours": colours} if colours else {}),
         )
         json.dumps(problem, allow_nan=False)
@@ -650,9 +685,36 @@ def solve_blocks(
                 if terms is None:
                     return None
                 row, node, coeff = (np.asarray(a) for a in terms)
-                # Exterior fixed values are known only for the zero gauge; others count as free.
-                node_free = node != 0 if fixed is None else np.ones(len(node), bool)
-                return row, node, node_free, coeff
+                return row, node, exterior_free(node), coeff
+
+            fixed_chunks: dict[tuple[int, ...], np.ndarray] = {}
+
+            def exterior_free(node):
+                """Which exterior nodes are free: the zero gauge without a provider, else asked per chunk.
+
+                Counting fixed exterior nodes as free (the behaviour before revision 2) adds coarse
+                couplings that no free row returns, so the assembled operator is not symmetric."""
+                node = np.asarray(node, np.int64)
+                if fixed is None:
+                    return node != 0
+                zyx = np.stack(np.unravel_index(node, shape), 1)
+                keys = zyx // chunk
+                free = np.ones(len(node), bool)
+                for key in np.unique(keys, axis=0):
+                    k = tuple(int(v) for v in key)
+                    if k not in fixed_chunks:
+                        if len(fixed_chunks) >= 64:
+                            fixed_chunks.pop(next(iter(fixed_chunks)))
+                        lo = np.asarray(k) * chunk
+                        hi = np.minimum(lo + chunk, shape)
+                        declared = np.asarray(fixed(lo, hi), np.float64)
+                        if declared.shape != tuple(int(v) for v in hi - lo):
+                            raise ValueError("invalid fixed-value observation")
+                        fixed_chunks[k] = np.isfinite(declared)
+                    sel = np.all(keys == key, axis=1)
+                    local = zyx[sel] - np.asarray(k) * chunk
+                    free[sel] = ~fixed_chunks[k][tuple(local.T)]
+                return free
 
             space = None
             coarse_status: dict[str, Any] = {}
@@ -792,20 +854,41 @@ def solve_blocks(
                 if space.solve is None:
                     coarse_status.update(stage="solve")
                     emit("RUNNING", phase="coarse-solve", active_sweep=sweep)
-                    space.solve, space.info = space.solver(coarse_direct_limit)
+                    space.solve, space.info = space.solver(coarse_direct_limit, coarse_floor)
                 if stopped():
                     return emit("CHECKPOINTED_STOP")
+                norm, norm0 = math.sqrt(norm_sq), math.sqrt(norm0_sq)
+                relative = norm / norm0 if norm0 else None
+                if coarse_divergence_sweeps and relative is not None:
+                    history = [s.get("relative_residual") for s in progress.get("completed_sweeps") or []]
+                    tail = history[-coarse_divergence_sweeps:] + [relative]
+                    if (
+                        len(tail) == coarse_divergence_sweeps + 1
+                        and None not in tail
+                        and all(b > a for a, b in zip(tail, tail[1:]))
+                    ):
+                        raise RuntimeError(
+                            f"coarse Schwarz diverging: relative residual rose {coarse_divergence_sweeps} sweeps "
+                            f"in a row ({', '.join(f'{v:.4g}' for v in tail)}); the checkpoint keeps the last sweep"
+                        )
                 solve_started = time.perf_counter()
                 correction = space.solve(rhs)
+                step = 1.0
+                if coarse_step:
+                    # Energy-optimal step along P e with the assembled operator; 1 for an exact solve.
+                    curvature = float(correction @ (space.matrix @ correction))
+                    slope = float(rhs @ correction)
+                    step = min(max(slope / curvature, 0.0), 1.0) if curvature > 0 else 0.0
+                    correction = correction * step
                 solve_s = time.perf_counter() - solve_started
                 np.save(correction_path, correction)
-                norm, norm0 = math.sqrt(norm_sq), math.sqrt(norm0_sq)
                 state = dict(
                     sweep=sweep,
                     stage="apply",
                     correction_sha256=file_sha(correction_path),
                     residual_norm=norm,
-                    relative_residual=norm / norm0 if norm0 else None,
+                    relative_residual=relative,
+                    step=step,
                     solve_s=solve_s,
                     seconds=time.perf_counter() - phase_started,
                     **(space.last or {}),

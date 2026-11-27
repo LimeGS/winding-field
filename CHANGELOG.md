@@ -37,6 +37,10 @@ versions follow the GitHub releases.
 
 ## [2.0.0] - unreleased
 
+Beta: `2.0.0b1` (tag `v2.0.0b1`, GitHub pre-release) ships everything below plus the
+Unreleased section above, for testing before 2.0.0. The final 2.0.0 sets the version back
+to `2.0.0` and moves these entries under it.
+
 Released in lockstep with winding-field-cli 2.0.0 and winding-field-studio 2.0.0
 (one version across the three repositories). Five unused public helpers are removed
 (see Removed and [docs/MIGRATION.md](docs/MIGRATION.md)); Jacobi identities and

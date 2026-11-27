@@ -363,7 +363,7 @@ def test_divergence_guard_stops_a_rising_residual(tmp_path, monkeypatch):
 
     monkeypatch.setattr(block_solver, "block_residual", rising)
     with pytest.raises(RuntimeError, match="coarse Schwarz diverging: relative residual rose 2 sweeps"):
-        run(tmp_path / "two", base, 8, halo=2, sweeps=8, coarse_factor=4, coarse_workers=1)
+        run(tmp_path / "two", base, 8, halo=2, sweeps=8, coarse_factor=4, coarse_workers=1, local_step=False)
     meta = field(tmp_path / "two")[1]
     assert len(meta["progress"]["completed_sweeps"]) == 3  # sweeps 3 and 4 rose above sweep 2; sweep 4 stops
 
@@ -434,3 +434,33 @@ def test_floor_leaves_unsupported_coarse_nodes_out():
 def test_invalid_coarse_safeguards_are_rejected(tmp_path, options):
     with pytest.raises(ValueError, match="coarse_"):
         run(tmp_path / "x", problem(tmp_path), 8, halo=2, sweeps=1, coarse_factor=4, **options)
+
+
+def test_auto_local_step_turns_on_after_the_coarse_residual_rises(tmp_path, monkeypatch):
+    import inspect
+
+    import block_solver
+
+    base = problem(tmp_path)
+    count = len(blocks(base["shape"], 8))
+    calls = [0]
+    original = block_solver.block_residual
+
+    def rising(*args):  # coarse residual norms that grow from the third sweep on
+        r, r0 = original(*args)
+        if any(frame.function == "energy_step" for frame in inspect.stack()[1:4]):
+            return r, r0
+        sweep = calls[0] // count
+        calls[0] += 1
+        return r * (1e3 * 1.5**sweep if sweep >= 2 else 1.0), r0
+
+    falling = run(tmp_path / "falling", base, 8, halo=2, sweeps=3, coarse_factor=4, coarse_workers=1)
+    plain = run(tmp_path / "plain", base, 8, halo=2, sweeps=3, coarse_factor=4, coarse_workers=1, local_step=False)
+    assert falling["status"] == plain["status"] == "SWEEP_BUDGET_REACHED"
+    np.testing.assert_array_equal(field(tmp_path / "falling")[0], field(tmp_path / "plain")[0])
+    done = field(tmp_path / "falling")[1]["progress"]["completed_sweeps"]
+    assert [s["local_step_active"] for s in done] == [False, False, False]
+    monkeypatch.setattr(block_solver, "block_residual", rising)
+    run(tmp_path / "rising", base, 8, halo=2, sweeps=4, coarse_factor=4, coarse_workers=1, coarse_divergence_sweeps=0)
+    done = field(tmp_path / "rising")[1]["progress"]["completed_sweeps"]
+    assert [s["local_step_active"] for s in done] == [False, False, True, True]

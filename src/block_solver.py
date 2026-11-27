@@ -211,6 +211,7 @@ def solve_blocks(
     coarse_floor: float = 1e-3,
     coarse_step: bool = True,
     coarse_divergence_sweeps: int = 2,
+    local_step: bool = True,
     checkpoint: Literal["block", "sweep"] = "block",
     memory_report: dict[str, Any] | None = None,
     colours: int = 0,
@@ -290,6 +291,14 @@ def solve_blocks(
     error when the relative residual has risen that many sweeps in a row. Exterior constraint
     terms of fixed nodes leave the coarse operator, so it is the Galerkin product of the free
     problem with a ``fixed`` provider too.
+
+    ``local_step`` (default on; part of the identity when ``halo > 1``) scales each committed core
+    update by its energy-optimal length clipped to [0, 1]. A crop is solved with its halo free but
+    only its core is committed, and that truncated update is not an energy step: with stiff pairs
+    across the core face it can raise the energy, which near-free unsupported regions amplify
+    sweep after sweep. Two crop residuals per block give the length; a halo of 1 is exact block
+    Gauss-Seidel and skips it. Each completed sweep records ``min_local_step`` and
+    ``damped_local_steps``.
 
     ``nonconvergence_policy='fail'`` (default) stops at the first local solve that
     does not reach ``rtol``. ``'continue'`` commits a local solve that only exhausted
@@ -400,6 +409,8 @@ def solve_blocks(
                 raise ValueError("coarse_step must be a bool")
             if partial_order:
                 raise ValueError("coarse correction needs the full block order")
+        if type(local_step) is not bool:
+            raise ValueError("local_step must be a bool")
         if checkpoint not in ("block", "sweep"):
             raise ValueError("checkpoint must be block or sweep")
         if type(colours) is not int or colours not in (0, 8):
@@ -470,6 +481,8 @@ def solve_blocks(
                 }
             ),
             **({"colours": colours} if colours else {}),
+            # A crop solved with a halo but committed on its core alone is not an energy step.
+            **({"local_step": "energy"} if local_step and halo > 1 else {}),
         )
         json.dumps(problem, allow_nan=False)
         if colours:
@@ -1051,6 +1064,32 @@ def solve_blocks(
                 prepared = None
                 return job
 
+            local_steps = dict(minimum=1.0, damped=0)
+
+            def energy_step(job, rows, delta, where):
+                """The energy-optimal length, clipped to [0, 1], of the committed core update.
+
+                The crop is solved with its halo free, but only the core is committed: the halo
+                part of the minimiser is dropped. With stiff pair rows across the core face that
+                truncated update can raise the energy (PHerc0175A, November 2026: the residual of
+                a 34.56 um field rose from sweep 6 on). Along the committed direction ``d`` the
+                energy changes by ``-a r.d + a^2/2 d.Ad``; ``a = r.d / d.Ad`` minimises it, and
+                ``a <= 1`` keeps the step inside the solve. Two crop residuals give ``r`` and ``Ad``.
+                """
+                owned, current = job["owned"], job["current"]
+                mask = np.isfinite(job["fixed_values"])
+                values = np.where(mask, job["fixed_values"], current)
+                moved = values.copy()
+                moved[owned] += delta
+                r, _ = block_residual(job["target"], job["weights"], spacing, rows, values, mask, str(where))
+                r_moved, _ = block_residual(job["target"], job["weights"], spacing, rows, moved, mask, str(where))
+                d = delta.astype(np.float64)
+                slope = float(np.sum(r[owned] * d))
+                curvature = float(np.sum((r - r_moved)[owned] * d))
+                if not (curvature > 0 and math.isfinite(slope)):
+                    return 0.0
+                return min(max(slope / curvature, 0.0), 1.0)
+
             def solve_block(job, slot=0):
                 """The local solve of a prepared block; safe on a worker thread (own CUDA stream).
 
@@ -1090,8 +1129,15 @@ def solve_blocks(
                     core = _numpy(result[owned])
                 del result
                 delta = core - job["current"][owned]
+                step = 1.0
+                if local_step and halo > 1 and delta.any():
+                    step = energy_step(job, rows, delta, where if local_devices else device)
+                    if step != 1.0:
+                        delta = delta * step
+                        core = (job["current"][owned] + delta).astype(core.dtype, copy=False)
                 return dict(
                     core=core,
+                    step=step,
                     delta=delta if observer is not None else None,
                     change=float(np.max(abs(delta))),
                     solver=solver,
@@ -1129,6 +1175,10 @@ def solve_blocks(
                     raise RuntimeError("conditional block did not converge")
                 core, change, owned_observed = solved["core"], solved["change"], solved["owned_observed"]
                 maximum = max(maximum, change)
+                if block == 0:
+                    local_steps.update(minimum=1.0, damped=0)
+                local_steps["minimum"] = min(local_steps["minimum"], solved["step"])
+                local_steps["damped"] += solved["step"] < 1.0
                 if observer is not None:
                     telemetry_started = time.perf_counter()
                     delta, selected = solved.pop("delta"), None
@@ -1167,6 +1217,8 @@ def solve_blocks(
                 next_completed = list(completed)
                 if block + 1 == len(ordered):
                     stats = dict(sweep=sweep, cores=len(ordered), max_core_update=maximum)
+                    if local_step and halo > 1:  # Advisory: a resume inside the sweep restarts the count.
+                        stats.update(min_local_step=local_steps["minimum"], damped_local_steps=local_steps["damped"])
                     if coarse_factor is not None:
                         opened = progress.get("coarse") or {}
                         stats.update(relative_residual=opened.get("relative_residual"), coarse_s=opened.get("seconds"))
